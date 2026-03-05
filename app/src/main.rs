@@ -54,85 +54,17 @@ fn load_app_icon() -> Option<egui::IconData> {
 
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    if let Ok(data) = fs::read("font.otf") {
+    {
+        let data = include_bytes!("../../font.otf");
         fonts
             .font_data
-            .insert("custom".to_string(), egui::FontData::from_owned(data));
+            .insert("custom".to_string(), egui::FontData::from_static(data));
         fonts
             .families
             .insert(egui::FontFamily::Proportional, vec!["custom".to_string()]);
         fonts
             .families
             .insert(egui::FontFamily::Monospace, vec!["custom".to_string()]);
-        ctx.set_fonts(fonts);
-    } else {
-        #[cfg(windows)]
-        {
-            let candidates = [
-                ("msyh", "C:\\Windows\\Fonts\\msyh.ttc"),
-                ("msjh", "C:\\Windows\\Fonts\\msjh.ttc"),
-                ("meiryo", "C:\\Windows\\Fonts\\meiryo.ttc"),
-                ("msgothic", "C:\\Windows\\Fonts\\msgothic.ttc"),
-                ("simhei", "C:\\Windows\\Fonts\\simhei.ttf"),
-                ("simsun", "C:\\Windows\\Fonts\\simsun.ttc"),
-            ];
-            for (name, path) in candidates {
-                if let Ok(data) = fs::read(path) {
-                    fonts
-                        .font_data
-                        .insert(name.to_string(), egui::FontData::from_owned(data));
-                    if let Some(family) =
-                        fonts.families.get_mut(&egui::FontFamily::Proportional)
-                    {
-                        family.insert(0, name.to_string());
-                    }
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let candidates = [
-                ("hiragino", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
-                ("pingfang", "/System/Library/Fonts/PingFang.ttc"),
-                ("heiti", "/System/Library/Fonts/STHeiti Medium.ttc"),
-                ("osaka", "/System/Library/Fonts/Osaka.ttf"),
-            ];
-            for (name, path) in candidates {
-                if let Ok(data) = fs::read(path) {
-                    fonts
-                        .font_data
-                        .insert(name.to_string(), egui::FontData::from_owned(data));
-                    if let Some(family) =
-                        fonts.families.get_mut(&egui::FontFamily::Proportional)
-                    {
-                        family.insert(0, name.to_string());
-                    }
-                }
-            }
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let candidates = [
-                ("noto_cjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-                ("noto_cjk_sc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-                ("noto_cjk2", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-                ("noto_cjk3", "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"),
-                ("wqy_zenhei", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-                ("arphic_ukai", "/usr/share/fonts/truetype/arphic/ukai.ttc"),
-            ];
-            for (name, path) in candidates {
-                if let Ok(data) = fs::read(path) {
-                    fonts
-                        .font_data
-                        .insert(name.to_string(), egui::FontData::from_owned(data));
-                    if let Some(family) =
-                        fonts.families.get_mut(&egui::FontFamily::Proportional)
-                    {
-                        family.insert(0, name.to_string());
-                    }
-                }
-            }
-        }
         ctx.set_fonts(fonts);
     }
     let mut style = (*ctx.style()).clone();
@@ -1448,8 +1380,8 @@ impl DawApp {
     }
 
     fn play_startup_sound(&mut self) -> Result<(), String> {
-        let file = std::fs::File::open("startup.wav").map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
+        let bytes = include_bytes!("../../startup.wav");
+        let reader = BufReader::new(std::io::Cursor::new(bytes));
         let (stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
         let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
         let source = Decoder::new(reader).map_err(|e| e.to_string())?;
