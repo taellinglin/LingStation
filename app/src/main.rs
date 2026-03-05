@@ -2292,6 +2292,13 @@ impl DawApp {
     }
 
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if !is_window_visible(ui_host.hwnd) {
+                self.show_plugin_ui = false;
+                ctx.request_repaint();
+                return;
+            }
+        }
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 ui_host.editor.set_focus(false);
@@ -2314,6 +2321,8 @@ impl DawApp {
             show_plugin_window(ui_host.hwnd);
             bring_window_to_front(ui_host.hwnd);
             ui_host.editor.set_focus(true);
+            invalidate_plugin_window(ui_host.child_hwnd);
+            invalidate_plugin_window(ui_host.hwnd);
         }
         self.ensure_plugin_ui();
 
@@ -2430,6 +2439,8 @@ impl DawApp {
         editor.set_size(w, h);
         editor.set_focus(true);
         bring_window_to_front(hwnd);
+        invalidate_plugin_window(child_hwnd);
+        invalidate_plugin_window(hwnd);
         self.plugin_ui = Some(PluginUiHost {
             hwnd,
             child_hwnd,
@@ -8145,6 +8156,17 @@ fn show_plugin_window(hwnd: isize) {
 #[cfg(not(windows))]
 fn show_plugin_window(_hwnd: isize) {}
 
+#[cfg(windows)]
+fn invalidate_plugin_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::InvalidateRect;
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn invalidate_plugin_window(_hwnd: isize) {}
+
 
 #[cfg(windows)]
 fn is_window_alive(hwnd: isize) -> bool {
@@ -8154,6 +8176,17 @@ fn is_window_alive(hwnd: isize) -> bool {
 
 #[cfg(not(windows))]
 fn is_window_alive(_hwnd: isize) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_window_visible(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+#[cfg(not(windows))]
+fn is_window_visible(_hwnd: isize) -> bool {
     false
 }
 
