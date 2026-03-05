@@ -1,0 +1,9 @@
+So...this is my LingStation project for a Metroid Kraid theme remake.
+I am using automation lanes for the bass, and custom synthesizers on each track.
+Everything you see and hear is synthesized from Rust and math, all done by me.
+The original song was on the SNES in Super Metroid, and it is a heavy, tense boss cue.
+I wanted to keep that low-end weight and sharp accents while making it my own.
+LingStation gives me tight MIDI editing with snapping and note-length tools.
+The piano roll lanes let me shape velocity, pan, cutoff, resonance, and MIDI CC.
+For sound design, I used an additive and hybrid FM synth, plus a subtractive synth called LingSynth.
+Thanks for watching. I'm Ling Lin, and I hope you enjoyed this video about LingStation.

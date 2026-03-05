@@ -1,0 +1,8 @@
+{
+  "output_device": "Main Out 1/2 (2- Studio 26c)",
+  "input_device": "Mic/Inst/Line In 1/2 (2- Studio 26c)",
+  "buffer_size": 2048,
+  "sample_rate": 48000,
+  "interpolation": "cubic",
+  "midi_input": "Studio 26c MIDI In"
+}

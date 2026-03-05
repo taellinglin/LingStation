@@ -1,0 +1,13 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal = "0.15"
+midir = "0.8"
+midly = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+
+[features]
+vst3 = []

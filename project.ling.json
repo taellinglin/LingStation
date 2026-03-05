@@ -1,0 +1,67 @@
+{
+  "name": "LingStation Demo",
+  "tempo_bpm": 120.0,
+  "tracks": [
+    {
+      "name": "Piano",
+      "clips": [
+        {
+          "id": 1,
+          "track": 0,
+          "start_beats": 0.0,
+          "length_beats": 4.0,
+          "is_midi": true
+        },
+        {
+          "id": 2,
+          "track": 0,
+          "start_beats": 5.0,
+          "length_beats": 2.0,
+          "is_midi": true
+        }
+      ],
+      "level": 0.8,
+      "muted": false,
+      "solo": false
+    },
+    {
+      "name": "Vox",
+      "clips": [
+        {
+          "id": 3,
+          "track": 1,
+          "start_beats": 1.0,
+          "length_beats": 6.0,
+          "is_midi": false
+        }
+      ],
+      "level": 0.7,
+      "muted": false,
+      "solo": false
+    },
+    {
+      "name": "Drums",
+      "clips": [],
+      "level": 0.9,
+      "muted": false,
+      "solo": false
+    }
+  ],
+  "notes": [
+    {
+      "start_beats": 0.0,
+      "length_beats": 1.0,
+      "midi_note": 60
+    },
+    {
+      "start_beats": 1.0,
+      "length_beats": 0.5,
+      "midi_note": 64
+    },
+    {
+      "start_beats": 2.0,
+      "length_beats": 1.5,
+      "midi_note": 67
+    }
+  ]
+}
