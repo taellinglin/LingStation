@@ -587,9 +587,9 @@ impl IBStreamTrait for MemoryStream {
         let len = self.data.len() as i64;
         let current = self.cursor;
         let next = match mode {
-            IStreamSeekMode_::kIBSeekSet => pos,
-            IStreamSeekMode_::kIBSeekCur => current.saturating_add(pos),
-            IStreamSeekMode_::kIBSeekEnd => len.saturating_add(pos),
+            mode if mode == IStreamSeekMode_::kIBSeekSet as i32 => pos,
+            mode if mode == IStreamSeekMode_::kIBSeekCur as i32 => current.saturating_add(pos),
+            mode if mode == IStreamSeekMode_::kIBSeekEnd as i32 => len.saturating_add(pos),
             _ => return kResultFalse,
         };
         let next = next.clamp(0, len);
@@ -997,7 +997,7 @@ impl Vst3Host {
             }
             eprintln!("VST3 component initialize ok");
 
-            let _ = component.setIoMode(IoModes_::kAdvanced);
+            let _ = component.setIoMode(IoModes_::kAdvanced as i32);
 
             let mut controller = None;
             let mut controller_cid: TUID = [0; 16];
@@ -1062,7 +1062,7 @@ impl Vst3Host {
                         if !bytes.is_empty() {
                             let _ = stream_ptr.seek(
                                 0,
-                                IStreamSeekMode_::kIBSeekSet,
+                                IStreamSeekMode_::kIBSeekSet as i32,
                                 std::ptr::null_mut(),
                             );
                             let _ = controller.setComponentState(stream_ptr.as_ptr());
@@ -1108,9 +1108,12 @@ impl Vst3Host {
                 .ok_or_else(|| "VST3 has no audio processor".to_string())?;
             eprintln!("VST3 audio processor ok");
 
-            let _ = component.setIoMode(IoModes_::kAdvanced);
+            let _ = component.setIoMode(IoModes_::kAdvanced as i32);
 
-            let audio_in_count = component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput);
+            let audio_in_count = component.getBusCount(
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kInput as i32,
+            );
             let mut output_channels = if channels <= 1 { 1 } else { 2 };
             let mut input_channels = if input_channels == 0 {
                 0
@@ -1180,22 +1183,43 @@ impl Vst3Host {
             }
             eprintln!("VST3 bus arrangement result: {bus_result}");
 
-            let audio_out_count = component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput);
+            let audio_out_count = component.getBusCount(
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kOutput as i32,
+            );
             if audio_out_count > 0 {
-                let _ = component.activateBus(MediaTypes_::kAudio, BusDirections_::kOutput, 0, 1);
+                let _ = component.activateBus(
+                    MediaTypes_::kAudio as i32,
+                    BusDirections_::kOutput as i32,
+                    0,
+                    1,
+                );
             }
             if input_channels > 0 && audio_in_count > 0 {
-                let _ = component.activateBus(MediaTypes_::kAudio, BusDirections_::kInput, 0, 1);
+                let _ = component.activateBus(
+                    MediaTypes_::kAudio as i32,
+                    BusDirections_::kInput as i32,
+                    0,
+                    1,
+                );
             }
-            let event_in_count = component.getBusCount(MediaTypes_::kEvent, BusDirections_::kInput);
+            let event_in_count = component.getBusCount(
+                MediaTypes_::kEvent as i32,
+                BusDirections_::kInput as i32,
+            );
             if event_in_count > 0 {
-                let _ = component.activateBus(MediaTypes_::kEvent, BusDirections_::kInput, 0, 1);
+                let _ = component.activateBus(
+                    MediaTypes_::kEvent as i32,
+                    BusDirections_::kInput as i32,
+                    0,
+                    1,
+                );
             }
 
             let mut bus_info: vst3::Steinberg::Vst::BusInfo = std::mem::zeroed();
             let bus_info_result = component.getBusInfo(
-                MediaTypes_::kAudio,
-                BusDirections_::kOutput,
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kOutput as i32,
                 0,
                 &mut bus_info as *mut _,
             );
@@ -1203,8 +1227,8 @@ impl Vst3Host {
                 output_channels = bus_info.channelCount as usize;
             }
             let in_bus_info_result = component.getBusInfo(
-                MediaTypes_::kAudio,
-                BusDirections_::kInput,
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kInput as i32,
                 0,
                 &mut bus_info as *mut _,
             );
@@ -1218,8 +1242,8 @@ impl Vst3Host {
             eprintln!("VST3 setActive -> {active_result}");
 
             let mut setup = ProcessSetup {
-                processMode: ProcessModes_::kRealtime,
-                symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+                processMode: ProcessModes_::kRealtime as i32,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
                 maxSamplesPerBlock: max_block_size as i32,
                 sampleRate: sample_rate,
             };
@@ -1357,7 +1381,7 @@ impl Vst3Host {
                         let _ = unsafe {
                             stream_ptr.seek(
                                 0,
-                                IStreamSeekMode_::kIBSeekSet,
+                                IStreamSeekMode_::kIBSeekSet as i32,
                                 std::ptr::null_mut(),
                             )
                         };
@@ -1446,8 +1470,8 @@ impl Vst3Host {
             }
         }
         let mut process_data = ProcessData {
-            processMode: ProcessModes_::kRealtime,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: 0,
             numOutputs: 1,
@@ -1586,8 +1610,8 @@ impl Vst3Host {
             }
         }
         let mut process_data = ProcessData {
-            processMode: ProcessModes_::kRealtime,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: 1,
             numOutputs: 1,
