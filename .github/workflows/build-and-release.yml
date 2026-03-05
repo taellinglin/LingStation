@@ -107,6 +107,33 @@ jobs:
           Copy-Item -Path "startup.wav" -Destination "dist\startup.wav"
           Compress-Archive -Path "dist\*" -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
+      - name: Delete existing release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = 'latest';
+            const prefix = `LingStation-v${process.env.VERSION}-`;
+            let release;
+            try {
+              const res = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              release = res.data;
+            } catch (err) {
+              core.info('No existing latest release; skipping asset delete.');
+              return;
+            }
+            for (const asset of release.assets || []) {
+              if (asset.name.startsWith(prefix)) {
+                core.info(`Deleting asset ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: asset.id,
+                });
+              }
+            }
+
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
         with:
