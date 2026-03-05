@@ -627,6 +627,7 @@ struct DawApp {
     piano_cc_drag: Option<usize>,
     piano_roll_rect: Option<egui::Rect>,
     plugin_ui: Option<PluginUiHost>,
+    plugin_ui_resume_at: Option<std::time::Instant>,
     last_params_track: Option<usize>,
     fs_expanded: HashSet<String>,
     fs_selected: Option<String>,
@@ -936,6 +937,7 @@ impl Default for DawApp {
             piano_cc_drag: None,
             piano_roll_rect: None,
             plugin_ui: None,
+            plugin_ui_resume_at: None,
             last_params_track: None,
             fs_expanded: HashSet::new(),
             fs_selected: None,
@@ -956,6 +958,16 @@ impl Default for DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(when) = self.plugin_ui_resume_at {
+            if std::time::Instant::now() >= when {
+                self.plugin_ui_resume_at = None;
+                if !self.audio_running {
+                    if let Err(err) = self.start_audio_and_midi() {
+                        self.status = format!("Audio resume failed: {err}");
+                    }
+                }
+            }
+        }
         self.sync_selected_track_index();
         self.handle_shortcuts(ctx);
         self.update_playhead(ctx);
@@ -2311,37 +2323,26 @@ impl DawApp {
 
     fn ensure_plugin_ui(&mut self) {
         vst3::init_windows_com_for_thread();
+        let target = self
+            .plugin_ui_target
+            .or_else(|| self.selected_track.map(PluginUiTarget::Instrument));
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if let Some(target) = target {
+                if ui_host.target == target {
+                    return;
+                }
+            }
+            self.destroy_plugin_ui();
+        }
+        let Some(target) = target else {
+            self.status = "No track selected".to_string();
+            return;
+        };
+
         let was_running = self.audio_running;
         if was_running {
             self.stop_audio_and_midi();
         }
-        if let Some(ui_host) = self.plugin_ui.as_ref() {
-            if let Some(target) = self.plugin_ui_target {
-                if ui_host.target != target {
-                    self.destroy_plugin_ui();
-                } else {
-                    if was_running {
-                        let _ = self.start_audio_and_midi();
-                    }
-                    return;
-                }
-            } else {
-                if was_running {
-                    let _ = self.start_audio_and_midi();
-                }
-                return;
-            }
-        }
-        let target = self
-            .plugin_ui_target
-            .or_else(|| self.selected_track.map(PluginUiTarget::Instrument));
-        let Some(target) = target else {
-            self.status = "No track selected".to_string();
-            if was_running {
-                let _ = self.start_audio_and_midi();
-            }
-            return;
-        };
         let host = match target {
             PluginUiTarget::Instrument(index) => self
                 .selected_track_host()
@@ -2423,7 +2424,9 @@ impl DawApp {
         editor.set_focus(true);
         bring_window_to_front(hwnd);
         if was_running {
-            let _ = self.start_audio_and_midi();
+            self.plugin_ui_resume_at = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(250),
+            );
         }
         self.plugin_ui = Some(PluginUiHost {
             hwnd,
@@ -2435,6 +2438,10 @@ impl DawApp {
     }
 
     fn destroy_plugin_ui(&mut self) {
+        let was_running = self.audio_running;
+        if was_running {
+            self.stop_audio_and_midi();
+        }
         if let Some(mut ui_host) = self.plugin_ui.take() {
             ui_host.editor.removed();
             if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
@@ -2445,6 +2452,11 @@ impl DawApp {
             }
         }
         self.plugin_ui_target = None;
+        if was_running {
+            self.plugin_ui_resume_at = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(200),
+            );
+        }
     }
 
     fn left_sidebar(&mut self, ctx: &egui::Context) {
@@ -4341,7 +4353,7 @@ impl DawApp {
                                                     .and_then(|i| self.track_audio.get(i))
                                                 {
                                                     if let Some(host) = state.host.as_ref() {
-                                                        if let Ok(mut host) = host.try_lock() {
+                                                        if let Ok(mut host) = host.lock() {
                                                             if let Some((channel, controller)) =
                                                                 host.param_to_cc(param_id)
                                                             {
@@ -4436,7 +4448,7 @@ impl DawApp {
                                                     .and_then(|i| self.track_audio.get(i))
                                                 {
                                                     if let Some(host) = state.host.as_ref() {
-                                                        if let Ok(mut host) = host.try_lock() {
+                                                        if let Ok(mut host) = host.lock() {
                                                             host.push_param_change(param_id, value as f64);
                                                         }
                                                     }
@@ -4511,7 +4523,7 @@ impl DawApp {
                                                                     state.effect_hosts.get(fx_index)
                                                                 {
                                                                     if let Ok(mut fx_host) =
-                                                                        fx_host.try_lock()
+                                                                        fx_host.lock()
                                                                     {
                                                                         fx_host.push_param_change(
                                                                             param_id,
