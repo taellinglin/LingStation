@@ -2440,6 +2440,7 @@ impl DawApp {
         editor.set_size(w, h);
         editor.set_focus(true);
         bring_window_to_front(hwnd);
+        focus_plugin_window(child_hwnd);
         if was_running {
             self.plugin_ui_resume_at = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(250),
@@ -2458,25 +2459,14 @@ impl DawApp {
         let Some(mut ui_host) = self.plugin_ui.take() else {
             return;
         };
-        let was_running = self.audio_running;
-        if was_running {
-            self.stop_audio_and_midi();
+        ui_host.editor.removed();
+        if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
+            destroy_plugin_child_window(ui_host.child_hwnd);
         }
-        {
-            ui_host.editor.removed();
-            if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
-                destroy_plugin_child_window(ui_host.child_hwnd);
-            }
-            if is_window_alive(ui_host.hwnd) {
-                destroy_plugin_child_window(ui_host.hwnd);
-            }
+        if is_window_alive(ui_host.hwnd) {
+            destroy_plugin_child_window(ui_host.hwnd);
         }
         self.plugin_ui_target = None;
-        if was_running {
-            self.plugin_ui_resume_at = Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(200),
-            );
-        }
     }
 
     fn left_sidebar(&mut self, ctx: &egui::Context) {
@@ -8131,6 +8121,17 @@ fn bring_window_to_front(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn bring_window_to_front(_hwnd: isize) {}
+
+#[cfg(windows)]
+fn focus_plugin_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetFocus;
+    unsafe {
+        SetFocus(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+fn focus_plugin_window(_hwnd: isize) {}
 
 #[cfg(windows)]
 fn is_window_alive(hwnd: isize) -> bool {
