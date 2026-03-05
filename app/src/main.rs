@@ -2294,6 +2294,7 @@ impl DawApp {
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
+                ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
             }
             ctx.request_repaint();
@@ -2333,6 +2334,7 @@ impl DawApp {
             });
         if close_editor {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
+                ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
             }
             open = false;
@@ -2341,6 +2343,7 @@ impl DawApp {
         self.show_plugin_ui = open;
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
+                ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
             }
             ctx.request_repaint();
@@ -7997,9 +8000,9 @@ fn create_plugin_top_window(width: i32, height: i32) -> Option<isize> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassExW, ShowWindow, WNDCLASSEXW,
-        CS_HREDRAW, CS_VREDRAW, CS_OWNDC, SW_SHOW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-        WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CreateWindowExW, RegisterClassExW, ShowWindow, WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW,
+        CS_OWNDC, SW_SHOW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
+        WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     let class_name: Vec<u16> = OsStr::new("LingStationPluginHost")
@@ -8015,7 +8018,7 @@ fn create_plugin_top_window(width: i32, height: i32) -> Option<isize> {
         let wnd_class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
-            lpfnWndProc: Some(DefWindowProcW),
+            lpfnWndProc: Some(plugin_host_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
@@ -8058,6 +8061,23 @@ fn create_plugin_top_window(width: i32, height: i32) -> Option<isize> {
 #[cfg(not(windows))]
 fn create_plugin_top_window(_width: i32, _height: i32) -> Option<isize> {
     None
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn plugin_host_wndproc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, ShowWindow, SW_HIDE, WM_CLOSE,
+    };
+    if msg == WM_CLOSE {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 #[cfg(not(windows))]
