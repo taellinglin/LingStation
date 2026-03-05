@@ -55,7 +55,7 @@ fn load_app_icon() -> Option<egui::IconData> {
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     {
-        let data = include_bytes!("../../font.otf");
+        let data = include_bytes!("../../font.ttf");
         fonts
             .font_data
             .insert("custom".to_string(), egui::FontData::from_static(data));
