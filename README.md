@@ -1,24 +1,29 @@
-# LingStation DAW Boilerplate
+# LingStation
 
-This is a Rust workspace with a minimal audio engine crate and an egui GUI app.
+LingStation is a Rust-based DAW with an egui/eframe UI, VST3 hosting, a piano roll, and automation tools.
 
-## Crates
-- engine: audio, MIDI, and VST host stubs
-- app: egui GUI with a simple piano roll visualization
+## Features
+- Arranger timeline with looping, snapping, and clip previews
+- Piano roll editor with note tools and lane editor (velocity, pan, cutoff, resonance, MIDI CC)
+- Track mixer with per-track level/mute/solo and peak meters
+- VST3 instrument and effect hosting with native editor windows
+- MIDI import/export and automation recording
+- Audio clip support with gain/pitch/time controls
+- Render/export to WAV, OGG, and FLAC
 
 ## Build
-Run from the workspace root:
+From the workspace root:
 
 ```
 cargo build
 ```
 
-## Run GUI
+## Run
 ```
 cargo run -p lingstation-app
 ```
 
 ## Notes
-- VST hosting is a stub; add a VST3 dependency (for example, vst3-sys) and wire it in engine/src/vst.rs.
-- MIDI import/export is a minimal SMF implementation for now.
-- MIDI and audio backends are placeholders.
+- The VST3 SDK is included as a submodule at `vst3sdk`.
+- On Linux, you need ALSA dev packages (`libasound2-dev`) to build.
+- `font.otf`, `font.ttf`, `icon.png`, and `startup.wav` are runtime assets used by the app.
