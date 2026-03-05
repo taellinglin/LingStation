@@ -14,16 +14,15 @@ fn main() {
             if let Ok(img) = image::open(&icon_png) {
                 let rgba = img.to_rgba8();
                 let (width, height) = rgba.dimensions();
-                if let Ok(icon_image) = ico::IconImage::from_rgba_data(width, height, rgba.into_raw()) {
-                    if let Ok(entry) = ico::IconDirEntry::encode(&icon_image) {
-                        let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
-                        icon_dir.add_entry(entry);
-                        if let Ok(mut file) = std::fs::File::create(&icon_ico) {
-                            let _ = icon_dir.write(&mut file);
-                            let mut res = winres::WindowsResource::new();
-                            res.set_icon(icon_ico.to_string_lossy());
-                            let _ = res.compile();
-                        }
+                let icon_image = ico::IconImage::from_rgba_data(width, height, rgba.into_raw());
+                if let Ok(entry) = ico::IconDirEntry::encode(&icon_image) {
+                    let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
+                    icon_dir.add_entry(entry);
+                    if let Ok(mut file) = std::fs::File::create(&icon_ico) {
+                        let _ = icon_dir.write(&mut file);
+                        let mut res = winres::WindowsResource::new();
+                        res.set_icon(icon_ico.to_string_lossy().as_ref());
+                        let _ = res.compile();
                     }
                 }
             }
