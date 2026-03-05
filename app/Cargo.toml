@@ -38,3 +38,8 @@ windows-sys = { version = "0.52", features = [
 	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+winres = "0.1"
+image = { version = "0.24", default-features = false, features = ["png"] }
+ico = "0.3"
