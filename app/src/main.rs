@@ -2356,10 +2356,6 @@ impl DawApp {
             return;
         };
 
-        let was_running = self.audio_running;
-        if was_running {
-            self.stop_audio_and_midi();
-        }
         let host = match target {
             PluginUiTarget::Instrument(index) => self
                 .selected_track_host()
@@ -2370,9 +2366,6 @@ impl DawApp {
         };
         let Some(host) = host else {
             self.status = "No VST3 host for UI".to_string();
-            if was_running {
-                let _ = self.start_audio_and_midi();
-            }
             return;
         };
         let mut editor = {
@@ -2380,9 +2373,6 @@ impl DawApp {
                 Ok(host) => host,
                 Err(_) => {
                     self.status = "Plugin busy; try again".to_string();
-                    if was_running {
-                        let _ = self.start_audio_and_midi();
-                    }
                     return;
                 }
             };
@@ -2390,9 +2380,6 @@ impl DawApp {
                 Some(editor) => editor,
                 None => {
                     self.status = "Plugin has no UI".to_string();
-                    if was_running {
-                        let _ = self.start_audio_and_midi();
-                    }
                     return;
                 }
             }
@@ -2403,48 +2390,33 @@ impl DawApp {
             Some(hwnd) => hwnd,
             None => {
                 self.status = "Failed to create plugin UI window".to_string();
-                if was_running {
-                    let _ = self.start_audio_and_midi();
-                }
                 return;
             }
         };
         eprintln!("Plugin UI window hwnd={hwnd}");
-        let mut child_hwnd = match create_plugin_child_window(hwnd) {
-            Some(child_hwnd) => child_hwnd,
-            None => {
-                self.status = "Failed to create plugin UI child window".to_string();
-                destroy_plugin_child_window(hwnd);
-                if was_running {
-                    let _ = self.start_audio_and_midi();
-                }
-                return;
-            }
-        };
-        move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
-        let mut attached = editor.attach_hwnd(child_hwnd).is_ok();
+        let mut child_hwnd = hwnd;
+        let mut attached = editor.attach_hwnd(hwnd).is_ok();
         if !attached {
-            destroy_plugin_child_window(child_hwnd);
-            child_hwnd = hwnd;
+            child_hwnd = match create_plugin_child_window(hwnd) {
+                Some(child_hwnd) => child_hwnd,
+                None => {
+                    self.status = "Failed to create plugin UI child window".to_string();
+                    destroy_plugin_child_window(hwnd);
+                    return;
+                }
+            };
+            move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
             attached = editor.attach_hwnd(child_hwnd).is_ok();
         }
         if !attached {
             self.status = "VST3 view attach failed".to_string();
             destroy_plugin_child_window(hwnd);
-            if was_running {
-                let _ = self.start_audio_and_midi();
-            }
             return;
         }
         eprintln!("Plugin UI attached");
         editor.set_size(w, h);
         editor.set_focus(true);
         bring_window_to_front(hwnd);
-        if was_running {
-            self.plugin_ui_resume_at = Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(250),
-            );
-        }
         self.plugin_ui = Some(PluginUiHost {
             hwnd,
             child_hwnd,
