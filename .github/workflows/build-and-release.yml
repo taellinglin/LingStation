@@ -1,0 +1,96 @@
+name: Release Binaries
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path('Cargo.toml').read_text(encoding='utf-8')
+          in_workspace = False
+          version = None
+          for line in text.splitlines():
+            if line.strip() == '[workspace.package]':
+              in_workspace = True
+              continue
+            if in_workspace and line.strip().startswith('['):
+              break
+            if in_workspace:
+              match = re.match(r'version\s*=\s*"([^"]+)"', line.strip())
+              if match:
+                version = match.group(1)
+                break
+          if not version:
+            raise SystemExit('version not found in [workspace.package]')
+          print(version)
+          PY
+          )
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Build (release)
+        run: cargo build -p lingstation-app --release
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          BIN_NAME=lingstation-app
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            EXT=macOS
+          else
+            EXT=Linux
+          fi
+          cp "target/release/${BIN_NAME}" "dist/LingStation-v${VERSION}-${EXT}"
+          tar -czf "dist/LingStation-v${VERSION}-${EXT}.tar.gz" -C dist "LingStation-v${VERSION}-${EXT}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $binName = "lingstation-app.exe"
+          $dest = "dist\LingStation-v$env:VERSION-Windows.exe"
+          Copy-Item -Path "target\release\$binName" -Destination $dest
+          Compress-Archive -Path $dest -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
