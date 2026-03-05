@@ -2293,7 +2293,9 @@ impl DawApp {
 
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.show_plugin_ui {
-            self.destroy_plugin_ui();
+            if self.plugin_ui.is_some() {
+                self.destroy_plugin_ui();
+            }
             ctx.request_repaint();
             return;
         }
@@ -2453,11 +2455,14 @@ impl DawApp {
     }
 
     fn destroy_plugin_ui(&mut self) {
+        let Some(mut ui_host) = self.plugin_ui.take() else {
+            return;
+        };
         let was_running = self.audio_running;
         if was_running {
             self.stop_audio_and_midi();
         }
-        if let Some(mut ui_host) = self.plugin_ui.take() {
+        {
             ui_host.editor.removed();
             if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
                 destroy_plugin_child_window(ui_host.child_hwnd);
