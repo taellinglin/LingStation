@@ -642,6 +642,7 @@ struct DawApp {
     piano_cc_drag: Option<usize>,
     piano_roll_rect: Option<egui::Rect>,
     plugin_ui: Option<PluginUiHost>,
+    plugin_ui_hidden: bool,
     plugin_ui_resume_at: Option<std::time::Instant>,
     last_params_track: Option<usize>,
     fs_expanded: HashSet<String>,
@@ -660,6 +661,7 @@ struct PluginUiHost {
     editor: vst3::Vst3Editor,
     host: Arc<Mutex<vst3::Vst3Host>>,
     target: PluginUiTarget,
+    close_requested: Arc<AtomicBool>,
 }
 
 struct CallbackGuard {
@@ -952,6 +954,7 @@ impl Default for DawApp {
             piano_cc_drag: None,
             piano_roll_rect: None,
             plugin_ui: None,
+            plugin_ui_hidden: false,
             plugin_ui_resume_at: None,
             last_params_track: None,
             fs_expanded: HashSet::new(),
@@ -2292,32 +2295,62 @@ impl DawApp {
     }
 
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if ui_host.close_requested.swap(false, Ordering::Relaxed) {
+                self.show_plugin_ui = false;
+                self.plugin_ui_hidden = true;
+                ui_host.editor.set_focus(false);
+                hide_plugin_window(ui_host.hwnd);
+                ctx.request_repaint();
+                return;
+            }
+        }
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if !is_window_visible(ui_host.hwnd) {
+                if self.show_plugin_ui {
+                    if self.plugin_ui_hidden {
+                        show_plugin_window(ui_host.hwnd);
+                        self.plugin_ui_hidden = false;
+                    } else {
+                        self.show_plugin_ui = false;
+                        self.plugin_ui_hidden = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                } else {
+                    self.plugin_ui_hidden = true;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
             }
+            if self.plugin_ui.is_some() {
+                self.plugin_ui_hidden = true;
+            }
             ctx.request_repaint();
             return;
-        }
-        if let Some(ui_host) = self.plugin_ui.as_ref() {
-            if !is_window_visible(ui_host.hwnd) {
-                self.show_plugin_ui = false;
-                ctx.request_repaint();
-                return;
-            }
         }
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
             if !is_window_alive(ui_host.hwnd) {
                 self.destroy_plugin_ui();
                 self.show_plugin_ui = false;
+                self.plugin_ui_hidden = false;
                 ctx.request_repaint();
                 return;
             }
         }
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if self.plugin_ui_hidden {
+                show_plugin_window(ui_host.hwnd);
+                self.plugin_ui_hidden = false;
+            }
             pump_plugin_messages();
             show_plugin_window(ui_host.hwnd);
             bring_window_to_front(ui_host.hwnd);
@@ -2351,6 +2384,7 @@ impl DawApp {
                 hide_plugin_window(ui_host.hwnd);
             }
             open = false;
+            self.plugin_ui_hidden = true;
             ctx.request_repaint();
         }
         self.show_plugin_ui = open;
@@ -2358,6 +2392,9 @@ impl DawApp {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
+            }
+            if self.plugin_ui.is_some() {
+                self.plugin_ui_hidden = true;
             }
             ctx.request_repaint();
         }
@@ -2446,12 +2483,15 @@ impl DawApp {
         bring_window_to_front(hwnd);
         invalidate_plugin_window(child_hwnd);
         invalidate_plugin_window(hwnd);
+        let close_requested = Arc::new(AtomicBool::new(false));
+        set_plugin_close_flag(hwnd, &close_requested);
         self.plugin_ui = Some(PluginUiHost {
             hwnd,
             child_hwnd,
             editor,
             host: host.clone(),
             target,
+            close_requested,
         });
     }
 
@@ -2467,6 +2507,7 @@ impl DawApp {
             destroy_plugin_child_window(ui_host.hwnd);
         }
         self.plugin_ui_target = None;
+        self.plugin_ui_hidden = false;
     }
 
     fn left_sidebar(&mut self, ctx: &egui::Context) {
@@ -5631,9 +5672,16 @@ impl DawApp {
         if self.is_recording {
             let _ = self.end_recording();
         }
+        if self.audio_running {
+            self.stop_audio_and_midi();
+        }
         self.show_plugin_ui = false;
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            ui_host.editor.set_focus(false);
+            hide_plugin_window(ui_host.hwnd);
+        }
         self.destroy_plugin_ui();
-        self.stop_audio_and_midi();
+        self.plugin_ui_hidden = false;
         let mut hosts: Vec<Arc<Mutex<vst3::Vst3Host>>> = Vec::new();
         for state in self.track_audio.iter_mut() {
             if let Some(host) = state.host.take() {
@@ -8090,6 +8138,9 @@ unsafe extern "system" fn plugin_host_wndproc(
         DefWindowProcW, ShowWindow, SW_HIDE, WM_CLOSE,
     };
     if msg == WM_CLOSE {
+        if let Some(flag) = get_plugin_close_flag(hwnd) {
+            flag.store(true, Ordering::Relaxed);
+        }
         ShowWindow(hwnd, SW_HIDE);
         return 0;
     }
@@ -8171,6 +8222,34 @@ fn invalidate_plugin_window(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn invalidate_plugin_window(_hwnd: isize) {}
+
+#[cfg(windows)]
+fn set_plugin_close_flag(hwnd: isize, flag: &Arc<AtomicBool>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+    let ptr = Arc::as_ptr(flag) as isize;
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_plugin_close_flag(_hwnd: isize, _flag: &Arc<AtomicBool>) {}
+
+#[cfg(windows)]
+fn get_plugin_close_flag(hwnd: isize) -> Option<&'static AtomicBool> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const AtomicBool;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+#[cfg(not(windows))]
+fn get_plugin_close_flag(_hwnd: isize) -> Option<&'static AtomicBool> {
+    None
+}
 
 #[cfg(windows)]
 fn pump_plugin_messages() {
