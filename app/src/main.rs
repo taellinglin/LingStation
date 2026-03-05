@@ -2440,7 +2440,6 @@ impl DawApp {
         editor.set_size(w, h);
         editor.set_focus(true);
         bring_window_to_front(hwnd);
-        focus_plugin_window(child_hwnd);
         if was_running {
             self.plugin_ui_resume_at = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(250),
@@ -8122,16 +8121,6 @@ fn bring_window_to_front(hwnd: isize) {
 #[cfg(not(windows))]
 fn bring_window_to_front(_hwnd: isize) {}
 
-#[cfg(windows)]
-fn focus_plugin_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::SetFocus;
-    unsafe {
-        SetFocus(hwnd);
-    }
-}
-
-#[cfg(not(windows))]
-fn focus_plugin_window(_hwnd: isize) {}
 
 #[cfg(windows)]
 fn is_window_alive(hwnd: isize) -> bool {
