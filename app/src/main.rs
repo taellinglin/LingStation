@@ -2293,8 +2293,8 @@ impl DawApp {
 
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.show_plugin_ui {
-            if self.plugin_ui.is_some() {
-                self.destroy_plugin_ui();
+            if let Some(ui_host) = self.plugin_ui.as_ref() {
+                hide_plugin_window(ui_host.hwnd);
             }
             ctx.request_repaint();
             return;
@@ -2309,6 +2309,11 @@ impl DawApp {
             }
         }
 
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            show_plugin_window(ui_host.hwnd);
+            bring_window_to_front(ui_host.hwnd);
+            ui_host.editor.set_focus(true);
+        }
         self.ensure_plugin_ui();
 
         let mut open = self.show_plugin_ui;
@@ -2327,13 +2332,17 @@ impl DawApp {
                     if ui.button("Close Editor").clicked() { close_editor = true; }
             });
         if close_editor {
-            self.destroy_plugin_ui();
+            if let Some(ui_host) = self.plugin_ui.as_ref() {
+                hide_plugin_window(ui_host.hwnd);
+            }
             open = false;
             ctx.request_repaint();
         }
         self.show_plugin_ui = open;
         if !self.show_plugin_ui {
-            self.destroy_plugin_ui();
+            if let Some(ui_host) = self.plugin_ui.as_ref() {
+                hide_plugin_window(ui_host.hwnd);
+            }
             ctx.request_repaint();
         }
     }
@@ -2394,18 +2403,19 @@ impl DawApp {
             }
         };
         eprintln!("Plugin UI window hwnd={hwnd}");
-        let mut child_hwnd = hwnd;
-        let mut attached = editor.attach_hwnd(hwnd).is_ok();
+        let mut child_hwnd = match create_plugin_child_window(hwnd) {
+            Some(child_hwnd) => child_hwnd,
+            None => {
+                self.status = "Failed to create plugin UI child window".to_string();
+                destroy_plugin_child_window(hwnd);
+                return;
+            }
+        };
+        move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
+        let mut attached = editor.attach_hwnd(child_hwnd).is_ok();
         if !attached {
-            child_hwnd = match create_plugin_child_window(hwnd) {
-                Some(child_hwnd) => child_hwnd,
-                None => {
-                    self.status = "Failed to create plugin UI child window".to_string();
-                    destroy_plugin_child_window(hwnd);
-                    return;
-                }
-            };
-            move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
+            destroy_plugin_child_window(child_hwnd);
+            child_hwnd = hwnd;
             attached = editor.attach_hwnd(child_hwnd).is_ok();
         }
         if !attached {
@@ -8092,6 +8102,28 @@ fn bring_window_to_front(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn bring_window_to_front(_hwnd: isize) {}
+
+#[cfg(windows)]
+fn hide_plugin_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    unsafe {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_plugin_window(_hwnd: isize) {}
+
+#[cfg(windows)]
+fn show_plugin_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_plugin_window(_hwnd: isize) {}
 
 
 #[cfg(windows)]
