@@ -2292,13 +2292,6 @@ impl DawApp {
     }
 
     fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(ui_host) = self.plugin_ui.as_ref() {
-            if !is_window_visible(ui_host.hwnd) {
-                self.show_plugin_ui = false;
-                ctx.request_repaint();
-                return;
-            }
-        }
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 ui_host.editor.set_focus(false);
@@ -2306,6 +2299,13 @@ impl DawApp {
             }
             ctx.request_repaint();
             return;
+        }
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            if !is_window_visible(ui_host.hwnd) {
+                self.show_plugin_ui = false;
+                ctx.request_repaint();
+                return;
+            }
         }
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
@@ -2318,9 +2318,13 @@ impl DawApp {
         }
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
+            pump_plugin_messages();
             show_plugin_window(ui_host.hwnd);
             bring_window_to_front(ui_host.hwnd);
             ui_host.editor.set_focus(true);
+            if let Some((cw, ch)) = client_window_size(ui_host.child_hwnd) {
+                ui_host.editor.set_size(cw, ch);
+            }
             invalidate_plugin_window(ui_host.child_hwnd);
             invalidate_plugin_window(ui_host.hwnd);
         }
@@ -2436,7 +2440,8 @@ impl DawApp {
             return;
         }
         eprintln!("Plugin UI attached");
-        editor.set_size(w, h);
+        let (cw, ch) = client_window_size(child_hwnd).unwrap_or((w, h));
+        editor.set_size(cw, ch);
         editor.set_focus(true);
         bring_window_to_front(hwnd);
         invalidate_plugin_window(child_hwnd);
@@ -8166,6 +8171,45 @@ fn invalidate_plugin_window(hwnd: isize) {
 
 #[cfg(not(windows))]
 fn invalidate_plugin_window(_hwnd: isize) {}
+
+#[cfg(windows)]
+fn pump_plugin_messages() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE, MSG,
+    };
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn pump_plugin_messages() {}
+
+#[cfg(windows)]
+fn client_window_size(hwnd: isize) -> Option<(i32, i32)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe { GetClientRect(hwnd, &mut rect) };
+    if ok == 0 {
+        return None;
+    }
+    Some(((rect.right - rect.left).max(0), (rect.bottom - rect.top).max(0)))
+}
+
+#[cfg(not(windows))]
+fn client_window_size(_hwnd: isize) -> Option<(i32, i32)> {
+    None
+}
 
 
 #[cfg(windows)]
