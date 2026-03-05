@@ -352,6 +352,20 @@ struct TrackAudioState {
     peak_l_bits: Arc<AtomicU32>,
     peak_r_bits: Arc<AtomicU32>,
     automation_lanes: Arc<Mutex<Vec<AutomationLane>>>,
+    pending_param_changes: Arc<Mutex<Vec<PendingParamChange>>>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingParamTarget {
+    Instrument,
+    Effect(usize),
+}
+
+#[derive(Clone, Copy)]
+struct PendingParamChange {
+    target: PendingParamTarget,
+    param_id: u32,
+    value: f64,
 }
 
 impl TrackAudioState {
@@ -367,6 +381,7 @@ impl TrackAudioState {
             peak_l_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             peak_r_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             automation_lanes: Arc::new(Mutex::new(track.automation_lanes.clone())),
+            pending_param_changes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4352,33 +4367,38 @@ impl DawApp {
                                                     .selected_track
                                                     .and_then(|i| self.track_audio.get(i))
                                                 {
-                                                    if let Some(host) = state.host.as_ref() {
-                                                        if let Ok(mut host) = host.lock() {
-                                                            if let Some((channel, controller)) =
-                                                                host.param_to_cc(param_id)
-                                                            {
-                                                                if let Ok(mut events) =
-                                                                    state.midi_events.lock()
+                                                        if let Some(host) = state.host.as_ref() {
+                                                            if let Ok(host) = host.try_lock() {
+                                                                if let Some((channel, controller)) =
+                                                                    host.param_to_cc(param_id)
                                                                 {
-                                                                    let cc_value =
-                                                                        (*value * 127.0).round() as i32;
-                                                                    let cc_value =
-                                                                        cc_value.clamp(0, 127) as u8;
-                                                                    events.push(
-                                                                        vst3::MidiEvent::control_change(
-                                                                            channel,
-                                                                            controller,
-                                                                            cc_value,
-                                                                        ),
-                                                                    );
+                                                                    if let Ok(mut events) =
+                                                                        state.midi_events.lock()
+                                                                    {
+                                                                        let cc_value =
+                                                                            (*value * 127.0).round() as i32;
+                                                                        let cc_value =
+                                                                            cc_value.clamp(0, 127) as u8;
+                                                                        events.push(
+                                                                            vst3::MidiEvent::control_change(
+                                                                                channel,
+                                                                                controller,
+                                                                                cc_value,
+                                                                            ),
+                                                                        );
+                                                                    }
                                                                 }
                                                             }
-                                                            host.push_param_change(
-                                                                param_id,
-                                                                *value as f64,
-                                                            );
                                                         }
-                                                    }
+                                                        if let Ok(mut pending) =
+                                                            state.pending_param_changes.lock()
+                                                        {
+                                                            pending.push(PendingParamChange {
+                                                                target: PendingParamTarget::Instrument,
+                                                                param_id,
+                                                                value: *value as f64,
+                                                            });
+                                                        }
                                                 }
                                                 if self.is_recording && self.record_automation {
                                                     if let Some(track_index) = selected_track_index {
@@ -4447,11 +4467,15 @@ impl DawApp {
                                                     .selected_track
                                                     .and_then(|i| self.track_audio.get(i))
                                                 {
-                                                    if let Some(host) = state.host.as_ref() {
-                                                        if let Ok(mut host) = host.lock() {
-                                                            host.push_param_change(param_id, value as f64);
+                                                        if let Ok(mut pending) =
+                                                            state.pending_param_changes.lock()
+                                                        {
+                                                            pending.push(PendingParamChange {
+                                                                target: PendingParamTarget::Instrument,
+                                                                param_id,
+                                                                value: value as f64,
+                                                            });
                                                         }
-                                                    }
                                                 }
                                             }
                                         }
@@ -4522,13 +4546,16 @@ impl DawApp {
                                                                 if let Some(fx_host) =
                                                                     state.effect_hosts.get(fx_index)
                                                                 {
-                                                                    if let Ok(mut fx_host) =
-                                                                        fx_host.lock()
+                                                                    if let Ok(mut pending) =
+                                                                        state.pending_param_changes.lock()
                                                                     {
-                                                                        fx_host.push_param_change(
+                                                                        pending.push(PendingParamChange {
+                                                                            target: PendingParamTarget::Effect(
+                                                                                fx_index,
+                                                                            ),
                                                                             param_id,
-                                                                            *value as f64,
-                                                                        );
+                                                                            value: *value as f64,
+                                                                        });
                                                                     }
                                                                 }
                                                             }
@@ -9077,8 +9104,25 @@ fn mix_track_hosts(
         if let Ok(mut queued) = state.midi_events.lock() {
             events.extend(queued.drain(..));
         }
+        let pending_params = state
+            .pending_param_changes
+            .lock()
+            .ok()
+            .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
         temp.fill(0.0);
         if let Ok(mut host) = host.lock() {
+            let mut remaining_params: Vec<PendingParamChange> = Vec::new();
+            for pending in &pending_params {
+                match pending.target {
+                    PendingParamTarget::Instrument => {
+                        host.push_param_change(pending.param_id, pending.value);
+                    }
+                    PendingParamTarget::Effect(_) => {
+                        remaining_params.push(*pending);
+                    }
+                }
+            }
             for lane in &automation {
                 if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
                     if lane.target == AutomationTarget::Instrument {
@@ -9113,6 +9157,18 @@ fn mix_track_hosts(
                     }
                     scratch.fill(0.0);
                     if let Ok(mut fx_host) = fx_host.lock() {
+                        let mut still_pending: Vec<PendingParamChange> = Vec::new();
+                        for pending in remaining_params.drain(..) {
+                            match pending.target {
+                                PendingParamTarget::Effect(target_index)
+                                    if target_index == fx_index =>
+                                {
+                                    fx_host.push_param_change(pending.param_id, pending.value);
+                                }
+                                _ => still_pending.push(pending),
+                            }
+                        }
+                        remaining_params = still_pending;
                         for lane in &automation {
                             if let Some(value) =
                                 DawApp::automation_value_at(&lane.points, block_beat)
@@ -9133,6 +9189,11 @@ fn mix_track_hosts(
                         {
                             std::mem::swap(&mut current, &mut scratch);
                         }
+                    }
+                }
+                if !remaining_params.is_empty() {
+                    if let Ok(mut pending) = state.pending_param_changes.lock() {
+                        pending.extend(remaining_params);
                     }
                 }
                 let mut peak_l = 0.0f32;
