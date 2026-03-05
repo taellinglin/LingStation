@@ -8158,7 +8158,7 @@ fn show_plugin_window(_hwnd: isize) {}
 
 #[cfg(windows)]
 fn invalidate_plugin_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::InvalidateRect;
+    use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 1);
     }
