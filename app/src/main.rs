@@ -828,7 +828,7 @@ impl Default for DawApp {
             startup_stream: None,
             startup_sink: None,
             settings: SettingsState::default(),
-            settings_path: "settings.ling.json".to_string(),
+            settings_path: Self::default_settings_path(),
             show_plugin_picker: false,
             show_plugin_ui: false,
             plugin_ui_target: None,
@@ -6596,6 +6596,31 @@ impl DawApp {
         };
         let folder = Self::sanitize_folder_name(name);
         Some(base.join(folder))
+    }
+
+    fn default_settings_path() -> String {
+        #[cfg(windows)]
+        {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                let dir = PathBuf::from(appdata).join("LingStation");
+                let _ = fs::create_dir_all(&dir);
+                return dir.join("settings.ling.json").to_string_lossy().to_string();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+                let dir = PathBuf::from(xdg).join("LingStation");
+                let _ = fs::create_dir_all(&dir);
+                return dir.join("settings.ling.json").to_string_lossy().to_string();
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                let dir = PathBuf::from(home).join(".config").join("LingStation");
+                let _ = fs::create_dir_all(&dir);
+                return dir.join("settings.ling.json").to_string_lossy().to_string();
+            }
+        }
+        "settings.ling.json".to_string()
     }
 
     fn normalize_windows_path(path: &Path) -> PathBuf {
