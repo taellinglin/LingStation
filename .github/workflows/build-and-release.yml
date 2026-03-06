@@ -108,6 +108,58 @@ jobs:
           Compress-Archive -Path "dist\*" -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
       - name: Delete existing release assets
+        run: echo "release handled in separate job"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ runner.os }}
+          path: dist/*
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path('Cargo.toml').read_text(encoding='utf-8')
+          in_workspace = False
+          version = None
+          for line in text.splitlines():
+            if line.strip() == '[workspace.package]':
+              in_workspace = True
+              continue
+            if in_workspace and line.strip().startswith('['):
+              break
+            if in_workspace:
+              match = re.match(r'version\s*=\s*"([^"]+)"', line.strip())
+              if match:
+                version = match.group(1)
+                break
+          if not version:
+            raise SystemExit('version not found in [workspace.package]')
+          print(version)
+          PY
+          )
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Delete existing release assets
         uses: actions/github-script@v7
         with:
           script: |
@@ -142,5 +194,5 @@ jobs:
           target_commitish: ${{ github.sha }}
           make_latest: true
           files: |
-            dist/*.tar.gz
-            dist/*.zip
+            dist/**/LingStation-v${{ env.VERSION }}-*.tar.gz
+            dist/**/LingStation-v${{ env.VERSION }}-*.zip
