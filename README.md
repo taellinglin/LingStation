@@ -26,4 +26,4 @@ cargo run -p lingstation-app
 ## Notes
 - The VST3 SDK is included as a submodule at `vst3sdk`.
 - On Linux, you need ALSA dev packages (`libasound2-dev`) to build.
-- `font.otf`, `font.ttf`, `icon.png`, and `startup.wav` are runtime assets used by the app.
+- The UI font and startup sound are embedded in the binary.
