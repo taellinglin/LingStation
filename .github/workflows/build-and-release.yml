@@ -82,16 +82,8 @@ jobs:
             EXT=Linux
           fi
           cp "target/release/${BIN_NAME}" "dist/LingStation-v${VERSION}-${EXT}"
-          cp "font.otf" "dist/"
-          cp "font.ttf" "dist/"
-          cp "icon.png" "dist/"
-          cp "startup.wav" "dist/"
           tar -czf "dist/LingStation-v${VERSION}-${EXT}.tar.gz" -C dist \
-            "LingStation-v${VERSION}-${EXT}" \
-            "font.otf" \
-            "font.ttf" \
-            "icon.png" \
-            "startup.wav"
+            "LingStation-v${VERSION}-${EXT}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -101,11 +93,7 @@ jobs:
           $binName = "lingstation-app.exe"
           $dest = "dist\LingStation-v$env:VERSION-Windows.exe"
           Copy-Item -Path "target\release\$binName" -Destination $dest
-          Copy-Item -Path "font.otf" -Destination "dist\font.otf"
-          Copy-Item -Path "font.ttf" -Destination "dist\font.ttf"
-          Copy-Item -Path "icon.png" -Destination "dist\icon.png"
-          Copy-Item -Path "startup.wav" -Destination "dist\startup.wav"
-          Compress-Archive -Path "dist\*" -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
+          Compress-Archive -Path $dest -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
       - name: Delete existing release assets
         run: echo "release handled in separate job"
