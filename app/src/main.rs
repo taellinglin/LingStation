@@ -2,7 +2,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
 use engine::timeline::PianoRollNote;
-use image::GenericImageView;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use rayon::prelude::*;
@@ -597,6 +596,7 @@ struct DawApp {
     clip_drag: Option<ClipDragState>,
     arranger_tool: ArrangerTool,
     arranger_select_start: Option<egui::Pos2>,
+    arranger_select_add: bool,
     arranger_draw: Option<ArrangerDrawState>,
     clip_clipboard: Option<Clip>,
     waveform_cache: RefCell<HashMap<String, Vec<f32>>>,
@@ -614,8 +614,11 @@ struct DawApp {
     piano_tool: PianoTool,
     piano_selected: HashSet<usize>,
     piano_marquee_start: Option<egui::Pos2>,
+    piano_marquee_add: bool,
     piano_cc_drag: Option<usize>,
     piano_roll_rect: Option<egui::Rect>,
+    piano_roll_panel_height: f32,
+    selected_clips: HashSet<usize>,
     plugin_ui: Option<PluginUiHost>,
     plugin_ui_hidden: bool,
     plugin_ui_resume_at: Option<std::time::Instant>,
@@ -834,6 +837,7 @@ impl Default for DawApp {
             })
             .collect();
         let selected_track_index = Some(0);
+        let initial_selected_clip = Some(1);
 
         let mut app = Self {
             project_name: "LingStation Demo".to_string(),
@@ -845,7 +849,7 @@ impl Default for DawApp {
             metadata_year: String::new(),
             metadata_comment: String::new(),
             tracks,
-            selected_clip: Some(1),
+            selected_clip: initial_selected_clip,
             selected_track: Some(0),
             playhead_beats: 0.0,
             last_frame_time: None,
@@ -950,6 +954,7 @@ impl Default for DawApp {
             clip_drag: None,
             arranger_tool: ArrangerTool::Move,
             arranger_select_start: None,
+            arranger_select_add: false,
             arranger_draw: None,
             clip_clipboard: None,
             waveform_cache: RefCell::new(HashMap::new()),
@@ -967,8 +972,17 @@ impl Default for DawApp {
             piano_tool: PianoTool::Pencil,
             piano_selected: HashSet::new(),
             piano_marquee_start: None,
+            piano_marquee_add: false,
             piano_cc_drag: None,
             piano_roll_rect: None,
+            piano_roll_panel_height: 0.0,
+            selected_clips: {
+                let mut set = HashSet::new();
+                if let Some(clip_id) = initial_selected_clip {
+                    set.insert(clip_id);
+                }
+                set
+            },
             plugin_ui: None,
             plugin_ui_hidden: false,
             plugin_ui_resume_at: None,
@@ -2837,7 +2851,7 @@ impl DawApp {
 
     fn mixer_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("mixer_panel")
-            .default_width(260.0)
+            .default_width(340.0)
             .max_width(340.0)
             .resizable(true)
             .show(ctx, |ui| {
@@ -3404,14 +3418,13 @@ impl DawApp {
             let row_height = 52.0;
             let beat_width = 22.0 * self.arranger_zoom;
             let header_height = 24.0;
-            let row_top_offset = header_height + self.arranger_pan.y;
             let lane_label_w = 160.0;
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             let pointer_pos = response
                 .hover_pos()
                 .or_else(|| ctx.input(|i| i.pointer.hover_pos()));
             let over_arranger = pointer_pos
-                .map(|pos| rect.contains(pos) && ctx.layer_id_at(pos) == Some(ui.layer_id()))
+                .map(|pos| rect.contains(pos))
                 .unwrap_or(false);
             if over_arranger && !self.piano_roll_hovered {
                 let input = ctx.input(|i| i.clone());
@@ -3432,12 +3445,34 @@ impl DawApp {
                     if delta == egui::Vec2::ZERO {
                         delta = input.raw_scroll_delta;
                     }
-                    self.arranger_pan += delta;
+                    self.arranger_pan += egui::vec2(-delta.x, -delta.y);
                 }
             }
-            if self.arranger_pan.y < 0.0 {
-                self.arranger_pan.y = 0.0;
+            let mut max_end_beats = self.playhead_beats.max(4.0);
+            for track in &self.tracks {
+                for clip in &track.clips {
+                    let end = clip.start_beats + clip.length_beats;
+                    if end > max_end_beats {
+                        max_end_beats = end;
+                    }
+                }
             }
+            let view_width = (rect.width() - lane_label_w - 24.0).max(1.0);
+            let content_width = max_end_beats * beat_width + 160.0;
+            let min_pan_x = (view_width - content_width).min(0.0);
+            let view_height = rect.height().max(1.0);
+            let content_height = header_height + self.tracks.len() as f32 * row_height + 8.0;
+            // Allow extra vertical pan only while the piano roll panel is in use.
+            let piano_roll_open = self.selected_clip.is_some();
+            let piano_roll_margin = if piano_roll_open {
+                self.piano_roll_panel_height
+            } else {
+                0.0
+            };
+            let min_pan_y = (view_height - content_height - piano_roll_margin).min(0.0);
+            self.arranger_pan.x = self.arranger_pan.x.clamp(min_pan_x, 0.0);
+            self.arranger_pan.y = self.arranger_pan.y.clamp(min_pan_y, 0.0);
+            let row_top_offset = header_height + self.arranger_pan.y;
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
             let header_rect = egui::Rect::from_min_max(
@@ -4264,6 +4299,7 @@ impl DawApp {
             }
             if selection_changed {
                 self.refresh_params_for_selected_track(false);
+                self.piano_selected.clear();
             }
             if switch_to_move {
                 self.arranger_tool = ArrangerTool::Move;
@@ -4383,6 +4419,7 @@ impl DawApp {
             .default_height(220.0)
             .resizable(true)
             .show(ctx, |ui| {
+                self.piano_roll_panel_height = ui.max_rect().height();
                 self.piano_roll_hovered = false;
                 let mut selected_clip_info = None;
                 if let Some(clip_id) = self.selected_clip {
@@ -4895,9 +4932,7 @@ impl DawApp {
                                                                 .selected_track
                                                                 .and_then(|i| self.track_audio.get(i))
                                                             {
-                                                                if let Some(fx_host) =
-                                                                    state.effect_hosts.get(fx_index)
-                                                                {
+                                                                if state.effect_hosts.get(fx_index).is_some() {
                                                                     if let Ok(mut pending) =
                                                                         state.pending_param_changes.lock()
                                                                     {
@@ -5289,6 +5324,13 @@ impl DawApp {
                                     let b = (base.b() as u16 + pan_blue as u16).min(255) as u8;
                                     let color = egui::Color32::from_rgba_premultiplied(r, g, b, alpha);
                                     painter.rect_filled(note_rect, 0.0, color);
+                                    if self.piano_selected.contains(&index) {
+                                        painter.rect_stroke(
+                                            note_rect,
+                                            0.0,
+                                            egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 240, 255)),
+                                        );
+                                    }
                                     if roll_response.hovered() {
                                         if let Some(pos) = roll_response.hover_pos() {
                                             if pos.x >= roll_rect.left() && note_rect.contains(pos) {
@@ -5326,8 +5368,76 @@ impl DawApp {
                         );
                     }
 
+                    let input = ctx.input(|i| i.clone());
+                    let ctrl = input.modifiers.ctrl;
+                    let shift = input.modifiers.shift;
+                    let alt = input.modifiers.alt;
+                    let mut marquee_rect: Option<egui::Rect> = None;
+                    if ctrl && roll_response.drag_started() {
+                        if let Some(pos) = roll_response.interact_pointer_pos() {
+                            if pos.x >= roll_rect.left() {
+                                self.piano_marquee_start = Some(pos);
+                                self.piano_marquee_add = shift;
+                            }
+                        }
+                    }
+                    if let Some(start) = self.piano_marquee_start {
+                        if roll_response.dragged() {
+                            if let Some(pos) = roll_response.interact_pointer_pos() {
+                                marquee_rect = Some(egui::Rect::from_two_pos(start, pos));
+                            }
+                        }
+                        if roll_response.drag_stopped() {
+                            if let Some(end) = roll_response.interact_pointer_pos() {
+                                let select_rect = egui::Rect::from_two_pos(start, end);
+                                if let Some(track_index) = self.selected_track {
+                                    if let Some(track) = self.tracks.get(track_index) {
+                                        let mut hits: Vec<usize> = Vec::new();
+                                        for (index, note) in track.midi_notes.iter().enumerate() {
+                                            let x = roll_rect.left()
+                                                + self.piano_pan.x
+                                                + note.start_beats * beat_width;
+                                            let y = roll_rect.bottom() + self.piano_pan.y
+                                                - (note.midi_note as f32 - 40.0) * note_height;
+                                            let w = (note.length_beats * beat_width).max(12.0);
+                                            let note_rect = egui::Rect::from_min_size(
+                                                egui::pos2(x, y - note_height),
+                                                egui::vec2(w, note_height),
+                                            );
+                                            if select_rect.intersects(note_rect) {
+                                                hits.push(index);
+                                            }
+                                        }
+                                        if !self.piano_marquee_add {
+                                            self.piano_selected.clear();
+                                        }
+                                        for index in hits {
+                                            self.piano_selected.insert(index);
+                                        }
+                                    }
+                                }
+                            }
+                            self.piano_marquee_start = None;
+                            self.piano_marquee_add = false;
+                        }
+                    }
+
                     let quantize = self.piano_snap.max(0.03125);
-                    if roll_response.clicked_by(egui::PointerButton::Primary) {
+                    if ctrl && roll_response.clicked_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = roll_response.interact_pointer_pos() {
+                            if pos.x < roll_rect.left() {
+                                return;
+                            }
+                            if let Some((note_index, _)) = hovered_note {
+                                if !shift {
+                                    self.piano_selected.clear();
+                                }
+                                self.piano_selected.insert(note_index);
+                            } else if !shift {
+                                self.piano_selected.clear();
+                            }
+                        }
+                    } else if roll_response.clicked_by(egui::PointerButton::Primary) {
                         if let Some(pos) = roll_response.interact_pointer_pos() {
                             if pos.x < roll_rect.left() {
                                 return;
@@ -5336,10 +5446,21 @@ impl DawApp {
                                 if let Some(track) = self.tracks.get_mut(track_index) {
                                     if hovered_note.is_none() {
                                         let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
-                                        let snapped = (beat / quantize).round() * quantize;
+                                        let snapped = if alt {
+                                            beat
+                                        } else {
+                                            (beat / quantize).round() * quantize
+                                        };
                                         let pitch_f = (roll_rect.bottom() + self.piano_pan.y - pos.y) / note_height;
                                         let pitch = (40.0 + pitch_f).floor() as i32;
                                         let pitch = pitch.clamp(0, 127) as u8;
+                                        if shift {
+                                            track.midi_notes.retain(|note| {
+                                                note.midi_note != pitch
+                                                    || note.start_beats + note.length_beats <= snapped
+                                                    || note.start_beats >= snapped + self.piano_note_len
+                                            });
+                                        }
                                         track
                                             .midi_notes
                                             .push(PianoRollNote::new(
@@ -5348,6 +5469,10 @@ impl DawApp {
                                                 pitch,
                                                 100,
                                             ));
+                                        if let Some(index) = track.midi_notes.len().checked_sub(1) {
+                                            self.piano_selected.clear();
+                                            self.piano_selected.insert(index);
+                                        }
                                         self.sync_track_audio_notes(track_index);
                                     }
                                 }
@@ -5361,6 +5486,13 @@ impl DawApp {
                                 if let Some(track) = self.tracks.get_mut(track_index) {
                                     if note_index < track.midi_notes.len() {
                                         track.midi_notes.remove(note_index);
+                                        self.piano_selected.remove(&note_index);
+                                        let shifted: HashSet<usize> = self
+                                            .piano_selected
+                                            .iter()
+                                            .map(|idx| if *idx > note_index { idx - 1 } else { *idx })
+                                            .collect();
+                                        self.piano_selected = shifted;
                                         self.sync_track_audio_notes(track_index);
                                     }
                                 }
@@ -5368,7 +5500,7 @@ impl DawApp {
                         }
                     }
 
-                    if roll_response.drag_started() {
+                    if roll_response.drag_started() && !ctrl {
                         if let Some((note_index, note_rect)) = hovered_note {
                             if let Some(pos) = roll_response.interact_pointer_pos() {
                                 if pos.x < roll_rect.left() {
@@ -5391,7 +5523,7 @@ impl DawApp {
                         }
                     }
 
-                    if roll_response.dragged() {
+                    if roll_response.dragged() && !ctrl {
                         if let Some(drag) = &self.piano_drag {
                             if let Some(pos) = roll_response.interact_pointer_pos() {
                                 if pos.x < roll_rect.left() {
@@ -5402,12 +5534,20 @@ impl DawApp {
                                         let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
                                         match drag.kind {
                                             PianoDragKind::Move => {
-                                                let snapped = ((beat - drag.offset_beats) / quantize).round() * quantize;
+                                                let snapped = if alt {
+                                                    beat - drag.offset_beats
+                                                } else {
+                                                    ((beat - drag.offset_beats) / quantize).round() * quantize
+                                                };
                                                 note.start_beats = snapped.max(0.0);
                                             }
                                             PianoDragKind::Resize => {
                                                 let length = beat - note.start_beats;
-                                                let snapped = (length / quantize).round() * quantize;
+                                                let snapped = if alt {
+                                                    length
+                                                } else {
+                                                    (length / quantize).round() * quantize
+                                                };
                                                 note.length_beats = snapped.max(quantize);
                                             }
                                         }
@@ -5421,6 +5561,19 @@ impl DawApp {
                         if let Some(drag) = self.piano_drag.take() {
                             self.sync_track_audio_notes(drag.track_index);
                         }
+                    }
+
+                    if let Some(rect) = marquee_rect {
+                        painter.rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(120, 170, 255)),
+                        );
+                        painter.rect_filled(
+                            rect,
+                            0.0,
+                            egui::Color32::from_rgba_premultiplied(80, 120, 200, 40),
+                        );
                     }
 
                     let playhead_x = roll_rect.left() + self.piano_pan.x + self.playhead_beats * beat_width;
@@ -6210,6 +6363,7 @@ impl DawApp {
             hide_plugin_window(ui_host.hwnd);
         }
         self.destroy_plugin_ui();
+        pump_plugin_messages();
         self.plugin_ui_hidden = false;
         if self.audio_running {
             self.stop_audio_and_midi();
@@ -7034,7 +7188,7 @@ impl DawApp {
         let base_name = self.render_base_name();
 
         let project_end = self.project_end_beats().max(0.0);
-        let mut range_start = self.render_range_start.max(0.0);
+        let range_start = self.render_range_start.max(0.0);
         let mut range_end = self.render_range_end.max(0.0);
         if range_end <= range_start {
             range_end = project_end.max(range_start + 0.25);
@@ -9868,7 +10022,7 @@ fn render_plan_to_flac(
     let mut ctx = Context::new(bits_per_sample, channels);
     let mut framebuf = FrameBuf::with_size(channels, block_size)
         .map_err(|e| format!("FLAC frame buffer error: {e:?}"))?;
-    let mut stream_info_probe = StreamInfo::new(sample_rate, channels, bits_per_sample)
+    let stream_info_probe = StreamInfo::new(sample_rate, channels, bits_per_sample)
         .map_err(|e| format!("FLAC stream info error: {e:?}"))?;
     let mut min_frame_size = usize::MAX;
     let mut max_frame_size = 0usize;
@@ -9926,7 +10080,7 @@ fn render_plan_to_flac(
     stream_info.set_total_samples(ctx.total_samples());
     stream_info.set_md5_digest(&ctx.md5_digest());
 
-    let mut stream = flacenc::component::Stream::with_stream_info(stream_info.clone());
+    let stream = flacenc::component::Stream::with_stream_info(stream_info.clone());
     let mut sink = ByteSink::new();
     stream
         .write(&mut sink)
