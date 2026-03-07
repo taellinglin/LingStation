@@ -1,10 +1,11 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use engine::midi::{export_midi, import_midi_channels};
+use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
 use engine::timeline::PianoRollNote;
 use image::GenericImageView;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use rodio::{Decoder, OutputStream, Sink, Source};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
@@ -215,6 +216,8 @@ struct Track {
     automation_channels: Vec<String>,
     #[serde(default)]
     midi_cc_lanes: Vec<MidiCcLane>,
+    #[serde(default)]
+    midi_program: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -245,6 +248,16 @@ struct SettingsState {
     sample_rate: u32,
     interpolation: String,
     midi_input: String,
+    #[serde(default)]
+    triple_buffer: bool,
+    #[serde(default)]
+    safe_underruns: bool,
+    #[serde(default)]
+    adaptive_buffer: bool,
+    #[serde(default)]
+    smart_disable_plugins: bool,
+    #[serde(default)]
+    smart_suspend_tracks: bool,
 }
 
 impl Default for SettingsState {
@@ -256,6 +269,11 @@ impl Default for SettingsState {
             sample_rate: 44_100,
             interpolation: "linear".to_string(),
             midi_input: String::new(),
+            triple_buffer: false,
+            safe_underruns: true,
+            adaptive_buffer: true,
+            smart_disable_plugins: true,
+            smart_suspend_tracks: true,
         }
     }
 }
@@ -272,6 +290,13 @@ enum PluginUiTarget {
     Effect(usize, usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectAction {
+    NewProject,
+    OpenProject,
+    ImportMidi,
+}
+
 #[derive(Clone)]
 struct TrackAudioState {
     host: Option<Arc<Mutex<vst3::Vst3Host>>>,
@@ -285,6 +310,7 @@ struct TrackAudioState {
     peak_r_bits: Arc<AtomicU32>,
     automation_lanes: Arc<Mutex<Vec<AutomationLane>>>,
     pending_param_changes: Arc<Mutex<Vec<PendingParamChange>>>,
+    silent_blocks: Arc<AtomicU32>,
 }
 
 #[derive(Clone, Copy)]
@@ -314,6 +340,7 @@ impl TrackAudioState {
             peak_r_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             automation_lanes: Arc::new(Mutex::new(track.automation_lanes.clone())),
             pending_param_changes: Arc::new(Mutex::new(Vec::new())),
+            silent_blocks: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -352,6 +379,7 @@ struct AudioClipData {
 #[derive(Clone)]
 struct AudioClipRender {
     path: String,
+    track_index: usize,
     start_samples: u64,
     length_samples: u64,
     offset_samples: u64,
@@ -495,6 +523,7 @@ struct DawApp {
     transport_samples: Arc<AtomicU64>,
     master_peak_bits: Arc<AtomicU32>,
     master_peak_display: f32,
+    last_output_channels: usize,
     track_audio: Vec<TrackAudioState>,
     track_mix: Arc<Mutex<Vec<TrackMixState>>>,
     selected_track_index: Arc<AtomicUsize>,
@@ -534,6 +563,11 @@ struct DawApp {
     show_plugin_picker: bool,
     show_plugin_ui: bool,
     plugin_ui_target: Option<PluginUiTarget>,
+    project_dirty: bool,
+    show_close_confirm: bool,
+    pending_project_action: Option<ProjectAction>,
+    pending_exit: bool,
+    exit_confirmed: bool,
     show_render_dialog: bool,
     render_format: RenderFormat,
     render_sample_rate: u32,
@@ -556,9 +590,14 @@ struct DawApp {
     plugin_candidates: Vec<String>,
     plugin_search: String,
     plugin_target: Option<PluginTarget>,
+    show_midi_import: bool,
+    midi_import_state: Option<MidiImportState>,
     undo_stack: Vec<UndoState>,
     redo_stack: Vec<UndoState>,
     clip_drag: Option<ClipDragState>,
+    arranger_tool: ArrangerTool,
+    arranger_select_start: Option<egui::Pos2>,
+    arranger_draw: Option<ArrangerDrawState>,
     clip_clipboard: Option<Clip>,
     waveform_cache: RefCell<HashMap<String, Vec<f32>>>,
     audio_clip_cache: Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>,
@@ -567,6 +606,10 @@ struct DawApp {
     audio_preview_sink: Option<Sink>,
     audio_preview_loop: bool,
     audio_preview_clip_id: Option<usize>,
+    buffer_override: Option<u32>,
+    adaptive_restart_requested: Arc<AtomicBool>,
+    adaptive_buffer_size: Arc<AtomicU32>,
+    last_overrun: Arc<AtomicBool>,
     piano_drag: Option<PianoDragState>,
     piano_tool: PianoTool,
     piano_selected: HashSet<usize>,
@@ -643,6 +686,29 @@ struct ClipDragState {
     undo_pushed: bool,
 }
 
+struct MidiImportState {
+    path: String,
+    tracks: Vec<MidiTrackData>,
+    enabled: Vec<bool>,
+    apply_program: Vec<bool>,
+    instrument_plugin: String,
+    percussion_plugin: String,
+    import_portamento: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrangerTool {
+    Draw,
+    Select,
+    Move,
+}
+
+struct ArrangerDrawState {
+    track_index: usize,
+    start_beats: f32,
+    start_pos: egui::Pos2,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PianoDragKind {
     Move,
@@ -705,6 +771,7 @@ impl Default for DawApp {
                 automation_lanes: Vec::new(),
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
+                midi_program: None,
             },
             Track {
                 name: "Vox".to_string(),
@@ -727,6 +794,7 @@ impl Default for DawApp {
                 automation_lanes: Vec::new(),
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
+                midi_program: None,
             },
             Track {
                 name: "Drums".to_string(),
@@ -749,6 +817,7 @@ impl Default for DawApp {
                 automation_lanes: Vec::new(),
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
+                midi_program: None,
             },
         ];
 
@@ -791,6 +860,7 @@ impl Default for DawApp {
             transport_samples: Arc::new(AtomicU64::new(0)),
             master_peak_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             master_peak_display: 0.0,
+            last_output_channels: 2,
             track_audio,
             track_mix: Arc::new(Mutex::new(track_mix_states)),
             selected_track_index: Arc::new(AtomicUsize::new(
@@ -832,6 +902,11 @@ impl Default for DawApp {
             show_plugin_picker: false,
             show_plugin_ui: false,
             plugin_ui_target: None,
+            project_dirty: false,
+            show_close_confirm: false,
+            pending_project_action: None,
+            pending_exit: false,
+            exit_confirmed: false,
             show_render_dialog: false,
             render_format: RenderFormat::Wav,
             render_sample_rate: 48_000,
@@ -868,9 +943,14 @@ impl Default for DawApp {
             plugin_candidates: Vec::new(),
             plugin_search: String::new(),
             plugin_target: None,
+            show_midi_import: false,
+            midi_import_state: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clip_drag: None,
+            arranger_tool: ArrangerTool::Move,
+            arranger_select_start: None,
+            arranger_draw: None,
             clip_clipboard: None,
             waveform_cache: RefCell::new(HashMap::new()),
             audio_clip_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -879,6 +959,10 @@ impl Default for DawApp {
             audio_preview_sink: None,
             audio_preview_loop: false,
             audio_preview_clip_id: None,
+            buffer_override: None,
+            adaptive_restart_requested: Arc::new(AtomicBool::new(false)),
+            adaptive_buffer_size: Arc::new(AtomicU32::new(0)),
+            last_overrun: Arc::new(AtomicBool::new(false)),
             piano_drag: None,
             piano_tool: PianoTool::Pencil,
             piano_selected: HashSet::new(),
@@ -908,6 +992,37 @@ impl Default for DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.project_dirty {
+                self.pending_exit = true;
+                self.show_close_confirm = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if self
+            .adaptive_restart_requested
+            .swap(false, Ordering::Relaxed)
+        {
+            let effective = self.adaptive_buffer_size.load(Ordering::Relaxed);
+            if effective > 0 {
+                let base = if self.settings.triple_buffer {
+                    (effective / 3).max(1)
+                } else {
+                    effective
+                };
+                self.buffer_override = Some(base);
+                if self.audio_running {
+                    self.stop_audio_and_midi_internal(false);
+                    if let Err(err) = self.start_audio_and_midi_internal(false) {
+                        self.status = format!("Audio restart failed: {err}");
+                    } else {
+                        self.status = format!("Audio buffer increased to {effective} samples");
+                    }
+                }
+            }
+        }
         if let Some(when) = self.plugin_ui_resume_at {
             if std::time::Instant::now() >= when {
                 self.plugin_ui_resume_at = None;
@@ -948,6 +1063,10 @@ impl eframe::App for DawApp {
         self.bottom_piano_roll(ctx);
         self.plugin_ui_window(ctx, frame);
         self.modals(ctx);
+        if self.exit_confirmed {
+            self.exit_confirmed = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.render_job.is_some() {
             ctx.request_repaint();
         }
@@ -1188,10 +1307,10 @@ impl DawApp {
             let _ = self.save_project_dialog();
         }
         if input.modifiers.ctrl && input.key_pressed(egui::Key::O) {
-            let _ = self.open_project_dialog();
+            self.request_project_action(ProjectAction::OpenProject);
         }
         if input.modifiers.ctrl && input.key_pressed(egui::Key::N) {
-            self.new_project();
+            self.request_project_action(ProjectAction::NewProject);
         }
         if input.modifiers.ctrl && input.key_pressed(egui::Key::Comma) {
             self.show_settings = true;
@@ -1228,6 +1347,41 @@ impl DawApp {
     fn sync_selected_track_index(&self) {
         let index = self.selected_track.unwrap_or(usize::MAX);
         self.selected_track_index.store(index, Ordering::Relaxed);
+    }
+
+    fn mark_dirty(&mut self) {
+        self.project_dirty = true;
+    }
+
+    fn clear_dirty(&mut self) {
+        self.project_dirty = false;
+    }
+
+    fn request_project_action(&mut self, action: ProjectAction) {
+        if self.project_dirty {
+            self.pending_project_action = Some(action);
+            self.show_close_confirm = true;
+        } else {
+            self.perform_project_action(action);
+        }
+    }
+
+    fn perform_project_action(&mut self, action: ProjectAction) {
+        match action {
+            ProjectAction::NewProject => {
+                self.new_project();
+            }
+            ProjectAction::OpenProject => {
+                if let Err(err) = self.open_project_dialog() {
+                    self.status = format!("Open failed: {err}");
+                }
+            }
+            ProjectAction::ImportMidi => {
+                if let Err(err) = self.import_midi_dialog() {
+                    self.status = format!("Import failed: {err}");
+                }
+            }
+        }
     }
 
     fn sync_track_audio_states(&mut self) {
@@ -1415,6 +1569,7 @@ impl DawApp {
         }
         self.undo_stack.push(self.snapshot_state());
         self.redo_stack.clear();
+        self.mark_dirty();
     }
 
     fn undo(&mut self) {
@@ -1843,7 +1998,7 @@ impl DawApp {
 
     fn build_audio_clip_timeline(&self, sample_rate: u32) -> Vec<AudioClipRender> {
         let mut renders = Vec::new();
-        for track in &self.tracks {
+        for (track_index, track) in self.tracks.iter().enumerate() {
             for clip in &track.clips {
                 if clip.is_midi {
                     continue;
@@ -1857,6 +2012,7 @@ impl DawApp {
                 let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
                 renders.push(AudioClipRender {
                     path: path_str,
+                    track_index,
                     start_samples,
                     length_samples,
                     offset_samples,
@@ -1894,6 +2050,7 @@ impl DawApp {
                 let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
                 renders.push(AudioClipRender {
                     path: path_str.clone(),
+                    track_index,
                     start_samples,
                     length_samples,
                     offset_samples,
@@ -2003,13 +2160,11 @@ impl DawApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Project").clicked() {
-                        self.new_project();
+                        self.request_project_action(ProjectAction::NewProject);
                         ui.close_menu();
                     }
                     if ui.button("Open Project").clicked() {
-                        if let Err(err) = self.open_project_dialog() {
-                            self.status = format!("Open failed: {err}");
-                        }
+                        self.request_project_action(ProjectAction::OpenProject);
                         ui.close_menu();
                     }
                     if ui.button("Rename Project...").clicked() {
@@ -2030,9 +2185,7 @@ impl DawApp {
                     }
                     ui.separator();
                     if ui.button("Import MIDI").clicked() {
-                        if let Err(err) = self.import_midi_dialog() {
-                            self.status = format!("Import failed: {err}");
-                        }
+                        self.request_project_action(ProjectAction::ImportMidi);
                         ui.close_menu();
                     }
                     if ui.button("Export MIDI").clicked() {
@@ -2315,8 +2468,9 @@ impl DawApp {
                 ui_host.editor.set_focus(false);
                 hide_plugin_window(ui_host.hwnd);
             }
+            self.destroy_plugin_ui();
             open = false;
-            self.plugin_ui_hidden = true;
+            self.plugin_ui_hidden = false;
             ctx.request_repaint();
         }
         self.show_plugin_ui = open;
@@ -3181,6 +3335,13 @@ impl DawApp {
             ui.heading("Arranger");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                ui.label("Tools");
+                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Draw, "Draw MIDI");
+                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Select, "Select (Box)");
+                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Move, "Move");
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
                 ui.label("Automation");
                 let selected_track = self.selected_track;
                 let lanes = selected_track
@@ -3273,6 +3434,9 @@ impl DawApp {
                     }
                     self.arranger_pan += delta;
                 }
+            }
+            if self.arranger_pan.y < 0.0 {
+                self.arranger_pan.y = 0.0;
             }
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
@@ -3458,6 +3622,8 @@ impl DawApp {
             let mut pending_delete: Option<usize> = None;
             let mut pending_drag_start: Option<ClipDragState> = None;
             let mut pending_track_select: Option<usize> = None;
+            let mut over_clip = false;
+            let mut switch_to_move = false;
 
             let mut pending_lane_edit: Option<(usize, usize, f32, f32)> = None;
             for (track_index, track) in self.tracks.iter().enumerate() {
@@ -3593,8 +3759,18 @@ impl DawApp {
 
                     let clip_id = egui::Id::new(format!("clip_{}", clip.id));
                     let clip_response = ui.interact(clip_rect, clip_id, egui::Sense::click_and_drag());
-                    if clip_response.clicked() || header_left_resp.clicked() || header_right_resp.clicked() {
+                    if clip_response.hovered() {
+                        over_clip = true;
+                    }
+                    if self.arranger_tool != ArrangerTool::Draw
+                        && (clip_response.clicked()
+                            || header_left_resp.clicked()
+                            || header_right_resp.clicked())
+                    {
                         pending_select = Some((clip.id, track_index));
+                        if self.arranger_tool == ArrangerTool::Select {
+                            switch_to_move = true;
+                        }
                     }
 
                     let mut start_drag = |kind: ClipDragKind, pos: Option<egui::Pos2>| {
@@ -3614,16 +3790,18 @@ impl DawApp {
                         }
                     };
 
-                    if header_left_resp.drag_started() {
-                        start_drag(ClipDragKind::ResizeStart, header_left_resp.interact_pointer_pos());
-                    } else if header_right_resp.drag_started() {
-                        start_drag(ClipDragKind::ResizeEnd, header_right_resp.interact_pointer_pos());
-                    } else if trim_left_resp.drag_started() {
-                        start_drag(ClipDragKind::TrimStart, trim_left_resp.interact_pointer_pos());
-                    } else if trim_right_resp.drag_started() {
-                        start_drag(ClipDragKind::TrimEnd, trim_right_resp.interact_pointer_pos());
-                    } else if clip_response.drag_started() {
-                        start_drag(ClipDragKind::Move, clip_response.interact_pointer_pos());
+                    if self.arranger_tool == ArrangerTool::Move {
+                        if header_left_resp.drag_started() {
+                            start_drag(ClipDragKind::ResizeStart, header_left_resp.interact_pointer_pos());
+                        } else if header_right_resp.drag_started() {
+                            start_drag(ClipDragKind::ResizeEnd, header_right_resp.interact_pointer_pos());
+                        } else if trim_left_resp.drag_started() {
+                            start_drag(ClipDragKind::TrimStart, trim_left_resp.interact_pointer_pos());
+                        } else if trim_right_resp.drag_started() {
+                            start_drag(ClipDragKind::TrimEnd, trim_right_resp.interact_pointer_pos());
+                        } else if clip_response.drag_started() {
+                            start_drag(ClipDragKind::Move, clip_response.interact_pointer_pos());
+                        }
                     }
 
                     clip_response.context_menu(|ui| {
@@ -3737,6 +3915,141 @@ impl DawApp {
                     };
                     painter.rect_filled(fill_rect, 3.0, color);
                 }
+            }
+
+            let mut marquee_rect: Option<egui::Rect> = None;
+            let mut draw_rect: Option<egui::Rect> = None;
+            if let Some(pos) = response.interact_pointer_pos() {
+                let in_grid = grid_clip.contains(pos);
+                if self.arranger_tool == ArrangerTool::Select && in_grid && !over_clip {
+                    if response.drag_started() {
+                        self.arranger_select_start = Some(pos);
+                    }
+                }
+                if self.arranger_tool == ArrangerTool::Draw && in_grid && !over_clip {
+                    if response.drag_started() {
+                        let row_index = ((pos.y - rect.top() - row_top_offset) / row_height).floor() as i32;
+                        let max_track = self.tracks.len().saturating_sub(1) as i32;
+                        let target_track = row_index.clamp(0, max_track) as usize;
+                        let start_beats = ((pos.x - row_left) / beat_width).max(0.0);
+                        self.arranger_draw = Some(ArrangerDrawState {
+                            track_index: target_track,
+                            start_beats,
+                            start_pos: pos,
+                        });
+                    }
+                }
+            }
+
+            if let Some(start) = self.arranger_select_start {
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        marquee_rect = Some(egui::Rect::from_two_pos(start, pos));
+                    }
+                }
+                if response.drag_stopped() {
+                    if let Some(end) = response.interact_pointer_pos() {
+                        let select_rect = egui::Rect::from_two_pos(start, end);
+                        let mut hit: Option<(usize, usize)> = None;
+                        for (track_index, track) in self.tracks.iter().enumerate() {
+                            let y = rect.top() + row_top_offset + track_index as f32 * row_height;
+                            let row_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + lane_label_w + 16.0, y),
+                                egui::pos2(rect.right() - 8.0, y + row_height),
+                            );
+                            for clip in &track.clips {
+                                let clip_x = row_left + clip.start_beats * beat_width;
+                                let clip_w = (clip.length_beats * beat_width).max(1.0);
+                                let clip_left = clip_x.max(row_rect.left());
+                                let clip_right = (clip_x + clip_w).min(row_rect.right());
+                                if clip_right <= clip_left {
+                                    continue;
+                                }
+                                let clip_rect = egui::Rect::from_min_max(
+                                    egui::pos2(clip_left, row_rect.top()),
+                                    egui::pos2(clip_right, row_rect.bottom()),
+                                );
+                                if select_rect.intersects(clip_rect) {
+                                    hit = Some((clip.id, track_index));
+                                    break;
+                                }
+                            }
+                            if hit.is_some() {
+                                break;
+                            }
+                        }
+                        if let Some((clip_id, track_index)) = hit {
+                            pending_select = Some((clip_id, track_index));
+                            switch_to_move = true;
+                        }
+                    }
+                    self.arranger_select_start = None;
+                }
+            }
+
+            if response.dragged() {
+                if let Some(draw) = self.arranger_draw.as_ref() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let end_beats = ((pos.x - row_left) / beat_width).max(0.0);
+                        let start_beats = draw.start_beats;
+                        let snap = self.piano_snap.max(0.25);
+                        let snapped_start = (start_beats / snap).round() * snap;
+                        let snapped_end = (end_beats / snap).round() * snap;
+                        let left = row_left + snapped_start.min(snapped_end) * beat_width;
+                        let right = row_left + snapped_start.max(snapped_end) * beat_width;
+                        let y = rect.top() + row_top_offset + draw.track_index as f32 * row_height;
+                        draw_rect = Some(egui::Rect::from_min_max(
+                            egui::pos2(left, y),
+                            egui::pos2(right, y + row_height),
+                        ));
+                    }
+                }
+            }
+            if response.drag_stopped() {
+                if let Some(draw) = self.arranger_draw.take() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let end_beats = ((pos.x - row_left) / beat_width).max(0.0);
+                        let snap = self.piano_snap.max(0.25);
+                        let mut start = (draw.start_beats / snap).round() * snap;
+                        let mut end = (end_beats / snap).round() * snap;
+                        if (end - start).abs() < snap {
+                            end = start + snap;
+                        }
+                        if end < start {
+                            std::mem::swap(&mut start, &mut end);
+                        }
+                        let track_index = draw.track_index;
+                        let clip_id = self.next_clip_id();
+                        self.push_undo_state();
+                        if let Some(track) = self.tracks.get_mut(track_index) {
+                            track.clips.push(Clip {
+                                id: clip_id,
+                                track: track_index,
+                                start_beats: start,
+                                length_beats: (end - start).max(snap),
+                                is_midi: true,
+                                name: "MIDI Clip".to_string(),
+                                audio_path: None,
+                                audio_source_beats: None,
+                                audio_offset_beats: 0.0,
+                                audio_gain: 1.0,
+                                audio_pitch_semitones: 0.0,
+                                audio_time_mul: 1.0,
+                            });
+                            self.selected_track = Some(track_index);
+                            self.selected_clip = Some(clip_id);
+                        }
+                    }
+                }
+            }
+
+            if let Some(rect) = marquee_rect {
+                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(120, 170, 255)));
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 200, 40));
+            }
+            if let Some(rect) = draw_rect {
+                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(120, 220, 160)));
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_premultiplied(60, 140, 90, 40));
             }
 
             let final_shelf_mask = egui::Rect::from_min_max(
@@ -3951,6 +4264,9 @@ impl DawApp {
             }
             if selection_changed {
                 self.refresh_params_for_selected_track(false);
+            }
+            if switch_to_move {
+                self.arranger_tool = ArrangerTool::Move;
             }
             if let Some(clip_id) = pending_delete {
                 self.push_undo_state();
@@ -4307,6 +4623,74 @@ impl DawApp {
                                     }
                                     if track.param_values.len() != track.params.len() {
                                         track.param_values.resize(track.params.len(), 0.0);
+                                    }
+                                    if let Some(program_index) = track
+                                        .params
+                                        .iter()
+                                        .position(|name| {
+                                            let name = name.to_ascii_lowercase();
+                                            name.contains("program") || name.contains("preset")
+                                        })
+                                    {
+                                        let current = (track.param_values[program_index] * 127.0)
+                                            .round()
+                                            .clamp(0.0, 127.0) as u8;
+                                        let mut selected = current;
+                                        egui::ComboBox::from_label("Preset")
+                                            .selected_text(format!(
+                                                "{:03} {}",
+                                                selected + 1,
+                                                gm_program_name(selected)
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for program in 0u8..=127 {
+                                                    let label = format!(
+                                                        "{:03} {}",
+                                                        program + 1,
+                                                        gm_program_name(program)
+                                                    );
+                                                    if ui
+                                                        .selectable_label(program == selected, label)
+                                                        .clicked()
+                                                    {
+                                                        selected = program;
+                                                    }
+                                                }
+                                            });
+                                        if selected != current {
+                                            let value = (selected as f32 / 127.0).clamp(0.0, 1.0);
+                                            track.param_values[program_index] = value;
+                                            if let Some(param_id) = track.param_ids.get(program_index).copied() {
+                                                if let Some(state) = self
+                                                    .selected_track
+                                                    .and_then(|i| self.track_audio.get(i))
+                                                {
+                                                    if let Ok(mut pending) =
+                                                        state.pending_param_changes.lock()
+                                                    {
+                                                        pending.push(PendingParamChange {
+                                                            target: PendingParamTarget::Instrument,
+                                                            param_id,
+                                                            value: value as f64,
+                                                        });
+                                                    }
+                                                }
+                                                if self.is_recording && self.record_automation {
+                                                    if let Some(track_index) = selected_track_index {
+                                                        pending_automation_record.push((
+                                                            track_index,
+                                                            RecordedAutomationPoint {
+                                                                param_id,
+                                                                target: AutomationTarget::Instrument,
+                                                                beat: self.playhead_beats,
+                                                                value,
+                                                            },
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ui.add_space(6.0);
                                     }
                                     for index in 0..track.params.len() {
                                         let label = track.params[index].clone();
@@ -5337,6 +5721,68 @@ impl DawApp {
     }
 
     fn modals(&mut self, ctx: &egui::Context) {
+        if self.show_close_confirm {
+            let mut open = self.show_close_confirm;
+            let mut proceed_action: Option<ProjectAction> = None;
+            let mut close_requested = false;
+            let mut confirm_exit = false;
+            egui::Window::new("Unsaved Changes")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Current project has unsaved changes.");
+                    ui.label("Save before continuing?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save & Continue").clicked() {
+                            match self.save_project_or_prompt() {
+                                Ok(_) => {
+                                    self.clear_dirty();
+                                    proceed_action = self.pending_project_action.take();
+                                    if self.pending_exit {
+                                        confirm_exit = true;
+                                    }
+                                    close_requested = true;
+                                }
+                                Err(err) => {
+                                    self.status = format!("Save failed: {err}");
+                                }
+                            }
+                        }
+                        if ui.button("Discard").clicked() {
+                            self.clear_dirty();
+                            proceed_action = self.pending_project_action.take();
+                            if self.pending_exit {
+                                confirm_exit = true;
+                            }
+                            close_requested = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.pending_exit = false;
+                            close_requested = true;
+                        }
+                    });
+                });
+            if close_requested {
+                open = false;
+            }
+            if !open {
+                self.show_close_confirm = false;
+                self.pending_exit = false;
+                if proceed_action.is_none() {
+                    self.pending_project_action = None;
+                }
+            }
+            if confirm_exit {
+                self.pending_exit = false;
+                self.exit_confirmed = true;
+            }
+            if let Some(action) = proceed_action {
+                self.perform_project_action(action);
+            }
+        }
+
         if self.show_settings {
             let mut open = self.show_settings;
             egui::Window::new("Settings")
@@ -5400,6 +5846,11 @@ impl DawApp {
                                 }
                             });
                     });
+                    ui.checkbox(&mut self.settings.triple_buffer, "Triple buffer");
+                    ui.checkbox(&mut self.settings.safe_underruns, "Safe underruns");
+                    ui.checkbox(&mut self.settings.adaptive_buffer, "Adaptive buffer");
+                    ui.checkbox(&mut self.settings.smart_disable_plugins, "Smart disable plugins");
+                    ui.checkbox(&mut self.settings.smart_suspend_tracks, "Smart suspend tracks");
 
                     ui.add_space(8.0);
                     ui.heading("MIDI");
@@ -5517,6 +5968,111 @@ impl DawApp {
             }
         }
 
+        if self.show_midi_import {
+            let mut open = self.show_midi_import;
+            let mut do_import = false;
+            let mut close_requested = false;
+            if let Some(state) = self.midi_import_state.as_mut() {
+                egui::Window::new("Import MIDI")
+                    .open(&mut open)
+                    .default_size(egui::vec2(520.0, 420.0))
+                    .show(ctx, |ui| {
+                        let file_label = Path::new(&state.path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(state.path.as_str());
+                        ui.label(format!("File: {file_label}"));
+                        ui.separator();
+                        ui.label("Tracks");
+                        ui.horizontal(|ui| {
+                            if ui.button("All").clicked() {
+                                for enabled in &mut state.enabled {
+                                    *enabled = true;
+                                }
+                            }
+                            if ui.button("None").clicked() {
+                                for enabled in &mut state.enabled {
+                                    *enabled = false;
+                                }
+                            }
+                        });
+                        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            for (index, track_data) in state.tracks.iter().enumerate() {
+                                let enabled = state.enabled.get_mut(index).unwrap();
+                                let apply_program = state.apply_program.get_mut(index).unwrap();
+                                let track_name = match track_data.program {
+                                    Some(program) if track_data.has_drums => gm_drum_kit_name(program)
+                                        .unwrap_or("Drum Kit")
+                                        .to_string(),
+                                    Some(program) => gm_program_name(program).to_string(),
+                                    None => format!("Track {}", track_data.track_index + 1),
+                                };
+                                let label = format!("Track {} - {}", track_data.track_index + 1, track_name);
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(enabled, label);
+                                    ui.add_enabled_ui(track_data.program.is_some(), |ui| {
+                                        ui.checkbox(apply_program, "Use patch");
+                                    });
+                                });
+                            }
+                        });
+
+                        ui.separator();
+                        let instrument_options = [
+                            "None",
+                            "MiceSynth",
+                            "FishSynth",
+                            "SannySynth",
+                            "LingSynth",
+                            "DogSynth",
+                        ];
+                        egui::ComboBox::from_label("Instrument Plugin")
+                            .selected_text(state.instrument_plugin.clone())
+                            .show_ui(ui, |ui| {
+                                for name in instrument_options {
+                                    if ui.selectable_label(state.instrument_plugin == name, name).clicked() {
+                                        state.instrument_plugin = name.to_string();
+                                    }
+                                }
+                            });
+                        let percussion_options = ["None", "Catsynth"]; 
+                        egui::ComboBox::from_label("Percussion Plugin")
+                            .selected_text(state.percussion_plugin.clone())
+                            .show_ui(ui, |ui| {
+                                for name in percussion_options {
+                                    if ui.selectable_label(state.percussion_plugin == name, name).clicked() {
+                                        state.percussion_plugin = name.to_string();
+                                    }
+                                }
+                            });
+                        ui.checkbox(&mut state.import_portamento, "Import Portamento (CC65)");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Import").clicked() {
+                                do_import = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close_requested = true;
+                            }
+                        });
+                    });
+            } else {
+                open = false;
+            }
+            if close_requested {
+                open = false;
+            }
+            self.show_midi_import = open;
+            if do_import {
+                if let Err(err) = self.apply_midi_import() {
+                    self.status = format!("MIDI import failed: {err}");
+                }
+            }
+            if !open {
+                self.midi_import_state = None;
+            }
+        }
+
         if self.show_rename_track {
             let mut open = self.show_rename_track;
             let mut close_requested = false;
@@ -5601,35 +6157,7 @@ impl DawApp {
     }
 
     fn new_project(&mut self) {
-        if self.is_recording {
-            let _ = self.end_recording();
-        }
-        if self.audio_running {
-            self.stop_audio_and_midi();
-        }
-        self.show_plugin_ui = false;
-        if let Some(ui_host) = self.plugin_ui.as_ref() {
-            ui_host.editor.set_focus(false);
-            hide_plugin_window(ui_host.hwnd);
-        }
-        self.destroy_plugin_ui();
-        self.plugin_ui_hidden = false;
-        let mut hosts: Vec<Arc<Mutex<vst3::Vst3Host>>> = Vec::new();
-        for state in self.track_audio.iter_mut() {
-            if let Some(host) = state.host.take() {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
-                hosts.push(host);
-            }
-                for host in state.effect_hosts.drain(..) {
-                    if let Ok(mut host) = host.lock() {
-                        host.prepare_for_drop();
-                    }
-                    hosts.push(host);
-                }
-        }
-        self.orphaned_hosts.extend(hosts);
+        self.prepare_for_project_change();
 
         self.project_name = "Untitled Project".to_string();
         self.project_path = String::new();
@@ -5660,12 +6188,49 @@ impl DawApp {
             automation_lanes: Vec::new(),
             automation_channels: Vec::new(),
             midi_cc_lanes: Vec::new(),
+            midi_program: None,
         }];
         self.selected_clip = None;
         self.selected_track = Some(0);
         self.playhead_beats = 0.0;
         self.sync_track_audio_states();
+        self.clear_dirty();
         self.status = "New project".to_string();
+    }
+
+    fn prepare_for_project_change(&mut self) {
+        if self.is_recording {
+            let _ = self.end_recording();
+        }
+        self.stop_audio_preview();
+        self.plugin_ui_resume_at = None;
+        self.show_plugin_ui = false;
+        if let Some(ui_host) = self.plugin_ui.as_ref() {
+            ui_host.editor.set_focus(false);
+            hide_plugin_window(ui_host.hwnd);
+        }
+        self.destroy_plugin_ui();
+        self.plugin_ui_hidden = false;
+        if self.audio_running {
+            self.stop_audio_and_midi();
+        }
+        let mut hosts: Vec<Arc<Mutex<vst3::Vst3Host>>> = Vec::new();
+        for state in self.track_audio.iter_mut() {
+            if let Some(host) = state.host.take() {
+                if let Ok(mut host) = host.lock() {
+                    host.prepare_for_drop();
+                }
+                hosts.push(host);
+            }
+            for host in state.effect_hosts.drain(..) {
+                if let Ok(mut host) = host.lock() {
+                    host.prepare_for_drop();
+                }
+                hosts.push(host);
+            }
+        }
+        self.orphaned_hosts.extend(hosts);
+        self.track_audio.clear();
     }
 
     fn add_track(&mut self) {
@@ -5691,6 +6256,7 @@ impl DawApp {
             automation_lanes: Vec::new(),
             automation_channels: Vec::new(),
             midi_cc_lanes: Vec::new(),
+            midi_program: None,
         });
         self.selected_track = Some(self.tracks.len().saturating_sub(1));
         self.refresh_params_for_selected_track(true);
@@ -5698,6 +6264,7 @@ impl DawApp {
             self.track_audio.push(TrackAudioState::from_track(track));
         }
         self.sync_track_mix();
+        self.mark_dirty();
         self.status = "Track added".to_string();
     }
 
@@ -5732,6 +6299,7 @@ impl DawApp {
                 let next = index.saturating_sub(1).min(self.tracks.len().saturating_sub(1));
                 self.selected_track = Some(next);
                 self.sync_track_mix();
+                self.mark_dirty();
                 self.status = "Track removed".to_string();
             } else {
                 self.status = "At least one track required".to_string();
@@ -5749,6 +6317,7 @@ impl DawApp {
                 self.track_audio.insert(index + 1, state);
                 self.selected_track = Some(index + 1);
                 self.sync_track_mix();
+                self.mark_dirty();
                 self.status = "Track duplicated".to_string();
             }
         }
@@ -5765,6 +6334,7 @@ impl DawApp {
                 self.track_audio.insert(index + 1, state);
                 self.selected_track = Some(index + 1);
                 self.sync_track_mix();
+                self.mark_dirty();
                 self.status = "Track cloned".to_string();
             }
         }
@@ -5785,6 +6355,7 @@ impl DawApp {
                 let name = self.rename_buffer.trim();
                 if !name.is_empty() {
                     track.name = name.to_string();
+                    self.mark_dirty();
                     self.status = "Track renamed".to_string();
                 }
             }
@@ -5893,6 +6464,7 @@ impl DawApp {
                 self.project_name = name;
             }
         }
+        self.clear_dirty();
         self.status = format!("Saved {}", self.project_path);
         Ok(())
     }
@@ -5903,6 +6475,7 @@ impl DawApp {
     }
 
     fn load_project_from_folder(&mut self, folder: &Path) -> Result<(), String> {
+        self.prepare_for_project_change();
         let manifest_path = folder.join("project.json");
         let data = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
         let state: ProjectState = serde_json::from_str(&data).map_err(|e| e.to_string())?;
@@ -5924,6 +6497,7 @@ impl DawApp {
                 self.project_name = name;
             }
         }
+        self.clear_dirty();
         self.status = format!("Loaded {}", self.project_path);
         Ok(())
     }
@@ -5953,6 +6527,7 @@ impl DawApp {
         let name = self.project_name_buffer.trim();
         if !name.is_empty() {
             self.project_name = name.to_string();
+            self.mark_dirty();
             self.status = "Project renamed".to_string();
         }
     }
@@ -6203,86 +6778,176 @@ impl DawApp {
     }
 
     fn import_midi_dialog(&mut self) -> Result<(), String> {
-        let was_running = self.audio_running;
-        self.show_plugin_ui = false;
-        self.destroy_plugin_ui();
-        if was_running {
-            self.stop_audio_and_midi();
-        }
         let path = rfd::FileDialog::new()
             .add_filter("MIDI", &["mid", "midi"])
             .pick_file();
         if let Some(path) = path {
-            let old_audio = std::mem::take(&mut self.track_audio);
-            for state in old_audio {
-                if let Some(host) = state.host {
-                    self.orphaned_hosts.push(host);
-                }
-            }
             let path_str = path.to_string_lossy().to_string();
-            let channels = import_midi_channels(&path_str)?;
-            let mut next_id = self.next_clip_id();
-            let mut tracks = Vec::new();
-            for channel_data in channels {
-                if channel_data.notes.is_empty() {
-                    continue;
-                }
-                let max_end: f32 = channel_data
-                    .notes
-                    .iter()
-                    .map(|n| n.start_beats + n.length_beats)
-                    .fold(1.0, |a, b| a.max(b));
-                let clip = Clip {
-                    id: next_id,
-                    track: tracks.len(),
-                    start_beats: 0.0,
-                    length_beats: max_end.max(1.0),
-                    is_midi: true,
-                    name: format!("Ch {}", channel_data.channel + 1),
-                    audio_path: None,
-                    audio_source_beats: None,
-                    audio_offset_beats: 0.0,
-                    audio_gain: 1.0,
-                    audio_pitch_semitones: 0.0,
-                    audio_time_mul: 1.0,
-                };
-                next_id += 1;
-                tracks.push(Track {
-                    name: format!("MIDI Ch {}", channel_data.channel + 1),
-                    clips: vec![clip],
-                    level: 0.8,
-                    muted: false,
-                    solo: false,
-                    midi_notes: channel_data.notes,
-                    instrument_path: None,
-                    effect_paths: Vec::new(),
-                    effect_bypass: Vec::new(),
-                    effect_params: Vec::new(),
-                    effect_param_ids: Vec::new(),
-                    effect_param_values: Vec::new(),
-                    params: default_midi_params(),
-                    param_ids: Vec::new(),
-                    param_values: Vec::new(),
-                    plugin_state_component: None,
-                    plugin_state_controller: None,
-                    automation_lanes: Vec::new(),
-                    automation_channels: Vec::new(),
-                    midi_cc_lanes: Vec::new(),
-                });
-            }
-
-            if tracks.is_empty() {
-                self.status = "No MIDI notes found".to_string();
-            } else {
-                self.tracks = tracks;
-                self.selected_track = Some(0);
-                self.selected_clip = self.tracks.get(0).and_then(|t| t.clips.first()).map(|c| c.id);
-                self.sync_track_audio_states();
-                self.status = "MIDI imported".to_string();
-            }
-
-            self.import_path = path_str;
+            self.begin_midi_import(path_str)?;
         }
+        Ok(())
+    }
+
+    fn begin_midi_import(&mut self, path_str: String) -> Result<(), String> {
+        let tracks = import_midi_tracks(&path_str)?;
+        if tracks.is_empty() {
+            self.status = "No MIDI tracks found".to_string();
+            return Ok(());
+        }
+        let enabled = vec![true; tracks.len()];
+        let apply_program = tracks.iter().map(|t| t.program.is_some()).collect();
+        self.midi_import_state = Some(MidiImportState {
+            path: path_str,
+            tracks,
+            enabled,
+            apply_program,
+            instrument_plugin: "FishSynth".to_string(),
+            percussion_plugin: "Catsynth".to_string(),
+            import_portamento: true,
+        });
+        self.show_midi_import = true;
+        Ok(())
+    }
+
+    fn apply_midi_import(&mut self) -> Result<(), String> {
+        let Some(state) = self.midi_import_state.take() else {
+            return Ok(());
+        };
+        let was_running = self.audio_running;
+        self.prepare_for_project_change();
+
+        let mut next_id = self.next_clip_id();
+        let mut tracks = Vec::new();
+        let mut missing_plugins: HashSet<String> = HashSet::new();
+        for (index, track_data) in state.tracks.iter().enumerate() {
+            if !state.enabled.get(index).copied().unwrap_or(true) {
+                continue;
+            }
+            if track_data.notes.is_empty() {
+                continue;
+            }
+            let is_drums = track_data.has_drums;
+            let plugin_name = if is_drums {
+                state.percussion_plugin.as_str()
+            } else {
+                state.instrument_plugin.as_str()
+            };
+            let instrument_path = if plugin_name == "None" {
+                None
+            } else {
+                let path = self.find_vst3_plugin_by_name(plugin_name);
+                if path.is_none() {
+                    missing_plugins.insert(plugin_name.to_string());
+                }
+                path
+            };
+            let params = if instrument_path.is_some() {
+                default_instrument_params()
+            } else {
+                default_midi_params()
+            };
+            let max_end: f32 = track_data
+                .notes
+                .iter()
+                .map(|n| n.start_beats + n.length_beats)
+                .fold(1.0f32, |a, b| a.max(b));
+            let clip = Clip {
+                id: next_id,
+                track: tracks.len(),
+                start_beats: 0.0,
+                length_beats: max_end.max(1.0),
+                is_midi: true,
+                name: format!("Track {}", track_data.track_index + 1),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_time_mul: 1.0,
+            };
+            next_id += 1;
+            let track_name = match track_data.program {
+                Some(program) if is_drums => gm_drum_kit_name(program)
+                    .unwrap_or("Drum Kit")
+                    .to_string(),
+                Some(program) => gm_program_name(program).to_string(),
+                None => format!("Track {}", track_data.track_index + 1),
+            };
+            let mut midi_cc_lanes = Vec::new();
+            if state.import_portamento {
+                let mut points = Vec::new();
+                for event in &track_data.cc_events {
+                    if event.cc == 65 {
+                        points.push(AutomationPoint {
+                            beat: event.beat,
+                            value: event.value,
+                        });
+                    }
+                }
+                if !points.is_empty() {
+                    points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap());
+                    midi_cc_lanes.push(MidiCcLane { cc: 65, points });
+                }
+            }
+            let midi_program = if state.apply_program.get(index).copied().unwrap_or(true) {
+                track_data.program
+            } else {
+                None
+            };
+            tracks.push(Track {
+                name: track_name,
+                clips: vec![clip],
+                level: 0.8,
+                muted: false,
+                solo: false,
+                midi_notes: track_data.notes.clone(),
+                instrument_path,
+                effect_paths: Vec::new(),
+                effect_bypass: Vec::new(),
+                effect_params: Vec::new(),
+                effect_param_ids: Vec::new(),
+                effect_param_values: Vec::new(),
+                params,
+                param_ids: Vec::new(),
+                param_values: Vec::new(),
+                plugin_state_component: None,
+                plugin_state_controller: None,
+                automation_lanes: Vec::new(),
+                automation_channels: Vec::new(),
+                midi_cc_lanes,
+                midi_program,
+            });
+        }
+
+        if tracks.is_empty() {
+            self.status = "No MIDI tracks imported".to_string();
+        } else {
+            self.tracks = tracks;
+            self.selected_track = Some(0);
+            self.selected_clip = self.tracks.get(0).and_then(|t| t.clips.first()).map(|c| c.id);
+            self.sync_track_audio_states();
+            for index in 0..self.tracks.len() {
+                let mut should_refresh = false;
+                if let Some(track) = self.tracks.get(index) {
+                    if track.instrument_path.is_some() && track.midi_program.is_some() {
+                        should_refresh = true;
+                    }
+                }
+                if should_refresh {
+                    self.refresh_track_params(index);
+                }
+            }
+            if missing_plugins.is_empty() {
+                self.status = "MIDI imported".to_string();
+            } else {
+                let mut missing: Vec<String> = missing_plugins.into_iter().collect();
+                missing.sort();
+                self.status = format!("MIDI imported (missing: {})", missing.join(", "));
+            }
+        }
+        self.import_path = state.path;
+        self.show_midi_import = false;
+        self.mark_dirty();
         if was_running {
             if let Err(err) = self.start_audio_and_midi() {
                 self.status = format!("Audio restart failed: {err}");
@@ -6874,7 +7539,7 @@ impl DawApp {
         let channels = config.channels() as usize;
         let mut stream_config: cpal::StreamConfig = config.clone().into();
         stream_config.sample_rate = cpal::SampleRate(self.settings.sample_rate.max(1));
-        stream_config.buffer_size = cpal::BufferSize::Fixed(self.settings.buffer_size);
+        stream_config.buffer_size = cpal::BufferSize::Fixed(self.effective_buffer_size());
         let recording = self.recording.clone();
 
         let stream = match config.sample_format() {
@@ -7201,8 +7866,27 @@ impl DawApp {
         *points = merged;
     }
 
+    fn base_buffer_size(&self) -> u32 {
+        self.buffer_override
+            .unwrap_or(self.settings.buffer_size)
+            .max(1)
+    }
+
+    fn effective_buffer_size(&self) -> u32 {
+        let base = self.base_buffer_size();
+        if self.settings.triple_buffer {
+            base.saturating_mul(3).max(1)
+        } else {
+            base
+        }
+    }
+
 
     fn start_audio_and_midi(&mut self) -> Result<(), String> {
+        self.start_audio_and_midi_internal(true)
+    }
+
+    fn start_audio_and_midi_internal(&mut self, reset_transport: bool) -> Result<(), String> {
         if self.audio_running {
             return Ok(());
         }
@@ -7222,10 +7906,18 @@ impl DawApp {
         let config = device.default_output_config().map_err(|e| e.to_string())?;
         let sample_rate = self.settings.sample_rate.max(1) as f32;
         let channels = config.channels() as usize;
+        self.last_output_channels = channels.max(1);
+        let effective_buffer = self.effective_buffer_size();
+        let buffer_size_usize = effective_buffer as usize;
         let freq_bits = self.midi_freq_bits.clone();
         let gate = self.midi_gate.clone();
         let master_peak_bits = self.master_peak_bits.clone();
-        self.transport_samples.store(0, Ordering::Relaxed);
+        self.adaptive_buffer_size
+            .store(effective_buffer, Ordering::Relaxed);
+        self.last_overrun.store(false, Ordering::Relaxed);
+        if reset_transport {
+            self.transport_samples.store(0, Ordering::Relaxed);
+        }
         self.tempo_bits.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         self.sync_track_audio_states();
         let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
@@ -7245,7 +7937,7 @@ impl DawApp {
                 match vst3::Vst3Host::load(
                     &path,
                     self.settings.sample_rate as f64,
-                    self.settings.buffer_size as usize,
+                    buffer_size_usize,
                     channels,
                 ) {
                     Ok(host) => {
@@ -7263,6 +7955,7 @@ impl DawApp {
                                 track.params = params.iter().map(|p| p.name.clone()).collect();
                                 track.param_ids = next_ids;
                                 track.param_values = next_values;
+                                Self::apply_program_param(track);
                             }
                         }
                         let host = Arc::new(Mutex::new(host));
@@ -7313,7 +8006,7 @@ impl DawApp {
                     match vst3::Vst3Host::load_with_input(
                         fx_path,
                         self.settings.sample_rate as f64,
-                        self.settings.buffer_size as usize,
+                        buffer_size_usize,
                         channels,
                         channels,
                     ) {
@@ -7380,10 +8073,17 @@ impl DawApp {
         let audio_callback_active = self.audio_callback_active.clone();
         let audio_clip_cache = self.audio_clip_cache.clone();
         let audio_clip_timeline = self.audio_clip_timeline.clone();
+        let adaptive_enabled = self.settings.adaptive_buffer;
+        let safe_underruns = self.settings.safe_underruns;
+        let smart_disable_plugins = self.settings.smart_disable_plugins;
+        let smart_suspend_tracks = self.settings.smart_suspend_tracks;
+        let adaptive_restart_requested = self.adaptive_restart_requested.clone();
+        let adaptive_buffer_size = self.adaptive_buffer_size.clone();
+        let last_overrun = self.last_overrun.clone();
 
         let mut stream_config: cpal::StreamConfig = config.clone().into();
         stream_config.sample_rate = cpal::SampleRate(self.settings.sample_rate);
-        stream_config.buffer_size = cpal::BufferSize::Fixed(self.settings.buffer_size);
+        stream_config.buffer_size = cpal::BufferSize::Fixed(effective_buffer);
 
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => {
@@ -7400,6 +8100,12 @@ impl DawApp {
                             update_master_peak_f32(data, &master_peak_bits);
                             return;
                         }
+                        if safe_underruns && last_overrun.swap(false, Ordering::Relaxed) {
+                            data.fill(0.0);
+                            update_master_peak_f32(data, &master_peak_bits);
+                            return;
+                        }
+                        let started = std::time::Instant::now();
                         data.fill(0.0);
                         let processed = mix_track_hosts(
                             data,
@@ -7413,6 +8119,8 @@ impl DawApp {
                             &track_mix,
                             &audio_clip_timeline,
                             &audio_clip_cache,
+                            smart_disable_plugins,
+                            smart_suspend_tracks,
                         );
                         if !processed {
                             render_sine(data, channels, sample_rate, &freq_bits, &gate);
@@ -7421,6 +8129,21 @@ impl DawApp {
                             *sample = sample.clamp(-1.0, 1.0);
                         }
                         update_master_peak_f32(data, &master_peak_bits);
+                        let elapsed = started.elapsed().as_secs_f32();
+                        let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
+                        if elapsed > buffer_secs {
+                            if safe_underruns {
+                                last_overrun.store(true, Ordering::Relaxed);
+                            }
+                            if adaptive_enabled {
+                                let current = adaptive_buffer_size.load(Ordering::Relaxed);
+                                let next = (current.saturating_mul(2)).min(8192).max(current);
+                                if next > current {
+                                    adaptive_buffer_size.store(next, Ordering::Relaxed);
+                                    adaptive_restart_requested.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     },
                     move |err| {
                         eprintln!("audio error: {err}");
@@ -7445,6 +8168,12 @@ impl DawApp {
                             update_master_peak_i16(data, &master_peak_bits);
                             return;
                         }
+                        if safe_underruns && last_overrun.swap(false, Ordering::Relaxed) {
+                            data.fill(0);
+                            update_master_peak_i16(data, &master_peak_bits);
+                            return;
+                        }
+                        let started = std::time::Instant::now();
                         temp.resize(data.len(), 0.0);
                         let processed = mix_track_hosts(
                             &mut temp,
@@ -7458,6 +8187,8 @@ impl DawApp {
                             &track_mix,
                             &audio_clip_timeline,
                             &audio_clip_cache,
+                            smart_disable_plugins,
+                            smart_suspend_tracks,
                         );
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
@@ -7469,6 +8200,21 @@ impl DawApp {
                             *out = cpal::Sample::from_sample(*sample);
                         }
                         update_master_peak_f32(&temp, &master_peak_bits);
+                        let elapsed = started.elapsed().as_secs_f32();
+                        let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
+                        if elapsed > buffer_secs {
+                            if safe_underruns {
+                                last_overrun.store(true, Ordering::Relaxed);
+                            }
+                            if adaptive_enabled {
+                                let current = adaptive_buffer_size.load(Ordering::Relaxed);
+                                let next = (current.saturating_mul(2)).min(8192).max(current);
+                                if next > current {
+                                    adaptive_buffer_size.store(next, Ordering::Relaxed);
+                                    adaptive_restart_requested.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     },
                     move |err| {
                         eprintln!("audio error: {err}");
@@ -7494,6 +8240,13 @@ impl DawApp {
                             update_master_peak_u16(data, &master_peak_bits);
                             return;
                         }
+                        if safe_underruns && last_overrun.swap(false, Ordering::Relaxed) {
+                            let silence = u16::MAX / 2;
+                            data.fill(silence);
+                            update_master_peak_u16(data, &master_peak_bits);
+                            return;
+                        }
+                        let started = std::time::Instant::now();
                         temp.resize(data.len(), 0.0);
                         let processed = mix_track_hosts(
                             &mut temp,
@@ -7507,6 +8260,8 @@ impl DawApp {
                             &track_mix,
                             &audio_clip_timeline,
                             &audio_clip_cache,
+                            smart_disable_plugins,
+                            smart_suspend_tracks,
                         );
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
@@ -7518,6 +8273,21 @@ impl DawApp {
                             *out = cpal::Sample::from_sample(*sample);
                         }
                         update_master_peak_f32(&temp, &master_peak_bits);
+                        let elapsed = started.elapsed().as_secs_f32();
+                        let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
+                        if elapsed > buffer_secs {
+                            if safe_underruns {
+                                last_overrun.store(true, Ordering::Relaxed);
+                            }
+                            if adaptive_enabled {
+                                let current = adaptive_buffer_size.load(Ordering::Relaxed);
+                                let next = (current.saturating_mul(2)).min(8192).max(current);
+                                if next > current {
+                                    adaptive_buffer_size.store(next, Ordering::Relaxed);
+                                    adaptive_restart_requested.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     },
                     move |err| {
                         eprintln!("audio error: {err}");
@@ -7666,6 +8436,10 @@ impl DawApp {
     }
 
     fn stop_audio_and_midi(&mut self) {
+        self.stop_audio_and_midi_internal(true);
+    }
+
+    fn stop_audio_and_midi_internal(&mut self, reset_transport: bool) {
         self.audio_stop.store(true, Ordering::Relaxed);
         self.audio_running = false;
         self.midi_conn = None;
@@ -7678,16 +8452,42 @@ impl DawApp {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        if reset_transport {
+            self.send_midi_stop_to_hosts();
+        }
         // Keep the host alive on Stop; dropping here can crash some plugins.
         self.midi_gate.store(false, Ordering::Relaxed);
-        self.transport_samples.store(0, Ordering::Relaxed);
+        if reset_transport {
+            self.transport_samples.store(0, Ordering::Relaxed);
+        }
         for state in &self.track_audio {
             if let Ok(mut events) = state.midi_events.lock() {
                 events.clear();
             }
         }
-        self.playhead_beats = 0.0;
-        self.last_frame_time = None;
+        if reset_transport {
+            self.playhead_beats = 0.0;
+            self.last_frame_time = None;
+        }
+    }
+
+    fn send_midi_stop_to_hosts(&mut self) {
+        let channels = self.last_output_channels.max(1);
+        let mut buffer = vec![0.0f32; channels];
+        let mut events = Vec::with_capacity(16 * 128);
+        for channel in 0u8..16 {
+            for note in 0u8..=127 {
+                events.push(vst3::MidiEvent::note_off_at(channel, note, 0, 0));
+            }
+        }
+        for state in &self.track_audio {
+            let Some(host) = state.host.as_ref() else {
+                continue;
+            };
+            if let Ok(mut host) = host.lock() {
+                let _ = host.process_f32(&mut buffer, channels, &events);
+            }
+        }
     }
 
     fn settings_path(&self) -> &str {
@@ -7790,6 +8590,35 @@ impl DawApp {
         candidate.replace('_', " ")
     }
 
+    fn find_vst3_plugin_by_name(&mut self, name: &str) -> Option<String> {
+        if self.plugin_candidates.is_empty() {
+            self.plugin_candidates = self.scan_vst3_plugins();
+        }
+        let needle = name.to_ascii_lowercase();
+        self.plugin_candidates
+            .iter()
+            .find(|path| {
+                let display = Self::plugin_display_name(path).to_ascii_lowercase();
+                display == needle || display.contains(&needle)
+            })
+            .cloned()
+    }
+
+    fn apply_program_param(track: &mut Track) {
+        let Some(program) = track.midi_program else {
+            return;
+        };
+        let program_index = track.params.iter().position(|name| {
+            let name = name.to_ascii_lowercase();
+            name.contains("program") || name.contains("patch") || name.contains("preset")
+        });
+        if let Some(index) = program_index {
+            if let Some(value) = track.param_values.get_mut(index) {
+                *value = (program as f32 / 127.0).clamp(0.0, 1.0);
+            }
+        }
+    }
+
     fn scan_dir(&self, dir: &Path, out: &mut Vec<String>) {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -7830,6 +8659,7 @@ impl DawApp {
                         track.params = params.iter().map(|p| p.name.clone()).collect();
                         track.param_ids = next_ids;
                         track.param_values = next_values;
+                        Self::apply_program_param(track);
                         if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
                             let mut lanes = Vec::new();
                             for name in &track.automation_channels {
@@ -7905,11 +8735,13 @@ impl DawApp {
     }
 
     fn replace_instrument(&mut self, index: usize, path: String) {
+        let mut reopen_ui = false;
         if self
             .plugin_ui
             .as_ref()
             .map_or(false, |ui| ui.target == PluginUiTarget::Instrument(index))
         {
+            reopen_ui = self.show_plugin_ui;
             self.show_plugin_ui = false;
             self.destroy_plugin_ui();
         }
@@ -7937,6 +8769,11 @@ impl DawApp {
             } else {
                 self.status = "Instrument reloaded".to_string();
             }
+        }
+        if reopen_ui {
+            self.plugin_ui_target = Some(PluginUiTarget::Instrument(index));
+            self.plugin_ui_hidden = false;
+            self.show_plugin_ui = true;
         }
         self.refresh_params_for_selected_track(true);
     }
@@ -9149,6 +9986,8 @@ fn mix_track_hosts(
     track_mix: &Arc<Mutex<Vec<TrackMixState>>>,
     audio_clips: &Arc<Mutex<Vec<AudioClipRender>>>,
     audio_cache: &Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>,
+    smart_disable_plugins: bool,
+    smart_suspend_tracks: bool,
 ) -> bool {
     let frames = output.len() / channels;
     if frames == 0 || channels == 0 {
@@ -9173,200 +10012,20 @@ fn mix_track_hosts(
 
     let mix_snapshot = track_mix.lock().ok().map(|m| m.clone()).unwrap_or_default();
     let any_solo = mix_snapshot.iter().any(|m| m.solo);
-    let mut processed_any = false;
-
-    MIX_TEMP.with(|buf| {
-        let mut temp_buf = buf.borrow_mut();
-        FX_TEMP.with(|fx| {
-            let mut fx_buf = fx.borrow_mut();
-            if temp_buf.len() != output.len() {
-                temp_buf.resize(output.len(), 0.0);
-            }
-            if fx_buf.len() != output.len() {
-                fx_buf.resize(output.len(), 0.0);
-            }
-            let temp = &mut *temp_buf;
-            let fx_temp = &mut *fx_buf;
-
-            for (index, state) in track_audio.iter().enumerate() {
-        let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
-            muted: false,
-            solo: false,
-            level: 1.0,
-        });
-        if mix.muted || (any_solo && !mix.solo) {
-            state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            continue;
-        }
-        let mut track_processed = false;
-        let Some(host) = state.host.as_ref() else {
-            state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            continue;
-        };
-        let notes = match state.clip_notes.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => Vec::new(),
-        };
-        let learned_map = state
-            .learned_cc
-            .lock()
-            .ok()
-            .map(|map| map.clone())
-            .unwrap_or_default();
-        let automation = state
-            .automation_lanes
-            .lock()
-            .ok()
-            .map(|lanes| lanes.clone())
-            .unwrap_or_default();
-        let bypass = state
-            .effect_bypass
-            .lock()
-            .ok()
-            .map(|b| b.clone())
-            .unwrap_or_default();
-        let mut events = collect_block_events(&notes, block_start, block_end, samples_per_beat);
-        if loop_wrapped {
-            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
-        }
-        if let Ok(mut queued) = state.midi_events.lock() {
-            events.extend(queued.drain(..));
-        }
-        let pending_params = state
-            .pending_param_changes
-            .lock()
-            .ok()
-            .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
-            .unwrap_or_default();
-        temp.fill(0.0);
-        if let Ok(mut host) = host.lock() {
-            let mut remaining_params: Vec<PendingParamChange> = Vec::new();
-            for pending in &pending_params {
-                match pending.target {
-                    PendingParamTarget::Instrument => {
-                        host.push_param_change(pending.param_id, pending.value);
-                    }
-                    PendingParamTarget::Effect(_) => {
-                        remaining_params.push(*pending);
-                    }
-                }
-            }
-            for lane in &automation {
-                if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                    if lane.target == AutomationTarget::Instrument {
-                        host.push_param_change(lane.param_id, value as f64);
-                    }
-                }
-            }
-            let mut filtered = Vec::with_capacity(events.len());
-            for event in events {
-                match event {
-                    vst3::MidiEvent::ControlChange {
-                        channel,
-                        controller,
-                        value,
-                    } => {
-                        if let Some(param_id) = learned_map.get(&(channel, controller)) {
-                            let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
-                            host.push_param_change(*param_id, norm);
-                        } else {
-                            filtered.push(event);
-                        }
-                    }
-                    _ => filtered.push(event),
-                }
-            }
-            if host.process_f32(temp, channels, &filtered).is_ok() {
-                let mut current: &mut [f32] = &mut temp[..];
-                let mut scratch: &mut [f32] = &mut fx_temp[..];
-                for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
-                    if bypass.get(fx_index).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    scratch.fill(0.0);
-                    if let Ok(mut fx_host) = fx_host.lock() {
-                        let mut still_pending: Vec<PendingParamChange> = Vec::new();
-                        for pending in remaining_params.drain(..) {
-                            match pending.target {
-                                PendingParamTarget::Effect(target_index)
-                                    if target_index == fx_index =>
-                                {
-                                    fx_host.push_param_change(pending.param_id, pending.value);
-                                }
-                                _ => still_pending.push(pending),
-                            }
-                        }
-                        remaining_params = still_pending;
-                        for lane in &automation {
-                            if let Some(value) =
-                                DawApp::automation_value_at(&lane.points, block_beat)
-                            {
-                                if lane.target == AutomationTarget::Effect(fx_index) {
-                                    fx_host.push_param_change(lane.param_id, value as f64);
-                                }
-                            }
-                        }
-                        if fx_host
-                            .process_f32_with_input(
-                                current,
-                                scratch,
-                                channels,
-                                &filtered,
-                            )
-                            .is_ok()
-                        {
-                            std::mem::swap(&mut current, &mut scratch);
-                        }
-                    }
-                }
-                if !remaining_params.is_empty() {
-                    if let Ok(mut pending) = state.pending_param_changes.lock() {
-                        pending.extend(remaining_params);
-                    }
-                }
-                let mut peak_l = 0.0f32;
-                let mut peak_r = 0.0f32;
-                if channels >= 2 {
-                    for frame in current.chunks_exact(channels) {
-                        peak_l = peak_l.max(frame[0].abs());
-                        peak_r = peak_r.max(frame[1].abs());
-                    }
-                } else {
-                    for sample in current.iter() {
-                        let v = sample.abs();
-                        peak_l = peak_l.max(v);
-                        peak_r = peak_r.max(v);
-                    }
-                }
-                state.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
-                state.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
-                state.peak_bits.store(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
-                for (out, sample) in output.iter_mut().zip(current.iter()) {
-                    *out += *sample * mix.level;
-                }
-                track_processed = true;
-                processed_any = true;
-            }
-        }
-        if !track_processed {
-            state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-        }
-            }
-        });
-    });
-
+    let track_count = track_audio.len();
+    let mut track_has_audio = vec![false; track_count];
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_count];
     if let Ok(clips) = audio_clips.lock() {
         for clip in clips.iter() {
+            if clip.track_index >= track_count {
+                continue;
+            }
             let clip_end = clip.start_samples + clip.length_samples;
             if block_end <= clip.start_samples || block_start >= clip_end {
                 continue;
             }
+            track_has_audio[clip.track_index] = true;
             let data = {
                 let cache = match audio_cache.lock() {
                     Ok(cache) => cache,
@@ -9377,46 +10036,276 @@ fn mix_track_hosts(
             let Some(data) = data else {
                 continue;
             };
-            let src_channels = data.channels.max(1);
-            let src_frames = data.samples.len() / src_channels;
-            if src_frames == 0 {
-                continue;
-            }
-            let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
-            let time_mul = clip.time_mul.max(0.01) as f64;
-            let start_in_block = block_start.max(clip.start_samples) - block_start;
-            let end_in_block = block_end.min(clip_end) - block_start;
-            for i in start_in_block..end_in_block {
-                let clip_pos = i + block_start - clip.start_samples;
-                let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                    .max(0.0);
-                let src_pos = if src_frames > 0 {
-                    let len = src_frames as f64;
-                    pos % len
-                } else {
-                    pos
-                };
-                let base = src_pos.floor() as usize;
-                let frac = (src_pos - base as f64) as f32;
-                let next = (base + 1).min(src_frames.saturating_sub(1));
-                for ch in 0..channels {
-                    let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                    let idx0 = base * src_channels + src_ch;
-                    let idx1 = next * src_channels + src_ch;
-                    let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                    let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                    let sample = s0 + (s1 - s0) * frac;
-                    let out_index = i as usize * channels + ch;
-                    if out_index < output.len() {
-                        output[out_index] += sample * clip.gain;
-                    }
-                }
-            }
-            processed_any = true;
+            per_track_clips[clip.track_index].push((clip.clone(), data));
         }
     }
 
-    processed_any
+    let mut per_track_buffers: Vec<Vec<f32>> = vec![vec![0.0; output.len()]; track_count];
+    let processed_any = Arc::new(AtomicBool::new(false));
+
+    per_track_buffers
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, temp)| {
+            let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
+                muted: false,
+                solo: false,
+                level: 1.0,
+            });
+            let state = match track_audio.get(index) {
+                Some(state) => state,
+                None => return,
+            };
+            if mix.muted || (any_solo && !mix.solo) {
+                state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                return;
+            }
+
+            let notes = match state.clip_notes.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_) => Vec::new(),
+            };
+            let has_notes = !notes.is_empty();
+            let has_audio = track_has_audio.get(index).copied().unwrap_or(false);
+            let learned_map = state
+                .learned_cc
+                .lock()
+                .ok()
+                .map(|map| map.clone())
+                .unwrap_or_default();
+            let automation = state
+                .automation_lanes
+                .lock()
+                .ok()
+                .map(|lanes| lanes.clone())
+                .unwrap_or_default();
+            let bypass = state
+                .effect_bypass
+                .lock()
+                .ok()
+                .map(|b| b.clone())
+                .unwrap_or_default();
+            let queued_len = state
+                .midi_events
+                .lock()
+                .ok()
+                .map(|q| q.len())
+                .unwrap_or(0);
+            let should_suspend = smart_suspend_tracks
+                && !has_notes
+                && !has_audio
+                && queued_len == 0
+                && automation.is_empty();
+            if should_suspend {
+                let blocks = state.silent_blocks.fetch_add(1, Ordering::Relaxed) + 1;
+                if blocks >= 4 {
+                    state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    return;
+                }
+            } else {
+                state.silent_blocks.store(0, Ordering::Relaxed);
+            }
+
+            temp.fill(0.0);
+            let mut track_processed = false;
+            if let Some(host) = state.host.as_ref() {
+                let mut events =
+                    collect_block_events(&notes, block_start, block_end, samples_per_beat);
+                if loop_wrapped {
+                    events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
+                }
+                if let Ok(mut queued) = state.midi_events.lock() {
+                    events.extend(queued.drain(..));
+                }
+                let pending_params = state
+                    .pending_param_changes
+                    .lock()
+                    .ok()
+                    .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if let Ok(mut host) = host.lock() {
+                    let mut remaining_params: Vec<PendingParamChange> = Vec::new();
+                    for pending in &pending_params {
+                        match pending.target {
+                            PendingParamTarget::Instrument => {
+                                host.push_param_change(pending.param_id, pending.value);
+                            }
+                            PendingParamTarget::Effect(_) => {
+                                remaining_params.push(*pending);
+                            }
+                        }
+                    }
+                    for lane in &automation {
+                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat)
+                        {
+                            if lane.target == AutomationTarget::Instrument {
+                                host.push_param_change(lane.param_id, value as f64);
+                            }
+                        }
+                    }
+                    let mut filtered = Vec::with_capacity(events.len());
+                    for event in events {
+                        match event {
+                            vst3::MidiEvent::ControlChange {
+                                channel,
+                                controller,
+                                value,
+                            } => {
+                                if let Some(param_id) = learned_map.get(&(channel, controller)) {
+                                    let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
+                                    host.push_param_change(*param_id, norm);
+                                } else {
+                                    filtered.push(event);
+                                }
+                            }
+                            _ => filtered.push(event),
+                        }
+                    }
+                    if host.process_f32(temp, channels, &filtered).is_ok() {
+                        let temp_len = temp.len();
+                        let mut scratch: Vec<f32> = vec![0.0; temp_len];
+                        let mut use_temp = true;
+                        {
+                            let mut current: &mut [f32] = temp;
+                            let mut scratch_slice: &mut [f32] = &mut scratch;
+                            let skip_fx = smart_disable_plugins && !has_notes && !has_audio;
+                            for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
+                                if skip_fx || bypass.get(fx_index).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                scratch_slice.fill(0.0);
+                                if let Ok(mut fx_host) = fx_host.lock() {
+                                    let mut still_pending: Vec<PendingParamChange> = Vec::new();
+                                    for pending in remaining_params.drain(..) {
+                                        match pending.target {
+                                            PendingParamTarget::Effect(target_index)
+                                                if target_index == fx_index =>
+                                            {
+                                                fx_host.push_param_change(pending.param_id, pending.value);
+                                            }
+                                            _ => still_pending.push(pending),
+                                        }
+                                    }
+                                    remaining_params = still_pending;
+                                    for lane in &automation {
+                                        if let Some(value) =
+                                            DawApp::automation_value_at(&lane.points, block_beat)
+                                        {
+                                            if lane.target == AutomationTarget::Effect(fx_index) {
+                                                fx_host.push_param_change(lane.param_id, value as f64);
+                                            }
+                                        }
+                                    }
+                                    if fx_host
+                                        .process_f32_with_input(current, scratch_slice, channels, &filtered)
+                                        .is_ok()
+                                    {
+                                        std::mem::swap(&mut current, &mut scratch_slice);
+                                        use_temp = !use_temp;
+                                    }
+                                }
+                            }
+                        }
+                        if !remaining_params.is_empty() {
+                            if let Ok(mut pending) = state.pending_param_changes.lock() {
+                                pending.extend(remaining_params);
+                            }
+                        }
+                        if !use_temp {
+                            temp.copy_from_slice(&scratch);
+                        }
+                        track_processed = true;
+                    }
+                }
+            }
+
+            if let Some(clips) = per_track_clips.get(index) {
+                for (clip, data) in clips {
+                    let clip_end = clip.start_samples + clip.length_samples;
+                    if block_end <= clip.start_samples || block_start >= clip_end {
+                        continue;
+                    }
+                    let src_channels = data.channels.max(1);
+                    let src_frames = data.samples.len() / src_channels;
+                    if src_frames == 0 {
+                        continue;
+                    }
+                    let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
+                    let time_mul = clip.time_mul.max(0.01) as f64;
+                    let start_in_block = block_start.max(clip.start_samples) - block_start;
+                    let end_in_block = block_end.min(clip_end) - block_start;
+                    for i in start_in_block..end_in_block {
+                        let clip_pos = i + block_start - clip.start_samples;
+                        let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                            .max(0.0);
+                        let src_pos = if src_frames > 0 {
+                            let len = src_frames as f64;
+                            pos % len
+                        } else {
+                            pos
+                        };
+                        let base = src_pos.floor() as usize;
+                        let frac = (src_pos - base as f64) as f32;
+                        let next = (base + 1).min(src_frames.saturating_sub(1));
+                        for ch in 0..channels {
+                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                            let idx0 = base * src_channels + src_ch;
+                            let idx1 = next * src_channels + src_ch;
+                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                            let sample = s0 + (s1 - s0) * frac;
+                            let out_index = i as usize * channels + ch;
+                            if out_index < temp.len() {
+                                temp[out_index] += sample * clip.gain;
+                            }
+                        }
+                    }
+                    track_processed = true;
+                }
+            }
+
+            let mut peak_l = 0.0f32;
+            let mut peak_r = 0.0f32;
+            if channels >= 2 {
+                for frame in temp.chunks_exact(channels) {
+                    peak_l = peak_l.max(frame[0].abs());
+                    peak_r = peak_r.max(frame[1].abs());
+                }
+            } else {
+                for sample in temp.iter() {
+                    let v = sample.abs();
+                    peak_l = peak_l.max(v);
+                    peak_r = peak_r.max(v);
+                }
+            }
+            state.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
+            state.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
+            state.peak_bits.store(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
+
+            if track_processed {
+                processed_any.store(true, Ordering::Relaxed);
+            }
+        });
+
+    for (index, buffer) in per_track_buffers.iter().enumerate() {
+        let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
+            muted: false,
+            solo: false,
+            level: 1.0,
+        });
+        if mix.muted || (any_solo && !mix.solo) {
+            continue;
+        }
+        for (out, sample) in output.iter_mut().zip(buffer.iter()) {
+            *out += *sample * mix.level;
+        }
+    }
+
+    processed_any.load(Ordering::Relaxed)
 }
 
 fn update_master_peak_f32(output: &[f32], peak_bits: &AtomicU32) {
@@ -9569,6 +10458,155 @@ fn default_midi_params() -> Vec<String> {
         "CC11 Expression".to_string(),
         "CC64 Sustain".to_string(),
     ]
+}
+
+fn gm_program_name(program: u8) -> &'static str {
+    const GM_NAMES: [&str; 128] = [
+        "Acoustic Grand Piano",
+        "Bright Acoustic Piano",
+        "Electric Grand Piano",
+        "Honky-tonk Piano",
+        "Electric Piano 1",
+        "Electric Piano 2",
+        "Harpsichord",
+        "Clavinet",
+        "Celesta",
+        "Glockenspiel",
+        "Music Box",
+        "Vibraphone",
+        "Marimba",
+        "Xylophone",
+        "Tubular Bells",
+        "Dulcimer",
+        "Drawbar Organ",
+        "Percussive Organ",
+        "Rock Organ",
+        "Church Organ",
+        "Reed Organ",
+        "Accordion",
+        "Harmonica",
+        "Tango Accordion",
+        "Acoustic Guitar (nylon)",
+        "Acoustic Guitar (steel)",
+        "Electric Guitar (jazz)",
+        "Electric Guitar (clean)",
+        "Electric Guitar (muted)",
+        "Overdriven Guitar",
+        "Distortion Guitar",
+        "Guitar Harmonics",
+        "Acoustic Bass",
+        "Electric Bass (finger)",
+        "Electric Bass (pick)",
+        "Fretless Bass",
+        "Slap Bass 1",
+        "Slap Bass 2",
+        "Synth Bass 1",
+        "Synth Bass 2",
+        "Violin",
+        "Viola",
+        "Cello",
+        "Contrabass",
+        "Tremolo Strings",
+        "Pizzicato Strings",
+        "Orchestral Harp",
+        "Timpani",
+        "String Ensemble 1",
+        "String Ensemble 2",
+        "Synth Strings 1",
+        "Synth Strings 2",
+        "Choir Aahs",
+        "Voice Oohs",
+        "Synth Voice",
+        "Orchestra Hit",
+        "Trumpet",
+        "Trombone",
+        "Tuba",
+        "Muted Trumpet",
+        "French Horn",
+        "Brass Section",
+        "Synth Brass 1",
+        "Synth Brass 2",
+        "Soprano Sax",
+        "Alto Sax",
+        "Tenor Sax",
+        "Baritone Sax",
+        "Oboe",
+        "English Horn",
+        "Bassoon",
+        "Clarinet",
+        "Piccolo",
+        "Flute",
+        "Recorder",
+        "Pan Flute",
+        "Blown Bottle",
+        "Shakuhachi",
+        "Whistle",
+        "Ocarina",
+        "Lead 1 (square)",
+        "Lead 2 (sawtooth)",
+        "Lead 3 (calliope)",
+        "Lead 4 (chiff)",
+        "Lead 5 (charang)",
+        "Lead 6 (voice)",
+        "Lead 7 (fifths)",
+        "Lead 8 (bass + lead)",
+        "Pad 1 (new age)",
+        "Pad 2 (warm)",
+        "Pad 3 (polysynth)",
+        "Pad 4 (choir)",
+        "Pad 5 (bowed)",
+        "Pad 6 (metallic)",
+        "Pad 7 (halo)",
+        "Pad 8 (sweep)",
+        "FX 1 (rain)",
+        "FX 2 (soundtrack)",
+        "FX 3 (crystal)",
+        "FX 4 (atmosphere)",
+        "FX 5 (brightness)",
+        "FX 6 (goblins)",
+        "FX 7 (echoes)",
+        "FX 8 (sci-fi)",
+        "Sitar",
+        "Banjo",
+        "Shamisen",
+        "Koto",
+        "Kalimba",
+        "Bag pipe",
+        "Fiddle",
+        "Shanai",
+        "Tinkle Bell",
+        "Agogo",
+        "Steel Drums",
+        "Woodblock",
+        "Taiko Drum",
+        "Melodic Tom",
+        "Synth Drum",
+        "Reverse Cymbal",
+        "Guitar Fret Noise",
+        "Breath Noise",
+        "Seashore",
+        "Bird Tweet",
+        "Telephone Ring",
+        "Helicopter",
+        "Applause",
+        "Gunshot",
+    ];
+    GM_NAMES[program.min(127) as usize]
+}
+
+fn gm_drum_kit_name(program: u8) -> Option<&'static str> {
+    match program {
+        0 => Some("Standard Kit"),
+        8 => Some("Room Kit"),
+        16 => Some("Power Kit"),
+        24 => Some("Electronic Kit"),
+        25 => Some("TR-808 Kit"),
+        32 => Some("Jazz Kit"),
+        40 => Some("Brush Kit"),
+        48 => Some("Orchestra Kit"),
+        56 => Some("Sound FX Kit"),
+        _ => None,
+    }
 }
 
 fn default_instrument_params() -> Vec<String> {

@@ -133,6 +133,23 @@ pub fn export_midi(path: &str, notes: &[PianoRollNote], ticks_per_beat: u16) -> 
 pub struct MidiChannelNotes {
     pub channel: u8,
     pub notes: Vec<PianoRollNote>,
+    pub program: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MidiCcEvent {
+    pub cc: u8,
+    pub beat: f32,
+    pub value: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MidiTrackData {
+    pub track_index: usize,
+    pub notes: Vec<PianoRollNote>,
+    pub program: Option<u8>,
+    pub has_drums: bool,
+    pub cc_events: Vec<MidiCcEvent>,
 }
 
 pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String> {
@@ -144,6 +161,7 @@ pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String>
     };
 
     let mut channel_notes: HashMap<u8, Vec<PianoRollNote>> = HashMap::new();
+    let mut channel_programs: HashMap<u8, u8> = HashMap::new();
     for track in &smf.tracks {
         let mut abs_ticks = 0u64;
         let mut active: HashMap<(u8, u8), (u64, u8)> = HashMap::new();
@@ -152,6 +170,9 @@ pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String>
             if let TrackEventKind::Midi { channel, message } = event.kind {
                 let ch = channel.as_int();
                 match message {
+                    MidlyMessage::ProgramChange { program } => {
+                        channel_programs.insert(ch, program.as_int());
+                    }
                     MidlyMessage::NoteOn { key, vel } => {
                         let k = key.as_int();
                         if vel.as_int() == 0 {
@@ -196,9 +217,97 @@ pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String>
 
     let mut result: Vec<MidiChannelNotes> = channel_notes
         .into_iter()
-        .map(|(channel, notes)| MidiChannelNotes { channel, notes })
+        .map(|(channel, notes)| MidiChannelNotes {
+            channel,
+            notes,
+            program: channel_programs.get(&channel).copied(),
+        })
         .collect();
     result.sort_by_key(|item| item.channel);
+    Ok(result)
+}
+
+pub fn import_midi_tracks(path: &str) -> Result<Vec<MidiTrackData>, String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let smf = Smf::parse(&data).map_err(|e| format!("midi parse error: {e}"))?;
+    let ticks_per_beat = match smf.header.timing {
+        Timing::Metrical(ticks) => ticks.as_int() as u32,
+        Timing::Timecode(_, _) => 480,
+    };
+
+    let mut result = Vec::new();
+    for (track_index, track) in smf.tracks.iter().enumerate() {
+        let mut abs_ticks = 0u64;
+        let mut active: HashMap<(u8, u8), (u64, u8)> = HashMap::new();
+        let mut notes = Vec::new();
+        let mut program: Option<u8> = None;
+        let mut has_drums = false;
+        let mut cc_events = Vec::new();
+        for event in track {
+            abs_ticks += event.delta.as_int() as u64;
+            if let TrackEventKind::Midi { channel, message } = event.kind {
+                let ch = channel.as_int();
+                if ch == 9 {
+                    has_drums = true;
+                }
+                match message {
+                    MidlyMessage::ProgramChange { program: program_id } => {
+                        program = Some(program_id.as_int());
+                    }
+                    MidlyMessage::Controller { controller, value } => {
+                        let cc = controller.as_int();
+                        if cc == 65 {
+                            let beat = ticks_to_beats(abs_ticks, ticks_per_beat);
+                            let norm = (value.as_int() as f32 / 127.0).clamp(0.0, 1.0);
+                            cc_events.push(MidiCcEvent { cc, beat, value: norm });
+                        }
+                    }
+                    MidlyMessage::NoteOn { key, vel } => {
+                        let k = key.as_int();
+                        if vel.as_int() == 0 {
+                            if let Some((start, velocity)) = active.remove(&(ch, k)) {
+                                let length_ticks = abs_ticks.saturating_sub(start);
+                                notes.push(note_from_ticks(
+                                    start,
+                                    length_ticks,
+                                    k,
+                                    velocity,
+                                    ticks_per_beat,
+                                ));
+                            }
+                        } else {
+                            active.insert((ch, k), (abs_ticks, vel.as_int()));
+                        }
+                    }
+                    MidlyMessage::NoteOff { key, .. } => {
+                        let k = key.as_int();
+                        if let Some((start, velocity)) = active.remove(&(ch, k)) {
+                            let length_ticks = abs_ticks.saturating_sub(start);
+                            notes.push(note_from_ticks(
+                                start,
+                                length_ticks,
+                                k,
+                                velocity,
+                                ticks_per_beat,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if notes.is_empty() {
+            continue;
+        }
+        result.push(MidiTrackData {
+            track_index,
+            notes,
+            program,
+            has_drums,
+            cc_events,
+        });
+    }
     Ok(result)
 }
 
@@ -212,4 +321,8 @@ fn note_from_ticks(
     let start_beats = start as f32 / ticks_per_beat as f32;
     let length_beats = (length as f32 / ticks_per_beat as f32).max(0.25);
     PianoRollNote::new(start_beats, length_beats, key, velocity)
+}
+
+fn ticks_to_beats(ticks: u64, ticks_per_beat: u32) -> f32 {
+    ticks as f32 / ticks_per_beat as f32
 }
