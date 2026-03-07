@@ -8575,8 +8575,10 @@ impl DawApp {
 
     fn scan_vst3_plugins(&self) -> Vec<String> {
         let root = PathBuf::from("C:\\Program Files\\Common Files\\VST3");
+        let local = PathBuf::from("synths");
         let mut found = Vec::new();
         self.scan_dir(&root, &mut found);
+        self.scan_dir(&local, &mut found);
         found.sort();
         found
     }
