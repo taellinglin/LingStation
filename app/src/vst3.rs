@@ -899,6 +899,13 @@ unsafe impl Send for Vst3Host {}
 unsafe impl Sync for Vst3Host {}
 
 impl Vst3Host {
+    pub fn io_channels(&self) -> (usize, usize) {
+        (self.input_channels, self.output_channels)
+    }
+
+    pub fn latency_samples(&self) -> u32 {
+        unsafe { self.processor.getLatencySamples() }
+    }
     pub fn load(
         plugin_path: &str,
         sample_rate: f64,

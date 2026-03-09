@@ -27,5 +27,35 @@ fn main() {
                 }
             }
         }
+
+        let rb_root = manifest_dir
+            .join("..")
+            .join("third_party")
+            .join("rubberband")
+            .join("otherbuilds");
+        let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+        let mut candidates = Vec::new();
+        if profile == "release" {
+            candidates.push(rb_root.join("x64").join("Release"));
+            candidates.push(rb_root.join("Release"));
+        } else {
+            candidates.push(rb_root.join("x64").join("Debug"));
+            candidates.push(rb_root.join("Debug"));
+        }
+        let lib_name = "rubberband-library.lib";
+        let mut found = None;
+        for dir in candidates {
+            let lib_path = dir.join(lib_name);
+            if lib_path.exists() {
+                found = Some(dir);
+                break;
+            }
+        }
+        if let Some(dir) = found {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=rubberband-library");
+        } else {
+            println!("cargo:warning=Rubber Band static library not found. Build third_party\\rubberband\\otherbuilds\\rubberband-library.vcxproj for x64.");
+        }
     }
 }

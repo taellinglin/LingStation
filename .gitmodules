@@ -1,3 +1,6 @@
 [submodule "vst3sdk"]
 	path = vst3sdk
 	url = https://github.com/steinbergmedia/vst3sdk.git
+[submodule "third_party/rubberband"]
+	path = third_party/rubberband
+	url = https://github.com/breakfastquay/rubberband
