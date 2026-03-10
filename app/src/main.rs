@@ -1886,7 +1886,8 @@ impl DawApp {
     ) {
         let clip_len = clip_len.max(0.001);
         let painter = painter.with_clip_rect(rect);
-        let mut pitch_set: HashSet<u8> = HashSet::new();
+        let mut min_note: Option<u8> = None;
+        let mut max_note: Option<u8> = None;
         for note in notes {
             if note.start_beats + note.length_beats < clip_start {
                 continue;
@@ -1894,19 +1895,15 @@ impl DawApp {
             if note.start_beats > clip_start + clip_len {
                 continue;
             }
-            pitch_set.insert(note.midi_note);
+            min_note = Some(min_note.map_or(note.midi_note, |v| v.min(note.midi_note)));
+            max_note = Some(max_note.map_or(note.midi_note, |v| v.max(note.midi_note)));
         }
-        if pitch_set.is_empty() {
-            return;
-        }
-        let mut pitch_rows: Vec<u8> = pitch_set.into_iter().collect();
-        pitch_rows.sort_unstable();
-        let mut pitch_map: HashMap<u8, usize> = HashMap::new();
-        for (index, pitch) in pitch_rows.iter().enumerate() {
-            pitch_map.insert(*pitch, index);
-        }
-        let row_count = pitch_rows.len().max(1) as f32;
-        let note_height = (rect.height() / row_count).max(2.0);
+        let (min_note, max_note) = match (min_note, max_note) {
+            (Some(min_note), Some(max_note)) => (min_note, max_note),
+            _ => return,
+        };
+        let row_count = (max_note.saturating_sub(min_note) as f32 + 1.0).max(1.0);
+        let note_height = (rect.height() / row_count).max(1.0);
         for (index, note) in notes.iter().enumerate() {
             let note_end = note.start_beats + note.length_beats;
             if note_end < clip_start || note.start_beats > clip_start + clip_len {
@@ -1916,11 +1913,11 @@ impl DawApp {
             let local_len = note.length_beats.min(clip_len - local_start).max(0.0);
             let x = clip_left + local_start * beat_width;
             let w = (local_len * beat_width).max(2.0);
-            let row_index = pitch_map.get(&note.midi_note).copied().unwrap_or(0) as f32;
+            let row_index = note.midi_note.saturating_sub(min_note) as f32;
             let y = rect.bottom() - (row_index + 1.0) * note_height;
             let note_rect = egui::Rect::from_min_size(
                 egui::pos2(x, y),
-                egui::vec2(w, note_height * 0.9),
+                egui::vec2(w, (note_height * 0.9).max(1.0)),
             );
             let base = if index % 2 == 0 {
                 egui::Color32::from_rgb(88, 210, 180)
