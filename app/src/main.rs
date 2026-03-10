@@ -5202,12 +5202,15 @@ impl DawApp {
                 } else {
                     tile_rect
                 };
-                let label_id = egui::Id::new(format!("arranger_tracklist_{}", track_index));
-                let label_response = ui.interact(label_click_rect, label_id, egui::Sense::click());
-                if label_response.clicked()
-                    && !toggle_response.as_ref().map_or(false, |resp| resp.clicked())
-                {
-                    pending_track_select = Some(track_index);
+                if label_click_rect.top() >= grid_top {
+                    let label_id = egui::Id::new(format!("arranger_tracklist_{}", track_index));
+                    let label_response =
+                        ui.interact(label_click_rect, label_id, egui::Sense::click());
+                    if label_response.clicked()
+                        && !toggle_response.as_ref().map_or(false, |resp| resp.clicked())
+                    {
+                        pending_track_select = Some(track_index);
+                    }
                 }
                 let name_rect = egui::Rect::from_min_max(
                     egui::pos2(
