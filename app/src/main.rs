@@ -603,6 +603,7 @@ struct DawApp {
     clip_clipboard: Option<Clip>,
     waveform_cache: RefCell<HashMap<String, Vec<f32>>>,
     waveform_color_cache: RefCell<HashMap<String, Vec<[f32; 3]>>>,
+    waveform_len_seconds_cache: RefCell<HashMap<String, f32>>,
     audio_clip_cache: Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>,
     audio_clip_timeline: Arc<Mutex<Vec<AudioClipRender>>>,
     audio_preview_stream: Option<OutputStream>,
@@ -977,6 +978,7 @@ impl Default for DawApp {
             clip_clipboard: None,
             waveform_cache: RefCell::new(HashMap::new()),
             waveform_color_cache: RefCell::new(HashMap::new()),
+            waveform_len_seconds_cache: RefCell::new(HashMap::new()),
             audio_clip_cache: Arc::new(Mutex::new(HashMap::new())),
             audio_clip_timeline: Arc::new(Mutex::new(Vec::new())),
             audio_preview_stream: None,
@@ -1955,10 +1957,14 @@ impl DawApp {
             let step = rect.width() / count as f32;
             let time_mul = clip.audio_time_mul.max(0.01);
             let clip_len = clip.length_beats.max(0.001);
-            let source_beats = clip
-                .audio_source_beats
-                .unwrap_or(clip_len / time_mul)
-                .max(0.001);
+            let source_beats = self
+                .get_waveform_seconds_for_clip(clip)
+                .map(|seconds| (seconds * self.tempo_bpm.max(1.0) / 60.0).max(0.001))
+                .unwrap_or_else(|| {
+                    clip.audio_source_beats
+                        .unwrap_or(clip_len / time_mul)
+                        .max(0.001)
+                });
             let offset_beats = clip.audio_offset_beats.max(0.0);
             let source_span = (clip_len / time_mul).max(0.0);
             for index in 0..count {
@@ -1969,7 +1975,7 @@ impl DawApp {
                     if local_beat < 0.0 || local_beat > clip_len {
                         0.0
                     } else {
-                        let src_beat = offset_beats + local_beat / time_mul;
+                        let src_beat = (offset_beats + local_beat) / time_mul;
                         if src_beat < 0.0 || src_beat > source_beats {
                             0.0
                         } else {
@@ -1997,7 +2003,7 @@ impl DawApp {
                     } else {
                         0.0
                     };
-                    let src_beat = offset_beats + t * source_span;
+                    let src_beat = (offset_beats + t * clip_len) / time_mul;
                     if src_beat < 0.0 || src_beat > source_beats {
                         0.0
                     } else {
@@ -2031,7 +2037,7 @@ impl DawApp {
                         if local_beat < 0.0 || local_beat > clip_len {
                             (0.0, 0.0, 0.0)
                         } else {
-                            let src_beat = offset_beats + local_beat / time_mul;
+                            let src_beat = (offset_beats + local_beat) / time_mul;
                             if src_beat < 0.0 || src_beat > source_beats {
                                 (0.0, 0.0, 0.0)
                             } else {
@@ -2058,7 +2064,12 @@ impl DawApp {
                         } else {
                             0.0
                         };
-                        let src_pos = t * (bands.len() as f32 - 1.0);
+                        let src_beat = (offset_beats + t * clip_len) / time_mul;
+                        let src_pos = if source_beats > 0.0 {
+                            (src_beat / source_beats) * (bands.len() as f32 - 1.0)
+                        } else {
+                            t * (bands.len() as f32 - 1.0)
+                        };
                         let left = src_pos.floor().clamp(0.0, (bands.len() - 1) as f32) as usize;
                         let right = (left + 1).min(bands.len() - 1);
                         let frac = src_pos - left as f32;
@@ -2138,6 +2149,20 @@ impl DawApp {
                 }
             }
             cache.get(&key).cloned()
+        }
+    }
+
+    fn get_waveform_seconds_for_clip(&self, clip: &Clip) -> Option<f32> {
+        let path = self.resolve_clip_audio_path(clip)?;
+        let key = path.to_string_lossy().to_string();
+        {
+            let mut cache = self.waveform_len_seconds_cache.borrow_mut();
+            if !cache.contains_key(&key) {
+                if let Some(seconds) = Self::wav_length_seconds(&path) {
+                    cache.insert(key.clone(), seconds);
+                }
+            }
+            cache.get(&key).copied()
         }
     }
 
@@ -3679,8 +3704,8 @@ impl DawApp {
                         };
                         let strip_response = egui::Frame::none()
                             .fill(strip_fill)
-                            .rounding(egui::Rounding::same(4.0))
-                            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                            .rounding(egui::Rounding::same(0.0))
+                            .inner_margin(egui::Margin::symmetric(6.0, 0.0))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.visuals_mut().override_text_color =
@@ -3704,7 +3729,7 @@ impl DawApp {
                                     egui::vec2(ui.available_width(), 18.0),
                                     egui::Sense::hover(),
                                 );
-                                ui.painter().rect_filled(label_rect, 3.0, label_fill);
+                                ui.painter().rect_filled(label_rect, 0.0, label_fill);
                                 Self::outlined_text(
                                     ui.painter(),
                                     egui::pos2(label_rect.left() + 6.0, label_rect.center().y),
@@ -4124,9 +4149,38 @@ impl DawApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Tools");
-                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Draw, "Draw MIDI");
-                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Select, "Select (Box)");
-                ui.selectable_value(&mut self.arranger_tool, ArrangerTool::Move, "Move");
+                let tool_size = egui::vec2(110.0, 22.0);
+                let icon_size = egui::vec2(14.0, 14.0);
+                let button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 220);
+                let button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 220);
+                let icon_tint = egui::Color32::from_gray(220);
+                let mut tool_button = |tool: ArrangerTool, icon: egui::ImageSource<'static>, label: &str| {
+                    let selected = self.arranger_tool == tool;
+                    let mut button = egui::Button::image_and_text(
+                        egui::Image::new(icon).fit_to_exact_size(icon_size).tint(icon_tint),
+                        label,
+                    )
+                    .min_size(tool_size)
+                    .fill(if selected { button_on } else { button_bg });
+                    if ui.add(button).clicked() {
+                        self.arranger_tool = tool;
+                    }
+                };
+                tool_button(
+                    ArrangerTool::Draw,
+                    egui::include_image!("../../icons/arranger-write.svg"),
+                    "Draw MIDI",
+                );
+                tool_button(
+                    ArrangerTool::Select,
+                    egui::include_image!("../../icons/arranger-box-select.svg"),
+                    "Select (Box)",
+                );
+                tool_button(
+                    ArrangerTool::Move,
+                    egui::include_image!("../../icons/arranger-move.svg"),
+                    "Move",
+                );
             });
             ui.add_space(6.0);
             ui.add_space(6.0);
@@ -4194,7 +4248,7 @@ impl DawApp {
                     }
                 }
             }
-            let view_width = (rect.width() - lane_label_w - 24.0).max(1.0);
+            let view_width = (rect.width() - lane_label_w - 8.0).max(1.0);
             let content_width = max_end_beats * beat_width + 160.0;
             let min_pan_x = (view_width - content_width).min(0.0);
             let view_height = rect.height().max(1.0);
@@ -4227,7 +4281,7 @@ impl DawApp {
                 egui::pos2(rect.right(), rect.top() + header_height),
             );
             let timeline_bottom = header_rect.bottom();
-            let row_left = rect.left() + lane_label_w + 16.0 + self.arranger_pan.x;
+            let row_left = rect.left() + lane_label_w + self.arranger_pan.x;
             let header_id = egui::Id::new("arranger_timeline");
             let header_response = ui.interact(header_rect, header_id, egui::Sense::click());
             let header_pos = header_response.interact_pointer_pos();
@@ -4335,7 +4389,7 @@ impl DawApp {
             let playhead_x = row_left + self.playhead_beats * beat_width;
             let grid_top = (rect.top() + row_top_offset).max(header_rect.bottom());
             let grid_bottom = rect.bottom() - 8.0;
-            let grid_left = rect.left() + lane_label_w + 16.0;
+            let grid_left = rect.left() + lane_label_w;
             let grid_right = rect.right() - 8.0;
             let grid_clip = egui::Rect::from_min_max(
                 egui::pos2(grid_left, grid_top),
@@ -4344,7 +4398,7 @@ impl DawApp {
             let grid_painter = painter.with_clip_rect(grid_clip);
             let clip_painter = painter.with_clip_rect(grid_clip);
             let shelf_clip = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), header_rect.top()),
+                egui::pos2(rect.left(), grid_top),
                 egui::pos2(grid_left, grid_bottom),
             );
             let shelf_painter = painter.with_clip_rect(shelf_clip);
@@ -4404,7 +4458,7 @@ impl DawApp {
 
             let shelf_rect = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), grid_top),
-                egui::pos2(rect.left() + lane_label_w + 16.0, grid_bottom),
+                egui::pos2(rect.left() + lane_label_w, grid_bottom),
             );
             shelf_painter.rect_filled(shelf_rect, 0.0, egui::Color32::from_rgb(0, 0, 0));
             let timeline_clip = egui::Rect::from_min_max(
@@ -4457,15 +4511,15 @@ impl DawApp {
             for (row_index, row) in rows.iter().enumerate() {
                 let y = rect.top() + row_top_offset + row_index as f32 * row_height;
                 let label_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 8.0, y),
+                    egui::pos2(rect.left(), y),
                     egui::pos2(rect.left() + lane_label_w, y + row_height),
                 );
                 let row_rect = egui::Rect::from_min_max(
-                    egui::pos2(label_rect.right() + 8.0, y),
+                    egui::pos2(label_rect.right(), y),
                     egui::pos2(rect.right() - 8.0, y + row_height),
                 );
                 let row_click_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 8.0, y),
+                    egui::pos2(rect.left(), y),
                     egui::pos2(rect.right() - 8.0, y + row_height),
                 );
                 let row_click_top = row_click_rect.top().max(timeline_bottom);
@@ -4571,11 +4625,32 @@ impl DawApp {
                             } else {
                                 clip.name.as_str()
                             };
+                            let header_text = ui.fonts(|f| {
+                                let font = egui::FontId::proportional(11.0);
+                                let max_width = (header_rect.width() - 10.0).max(4.0);
+                                let mut text = name.to_string();
+                                while text.len() > 1
+                                    && f
+                                        .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE)
+                                        .size()
+                                        .x
+                                        > max_width
+                                {
+                                    text.pop();
+                                }
+                                if text.len() < name.len() {
+                                    if text.len() > 3 {
+                                        text.truncate(text.len().saturating_sub(3));
+                                    }
+                                    text.push_str("...");
+                                }
+                                text
+                            });
                             Self::outlined_text(
                                 &clip_painter,
-                                egui::pos2(header_rect.left() + 6.0, header_rect.center().y),
+                                egui::pos2(header_rect.left() + 4.0, header_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
-                                name,
+                                &header_text,
                                 egui::FontId::proportional(11.0),
                                 egui::Color32::WHITE,
                             );
@@ -5070,7 +5145,7 @@ impl DawApp {
                     egui::pos2(rect.left() + 8.0, y),
                     egui::pos2(rect.left() + lane_label_w, y + row_height),
                 );
-                let tile_rect = label_rect.shrink2(egui::vec2(0.0, 2.0));
+                let tile_rect = label_rect;
                 let is_selected = self.selected_track == Some(track_index);
                 let base = self.track_color(track_index);
                 let has_automation = !track.automation_lanes.is_empty();
@@ -5389,6 +5464,38 @@ impl DawApp {
                     ui.label("No clip selected");
                 }
             });
+            if !is_audio_clip {
+                ui.horizontal(|ui| {
+                    ui.label("Tools");
+                    let tool_size = egui::vec2(90.0, 22.0);
+                    let icon_size = egui::vec2(14.0, 14.0);
+                    let button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 220);
+                    let button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 220);
+                    let icon_tint = egui::Color32::from_gray(220);
+                    let mut tool_button = |tool: PianoTool, icon: egui::ImageSource<'static>, label: &str| {
+                        let selected = self.piano_tool == tool;
+                        let mut button = egui::Button::image_and_text(
+                            egui::Image::new(icon).fit_to_exact_size(icon_size).tint(icon_tint),
+                            label,
+                        )
+                        .min_size(tool_size)
+                        .fill(if selected { button_on } else { button_bg });
+                        if ui.add(button).clicked() {
+                            self.piano_tool = tool;
+                        }
+                    };
+                    tool_button(
+                        PianoTool::Pencil,
+                        egui::include_image!("../../icons/pen-tool.svg"),
+                        "Draw",
+                    );
+                    tool_button(
+                        PianoTool::Select,
+                        egui::include_image!("../../icons/mouse-pointer.svg"),
+                        "Select",
+                    );
+                });
+            }
             ui.add_space(4.0);
         }
 
@@ -5904,7 +6011,10 @@ impl DawApp {
             return;
         }
         if !is_audio_clip {
-            let note_button_size = egui::vec2(18.0, 18.0);
+            let note_button_size = egui::vec2(20.0, 20.0);
+            let note_icon_tint = egui::Color32::from_gray(220);
+            let note_button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 200);
+            let note_button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 220);
             ui.horizontal(|ui| {
                 ui.label("Note Length");
                 let lengths = [
@@ -5918,11 +6028,11 @@ impl DawApp {
                 for (value, label) in lengths {
                     let selected = (self.piano_note_len - value).abs() < f32::EPSILON;
                     let icon = egui::Image::new(Self::note_icon_source(value))
-                        .fit_to_exact_size(egui::vec2(16.0, 16.0));
-                    let mut button = egui::Button::image(icon).min_size(note_button_size);
-                    if selected {
-                        button = button.fill(egui::Color32::from_rgb(46, 94, 130));
-                    }
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(note_icon_tint);
+                    let mut button = egui::Button::image(icon)
+                        .min_size(note_button_size)
+                        .fill(if selected { note_button_on } else { note_button_bg });
                     if ui.add_sized(note_button_size, button).on_hover_text(label).clicked() {
                         self.piano_note_len = value;
                     }
@@ -5944,11 +6054,11 @@ impl DawApp {
                 for (value, label) in snaps {
                     let selected = (self.piano_snap - value).abs() < f32::EPSILON;
                     let icon = egui::Image::new(Self::note_icon_source(value))
-                        .fit_to_exact_size(egui::vec2(16.0, 16.0));
-                    let mut button = egui::Button::image(icon).min_size(note_button_size);
-                    if selected {
-                        button = button.fill(egui::Color32::from_rgb(46, 94, 130));
-                    }
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(note_icon_tint);
+                    let mut button = egui::Button::image(icon)
+                        .min_size(note_button_size)
+                        .fill(if selected { note_button_on } else { note_button_bg });
                     if ui.add_sized(note_button_size, button).on_hover_text(label).clicked() {
                         self.piano_snap = value;
                     }
@@ -8587,12 +8697,35 @@ impl DawApp {
         let reader = hound::WavReader::open(path).ok()?;
         let spec = reader.spec();
         let samples = reader.duration() as f32;
+        let channels = spec.channels.max(1) as f32;
         if spec.sample_rate == 0 {
             return None;
         }
-        let seconds = samples / spec.sample_rate as f32;
+        let frames = samples / channels;
+        let seconds = frames / spec.sample_rate as f32;
         let beats = seconds * tempo_bpm.max(1.0) / 60.0;
         Some(beats.max(0.0))
+    }
+
+    fn wav_length_seconds(path: &Path) -> Option<f32> {
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|e| !e.eq_ignore_ascii_case("wav"))
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        let reader = hound::WavReader::open(path).ok()?;
+        let spec = reader.spec();
+        let samples = reader.duration() as f32;
+        let channels = spec.channels.max(1) as f32;
+        if spec.sample_rate == 0 {
+            return None;
+        }
+        let frames = samples / channels;
+        let seconds = frames / spec.sample_rate as f32;
+        Some(seconds.max(0.0))
     }
 
     fn load_midi_from_folder(&mut self, folder: &Path) -> Result<(), String> {
@@ -10841,14 +10974,21 @@ unsafe extern "system" fn plugin_host_wndproc(
     lparam: isize,
 ) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, ShowWindow, SW_HIDE, WM_CLOSE,
+        DefWindowProcW, ShowWindow, SW_HIDE, WM_CLOSE, WM_NCDESTROY,
     };
     if msg == WM_CLOSE {
         if let Some(flag) = get_plugin_close_flag(hwnd) {
             flag.store(true, Ordering::Relaxed);
         }
         ShowWindow(hwnd, SW_HIDE);
+        release_mouse_capture();
         return 0;
+    }
+    if msg == WM_NCDESTROY {
+        if let Some(flag) = get_plugin_close_flag(hwnd) {
+            drop(Arc::from_raw(flag as *const AtomicBool));
+        }
+        clear_plugin_close_flag(hwnd);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
@@ -10932,7 +11072,7 @@ fn invalidate_plugin_window(_hwnd: isize) {}
 #[cfg(windows)]
 fn set_plugin_close_flag(hwnd: isize, flag: &Arc<AtomicBool>) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
-    let ptr = Arc::as_ptr(flag) as isize;
+    let ptr = Arc::into_raw(flag.clone()) as isize;
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr);
     }
@@ -10952,6 +11092,14 @@ fn get_plugin_close_flag(hwnd: isize) -> Option<&'static AtomicBool> {
     }
 }
 
+#[cfg(windows)]
+fn clear_plugin_close_flag(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+}
+
 #[cfg(not(windows))]
 fn get_plugin_close_flag(_hwnd: isize) -> Option<&'static AtomicBool> {
     None
@@ -10964,7 +11112,8 @@ fn pump_plugin_messages(hwnd: isize) {
     };
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+        let target = if hwnd == 0 { 0 } else { 0 };
+        while PeekMessageW(&mut msg, target, 0, 0, PM_REMOVE) != 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
