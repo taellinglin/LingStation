@@ -1121,6 +1121,19 @@ impl Vst3Host {
                 MediaTypes_::kAudio as i32,
                 BusDirections_::kInput as i32,
             );
+            let audio_out_count = component.getBusCount(
+                MediaTypes_::kAudio as i32,
+                BusDirections_::kOutput as i32,
+            );
+            if audio_out_count <= 0 {
+                return Err("VST3 has no audio output buses".to_string());
+            }
+            if audio_out_count > 1 {
+                return Err("VST3 multiple output buses not supported".to_string());
+            }
+            if audio_in_count > 1 {
+                return Err("VST3 multiple input buses not supported".to_string());
+            }
             let mut output_channels = if channels <= 1 { 1 } else { 2 };
             let mut input_channels = if input_channels == 0 {
                 0
@@ -1184,16 +1197,11 @@ impl Vst3Host {
                     )
                 };
             }
-            let _ = bus_result;
             if bus_result != kResultOk {
-                input_channels = 0;
+                eprintln!("VST3 setBusArrangements failed: {bus_result}");
+            } else {
+                eprintln!("VST3 bus arrangement result: {bus_result}");
             }
-            eprintln!("VST3 bus arrangement result: {bus_result}");
-
-            let audio_out_count = component.getBusCount(
-                MediaTypes_::kAudio as i32,
-                BusDirections_::kOutput as i32,
-            );
             if audio_out_count > 0 {
                 let _ = component.activateBus(
                     MediaTypes_::kAudio as i32,
@@ -1230,8 +1238,11 @@ impl Vst3Host {
                 0,
                 &mut bus_info as *mut _,
             );
-            if bus_info_result == kResultOk && bus_info.channelCount > 0 {
-                output_channels = bus_info.channelCount as usize;
+            if bus_info_result == kResultOk {
+                let count = bus_info.channelCount as usize;
+                if count == 1 || count == 2 {
+                    output_channels = count;
+                }
             }
             let in_bus_info_result = component.getBusInfo(
                 MediaTypes_::kAudio as i32,
@@ -1239,8 +1250,11 @@ impl Vst3Host {
                 0,
                 &mut bus_info as *mut _,
             );
-            if in_bus_info_result == kResultOk && bus_info.channelCount > 0 {
-                input_channels = bus_info.channelCount as usize;
+            if in_bus_info_result == kResultOk {
+                let count = bus_info.channelCount as usize;
+                if count == 1 || count == 2 {
+                    input_channels = count;
+                }
             } else if audio_in_count == 0 {
                 input_channels = 0;
             }
@@ -1410,6 +1424,17 @@ impl Vst3Host {
         Ok(())
     }
 
+    pub fn apply_state_for_render(
+        &mut self,
+        component_state: Option<&[u8]>,
+        controller_state: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let _ = unsafe { self.processor.setProcessing(0) };
+        let result = self.set_state_bytes(component_state, controller_state);
+        let _ = unsafe { self.processor.setProcessing(1) };
+        result
+    }
+
     pub fn process_f32(
         &mut self,
         output: &mut [f32],
@@ -1476,7 +1501,7 @@ impl Vst3Host {
                 _param_changes = Some(wrapper);
             }
         }
-        let mut process_data = ProcessData {
+            let mut process_data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
@@ -1488,7 +1513,7 @@ impl Vst3Host {
             outputParameterChanges: std::ptr::null_mut(),
             inputEvents: self.event_list_ptr.as_ptr(),
             outputEvents: std::ptr::null_mut(),
-            processContext: &mut self.process_context as *mut _,
+            processContext: std::ptr::null_mut(),
         };
 
         let result = unsafe { self.processor.process(&mut process_data as *mut _) };
@@ -1628,7 +1653,7 @@ impl Vst3Host {
             outputParameterChanges: std::ptr::null_mut(),
             inputEvents: self.event_list_ptr.as_ptr(),
             outputEvents: std::ptr::null_mut(),
-            processContext: &mut self.process_context as *mut _,
+            processContext: std::ptr::null_mut(),
         };
 
         let result = unsafe { self.processor.process(&mut process_data as *mut _) };

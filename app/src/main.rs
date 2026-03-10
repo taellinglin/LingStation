@@ -23,10 +23,13 @@ use std::os::windows::io::AsRawHandle;
 
 mod vst3;
 
+const BASE_UI_FONT_SIZE: f32 = 9.0;
+
 fn main() -> eframe::Result<()> {
     install_crash_logger();
     init_windows_com();
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0]);
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -69,7 +72,7 @@ fn configure_fonts(ctx: &egui::Context) {
     }
     let mut style = (*ctx.style()).clone();
     for font_id in style.text_styles.values_mut() {
-        font_id.size *= 1.0;
+        font_id.size = BASE_UI_FONT_SIZE;
     }
     ctx.set_style(style);
     ctx.set_pixels_per_point(1.5);
@@ -258,6 +261,12 @@ struct SettingsState {
     smart_disable_plugins: bool,
     #[serde(default)]
     smart_suspend_tracks: bool,
+    #[serde(default)]
+    recent_projects: Vec<String>,
+    #[serde(default)]
+    autosave_minutes: u32,
+    #[serde(default)]
+    load_last_project: bool,
 }
 
 impl Default for SettingsState {
@@ -275,6 +284,9 @@ impl Default for SettingsState {
             adaptive_buffer: true,
             smart_disable_plugins: true,
             smart_suspend_tracks: true,
+            recent_projects: Vec::new(),
+            autosave_minutes: 5,
+            load_last_project: false,
         }
     }
 }
@@ -291,11 +303,13 @@ enum PluginUiTarget {
     Effect(usize, usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ProjectAction {
     NewProject,
     OpenProject,
+    OpenProjectPath(String),
     ImportMidi,
+    NewFromTemplate(String),
 }
 
 #[derive(Clone)]
@@ -565,6 +579,7 @@ struct DawApp {
     show_plugin_ui: bool,
     plugin_ui_target: Option<PluginUiTarget>,
     project_dirty: bool,
+    last_autosave_at: Option<std::time::Instant>,
     show_close_confirm: bool,
     pending_project_action: Option<ProjectAction>,
     pending_exit: bool,
@@ -627,6 +642,10 @@ struct DawApp {
     plugin_ui_hidden: bool,
     plugin_ui_resume_at: Option<std::time::Instant>,
     last_params_track: Option<usize>,
+    last_viewport_maximized: Option<bool>,
+    last_viewport_rect: Option<egui::Rect>,
+    pending_startup_maximize: bool,
+    seen_nonzero_viewport: bool,
     fs_expanded: HashSet<String>,
     fs_selected: Option<String>,
     loop_start_beats: Option<f32>,
@@ -692,6 +711,7 @@ struct ClipDragState {
     audio_source_beats: Option<f32>,
     kind: ClipDragKind,
     undo_pushed: bool,
+    grabbed: bool,
 }
 
 struct MidiImportState {
@@ -757,35 +777,74 @@ struct PianoDragState {
     note_index: usize,
     kind: PianoDragKind,
     offset_beats: f32,
+    start_beats: f32,
+    start_length: f32,
+    start_pitch: u8,
+    start_pos_y: f32,
+    selected_notes: Vec<(usize, f32, u8, f32)>,
 }
 
 impl Default for DawApp {
     fn default() -> Self {
         let clips = vec![
-            Clip { id: 1, track: 0, start_beats: 0.0, length_beats: 4.0, is_midi: true, name: "Intro".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 2, track: 0, start_beats: 5.0, length_beats: 2.0, is_midi: true, name: "Verse".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 3, track: 1, start_beats: 1.0, length_beats: 6.0, is_midi: false, name: "Vox".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 1, track: 0, start_beats: 0.0, length_beats: 64.0, is_midi: true, name: "FishSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
         ];
 
         let tracks = vec![
             Track {
-                name: "Piano".to_string(),
+                name: "FishSynth".to_string(),
                 clips: clips.iter().cloned().filter(|c| c.track == 0).collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
-                midi_notes: vec![
-                    PianoRollNote::new(0.0, 1.0, 60, 100),
-                    PianoRollNote::new(1.0, 0.5, 64, 100),
-                    PianoRollNote::new(2.0, 1.5, 67, 100),
-                ],
-                instrument_path: None,
+                midi_notes: [
+                    (0.0, 2.0, 62),
+                    (2.0, 2.0, 65),
+                    (4.0, 2.0, 69),
+                    (6.0, 2.0, 72),
+                    (8.0, 2.0, 74),
+                    (10.0, 2.0, 72),
+                    (12.0, 2.0, 69),
+                    (14.0, 2.0, 65),
+                    (16.0, 2.0, 67),
+                    (18.0, 2.0, 70),
+                    (20.0, 2.0, 69),
+                    (22.0, 2.0, 65),
+                    (24.0, 2.0, 64),
+                    (26.0, 2.0, 65),
+                    (28.0, 4.0, 62),
+                    (32.0, 2.0, 62),
+                    (34.0, 2.0, 65),
+                    (36.0, 2.0, 69),
+                    (38.0, 2.0, 74),
+                    (40.0, 2.0, 72),
+                    (42.0, 2.0, 70),
+                    (44.0, 2.0, 69),
+                    (46.0, 2.0, 67),
+                    (48.0, 2.0, 65),
+                    (50.0, 2.0, 64),
+                    (52.0, 2.0, 62),
+                    (54.0, 2.0, 65),
+                    (56.0, 2.0, 69),
+                    (58.0, 2.0, 72),
+                    (60.0, 4.0, 62),
+                ]
+                .iter()
+                .copied()
+                .map(|(start, length, note)| PianoRollNote::new(start, length, note, 100))
+                .collect(),
+                instrument_path: Some("synths/FishSynth/FishSynth.vst3".to_string()),
                 effect_paths: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
                 effect_param_values: Vec::new(),
-                params: default_midi_params(),
+                params: default_instrument_params(),
                 param_ids: Vec::new(),
                 param_values: Vec::new(),
                 plugin_state_component: None,
@@ -796,19 +855,19 @@ impl Default for DawApp {
                 midi_program: None,
             },
             Track {
-                name: "Vox".to_string(),
+                name: "CatSynth".to_string(),
                 clips: clips.iter().cloned().filter(|c| c.track == 1).collect(),
                 level: 0.7,
                 muted: false,
                 solo: false,
                 midi_notes: Vec::new(),
-                instrument_path: None,
+                instrument_path: Some("synths/CatSynth/CatSynth.vst3".to_string()),
                 effect_paths: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
                 effect_param_values: Vec::new(),
-                params: default_midi_params(),
+                params: default_instrument_params(),
                 param_ids: Vec::new(),
                 param_values: Vec::new(),
                 plugin_state_component: None,
@@ -819,19 +878,88 @@ impl Default for DawApp {
                 midi_program: None,
             },
             Track {
-                name: "Drums".to_string(),
-                clips: Vec::new(),
-                level: 0.9,
+                name: "SannySynth".to_string(),
+                clips: clips.iter().cloned().filter(|c| c.track == 2).collect(),
+                level: 0.8,
                 muted: false,
                 solo: false,
                 midi_notes: Vec::new(),
-                instrument_path: None,
+                instrument_path: Some("synths/SannySynth/SannySynth.vst3".to_string()),
                 effect_paths: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
                 effect_param_values: Vec::new(),
-                params: default_midi_params(),
+                params: default_instrument_params(),
+                param_ids: Vec::new(),
+                param_values: Vec::new(),
+                plugin_state_component: None,
+                plugin_state_controller: None,
+                automation_lanes: Vec::new(),
+                automation_channels: Vec::new(),
+                midi_cc_lanes: Vec::new(),
+                midi_program: None,
+            },
+            Track {
+                name: "DogSynth".to_string(),
+                clips: clips.iter().cloned().filter(|c| c.track == 3).collect(),
+                level: 0.8,
+                muted: false,
+                solo: false,
+                midi_notes: Vec::new(),
+                instrument_path: Some("synths/DogSynth/DogSynth.vst3".to_string()),
+                effect_paths: Vec::new(),
+                effect_bypass: Vec::new(),
+                effect_params: Vec::new(),
+                effect_param_ids: Vec::new(),
+                effect_param_values: Vec::new(),
+                params: default_instrument_params(),
+                param_ids: Vec::new(),
+                param_values: Vec::new(),
+                plugin_state_component: None,
+                plugin_state_controller: None,
+                automation_lanes: Vec::new(),
+                automation_channels: Vec::new(),
+                midi_cc_lanes: Vec::new(),
+                midi_program: None,
+            },
+            Track {
+                name: "LingSynth".to_string(),
+                clips: clips.iter().cloned().filter(|c| c.track == 4).collect(),
+                level: 0.8,
+                muted: false,
+                solo: false,
+                midi_notes: Vec::new(),
+                instrument_path: Some("synths/LingSynth/LingSynth.vst3".to_string()),
+                effect_paths: Vec::new(),
+                effect_bypass: Vec::new(),
+                effect_params: Vec::new(),
+                effect_param_ids: Vec::new(),
+                effect_param_values: Vec::new(),
+                params: default_instrument_params(),
+                param_ids: Vec::new(),
+                param_values: Vec::new(),
+                plugin_state_component: None,
+                plugin_state_controller: None,
+                automation_lanes: Vec::new(),
+                automation_channels: Vec::new(),
+                midi_cc_lanes: Vec::new(),
+                midi_program: None,
+            },
+            Track {
+                name: "MiceSynth".to_string(),
+                clips: clips.iter().cloned().filter(|c| c.track == 5).collect(),
+                level: 0.8,
+                muted: false,
+                solo: false,
+                midi_notes: Vec::new(),
+                instrument_path: Some("synths/MiceSynth/MiceSynth.vst3".to_string()),
+                effect_paths: Vec::new(),
+                effect_bypass: Vec::new(),
+                effect_params: Vec::new(),
+                effect_param_ids: Vec::new(),
+                effect_param_values: Vec::new(),
+                params: default_instrument_params(),
                 param_ids: Vec::new(),
                 param_values: Vec::new(),
                 plugin_state_component: None,
@@ -926,6 +1054,7 @@ impl Default for DawApp {
             show_plugin_ui: false,
             plugin_ui_target: None,
             project_dirty: false,
+            last_autosave_at: None,
             show_close_confirm: false,
             pending_project_action: None,
             pending_exit: false,
@@ -1008,6 +1137,10 @@ impl Default for DawApp {
             plugin_ui_hidden: false,
             plugin_ui_resume_at: None,
             last_params_track: None,
+            last_viewport_maximized: None,
+            last_viewport_rect: None,
+            pending_startup_maximize: true,
+            seen_nonzero_viewport: false,
             fs_expanded: HashSet::new(),
             fs_selected: None,
             loop_start_beats: None,
@@ -1036,6 +1169,30 @@ impl eframe::App for DawApp {
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+        let viewport = ctx.input(|i| i.viewport().clone());
+        let viewport_has_size = viewport
+            .outer_rect
+            .map(|rect| rect.width() > 0.0 && rect.height() > 0.0)
+            .unwrap_or(false);
+        if viewport_has_size {
+            self.seen_nonzero_viewport = true;
+        }
+        if self.pending_startup_maximize
+            && self.seen_nonzero_viewport
+            && viewport.maximized != Some(true)
+        {
+            self.pending_startup_maximize = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            ctx.request_repaint();
+        }
+        if self.last_viewport_maximized != viewport.maximized {
+            self.last_viewport_maximized = viewport.maximized;
+            ctx.request_repaint();
+        }
+        if self.last_viewport_rect != viewport.outer_rect {
+            self.last_viewport_rect = viewport.outer_rect;
+            ctx.request_repaint();
         }
         self.apply_theme(ctx);
         if self
@@ -1073,6 +1230,7 @@ impl eframe::App for DawApp {
         self.sync_selected_track_index();
         self.handle_shortcuts(ctx);
         self.update_playhead(ctx);
+        self.update_autosave();
         self.menu_bar(ctx);
         self.view_tabs(ctx);
         self.piano_roll_hovered = if matches!(self.main_tab, MainTab::Parameters | MainTab::PianoRoll) {
@@ -1425,10 +1583,35 @@ impl DawApp {
 
     fn mark_dirty(&mut self) {
         self.project_dirty = true;
+        if self.last_autosave_at.is_none() {
+            self.last_autosave_at = Some(std::time::Instant::now());
+        }
     }
 
     fn clear_dirty(&mut self) {
         self.project_dirty = false;
+        self.last_autosave_at = None;
+    }
+
+    fn update_autosave(&mut self) {
+        let minutes = self.settings.autosave_minutes;
+        if minutes == 0 || !self.project_dirty {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(minutes.saturating_mul(60) as u64);
+        let now = std::time::Instant::now();
+        let last = self.last_autosave_at.unwrap_or(now);
+        if now.duration_since(last) >= interval {
+            let result = self.save_project();
+            if let Err(err) = result {
+                self.status = format!("Autosave failed: {err}");
+            } else {
+                self.status = format!("Autosaved {}", self.project_path);
+            }
+            self.last_autosave_at = Some(now);
+        } else if self.last_autosave_at.is_none() {
+            self.last_autosave_at = Some(now);
+        }
     }
 
     fn request_project_action(&mut self, action: ProjectAction) {
@@ -1450,9 +1633,19 @@ impl DawApp {
                     self.status = format!("Open failed: {err}");
                 }
             }
+            ProjectAction::OpenProjectPath(path) => {
+                if let Err(err) = self.open_project_from_path(&path) {
+                    self.status = format!("Open failed: {err}");
+                }
+            }
             ProjectAction::ImportMidi => {
                 if let Err(err) = self.import_midi_dialog() {
                     self.status = format!("Import failed: {err}");
+                }
+            }
+            ProjectAction::NewFromTemplate(path) => {
+                if let Err(err) = self.load_template_from_path(&path) {
+                    self.status = format!("Template failed: {err}");
                 }
             }
         }
@@ -1550,6 +1743,211 @@ impl DawApp {
             }
         }
         state.effect_hosts.get(effect_index).cloned()
+    }
+
+    fn draw_effect_params_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        track_index: usize,
+        track_color: Option<egui::Color32>,
+        pending_automation_record: &mut Vec<(usize, RecordedAutomationPoint)>,
+    ) {
+        let (effect_paths, needs_params) = if let Some(track) = self.tracks.get(track_index) {
+            let paths = track.effect_paths.clone();
+            let needs = paths
+                .iter()
+                .enumerate()
+                .map(|(fx_index, _)| {
+                    track
+                        .effect_params
+                        .get(fx_index)
+                        .map(|p| p.is_empty())
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            (paths, needs)
+        } else {
+            return;
+        };
+        let mut fx_updates: Vec<(usize, Vec<String>, Vec<u32>, Vec<f32>)> = Vec::new();
+        for (fx_index, _) in effect_paths.iter().enumerate() {
+            if !needs_params.get(fx_index).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(host) = self.ensure_effect_host(track_index, fx_index, 2) {
+                if let Ok(host) = host.lock() {
+                    let params = host.enumerate_params();
+                    if !params.is_empty() {
+                        let names = params.iter().map(|p| p.name.clone()).collect();
+                        let ids = params.iter().map(|p| p.id).collect();
+                        let values = params.iter().map(|p| p.default_value as f32).collect();
+                        fx_updates.push((fx_index, names, ids, values));
+                    }
+                }
+            }
+        }
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            for (fx_index, names, ids, values) in fx_updates {
+                if track.effect_params.len() <= fx_index {
+                    track.effect_params.resize(fx_index + 1, Vec::new());
+                    track.effect_param_ids.resize(fx_index + 1, Vec::new());
+                    track.effect_param_values.resize(fx_index + 1, Vec::new());
+                }
+                track.effect_params[fx_index] = names;
+                track.effect_param_ids[fx_index] = ids;
+                if track.effect_param_values[fx_index].is_empty() {
+                    track.effect_param_values[fx_index] = values;
+                }
+            }
+            if track.effect_paths.is_empty() {
+                return;
+            }
+            ui.separator();
+            ui.label("Effects Params");
+            let menu_color = track_color.unwrap_or(egui::Color32::from_rgb(120, 160, 220));
+            for (fx_index, fx_path) in track.effect_paths.iter().enumerate() {
+                let title = format!(
+                    "FX {}: {}",
+                    fx_index + 1,
+                    Self::plugin_display_name(fx_path)
+                );
+                ui.collapsing(title, |ui| {
+                    if ui
+                        .add(egui::Button::image(
+                            egui::Image::new(egui::include_image!("../../icons/eye.svg"))
+                                .fit_to_exact_size(egui::vec2(12.0, 12.0)),
+                        ))
+                        .on_hover_text("Open UI")
+                        .clicked()
+                    {
+                        self.plugin_ui_target = Some(PluginUiTarget::Effect(track_index, fx_index));
+                        self.show_plugin_ui = true;
+                    }
+                    let params = track
+                        .effect_params
+                        .get(fx_index)
+                        .cloned()
+                        .unwrap_or_default();
+                    if params.is_empty() {
+                        ui.label("(no parameters)");
+                        return;
+                    }
+                    if let Some(values) = track.effect_param_values.get_mut(fx_index) {
+                        if values.len() != params.len() {
+                            values.resize(params.len(), 0.0);
+                        }
+                    }
+                    let ids = track
+                        .effect_param_ids
+                        .get(fx_index)
+                        .cloned()
+                        .unwrap_or_default();
+                    for param_index in 0..params.len() {
+                        let label = params[param_index].clone();
+                        let value = track
+                            .effect_param_values
+                            .get_mut(fx_index)
+                            .and_then(|vals| vals.get_mut(param_index));
+                        let Some(value) = value else {
+                            continue;
+                        };
+                        let slider = ui.push_id(
+                            format!("fx{}_param_{}", fx_index, label),
+                            |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(&label);
+                                    Self::colored_slider(ui, value, 0.0..=1.0, track_color)
+                                })
+                                .inner
+                            },
+                        );
+                        let response = slider.response;
+                        let slider_response = slider.inner;
+                        let changed = slider_response.changed()
+                            || slider_response.dragged()
+                            || response.dragged();
+                        if changed {
+                            if let Some(param_id) = ids.get(param_index).copied() {
+                                if let Some(state) = self.track_audio.get(track_index) {
+                                    if state.effect_hosts.get(fx_index).is_some() {
+                                        if let Ok(mut pending) = state.pending_param_changes.lock() {
+                                            pending.push(PendingParamChange {
+                                                target: PendingParamTarget::Effect(fx_index),
+                                                param_id,
+                                                value: *value as f64,
+                                            });
+                                        }
+                                    }
+                                }
+                                if self.is_recording && self.record_automation {
+                                    pending_automation_record.push((
+                                        track_index,
+                                        RecordedAutomationPoint {
+                                            param_id,
+                                            target: AutomationTarget::Effect(fx_index),
+                                            beat: self.playhead_beats,
+                                            value: *value,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            if ui
+                                .add(egui::Button::image_and_text(
+                                    egui::Image::new(egui::include_image!(
+                                        "../../icons/target.svg"
+                                    ))
+                                    .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                                    .tint(menu_color),
+                                    egui::RichText::new("MIDI Learn").color(menu_color),
+                                ))
+                                .clicked()
+                            {
+                                if let Some(param_id) = ids.get(param_index).copied() {
+                                    if let Ok(mut learn) = self.midi_learn.lock() {
+                                        *learn = Some((track_index, param_id));
+                                    }
+                                    self.status = format!("MIDI Learn armed for {}", label);
+                                }
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add(egui::Button::image_and_text(
+                                    egui::Image::new(egui::include_image!(
+                                        "../../icons/activity.svg"
+                                    ))
+                                    .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                                    .tint(menu_color),
+                                    egui::RichText::new("Create Automation Lane")
+                                        .color(menu_color),
+                                ))
+                                .clicked()
+                            {
+                                if let Some(param_id) = ids.get(param_index).copied() {
+                                    if !track.automation_lanes.iter().any(|l| {
+                                        l.param_id == param_id
+                                            && l.target == AutomationTarget::Effect(fx_index)
+                                    }) {
+                                        track.automation_lanes.push(AutomationLane {
+                                            name: format!(
+                                                "{}: {}",
+                                                Self::plugin_display_name(fx_path),
+                                                label
+                                            ),
+                                            param_id,
+                                            target: AutomationTarget::Effect(fx_index),
+                                            points: Vec::new(),
+                                        });
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            }
+        }
     }
 
     fn plugin_ui_matches(&self, target: PluginUiTarget) -> bool {
@@ -2521,15 +2919,14 @@ impl DawApp {
             egui::menu::bar(ui, |ui| {
                 ui.scope(|ui| {
                     let mut style = ui.style().as_ref().clone();
-                    style
-                        .text_styles
-                        .insert(egui::TextStyle::Button, egui::FontId::proportional(9.0));
+                    style.text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(BASE_UI_FONT_SIZE),
+                    );
                     ui.set_style(style);
 
                     let icon_size = egui::vec2(12.0, 12.0);
-                    let menu_text = |text: &str| {
-                        egui::RichText::new(text).size(9.0)
-                    };
+                    let menu_text = |text: &str| egui::RichText::new(text).size(BASE_UI_FONT_SIZE);
                     let file_color = egui::Color32::from_rgb(235, 64, 52);
                     let edit_color = egui::Color32::from_rgb(255, 140, 40);
                     let view_color = egui::Color32::from_rgb(245, 205, 70);
@@ -2548,6 +2945,21 @@ impl DawApp {
                         self.request_project_action(ProjectAction::NewProject);
                         ui.close_menu();
                         }
+                        ui.menu_button("New From Template", |ui| {
+                            let templates = self.list_templates();
+                            if templates.is_empty() {
+                                ui.label("No templates found");
+                            } else {
+                                for (name, path) in templates {
+                                    if ui.button(name).clicked() {
+                                        self.request_project_action(ProjectAction::NewFromTemplate(
+                                            path,
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+                        });
                         if ui
                             .add(egui::Button::image_and_text(
                                 egui::Image::new(egui::include_image!("../../icons/folder.svg"))
@@ -2560,6 +2972,28 @@ impl DawApp {
                         self.request_project_action(ProjectAction::OpenProject);
                         ui.close_menu();
                         }
+                        ui.menu_button("Open Recent", |ui| {
+                            if self.settings.recent_projects.is_empty() {
+                                ui.label("No recent projects");
+                            } else {
+                                for path in self.settings.recent_projects.clone() {
+                                    let display = Path::new(&path)
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or(path.as_str())
+                                        .to_string();
+                                    let exists = Path::new(&path).exists();
+                                    ui.add_enabled_ui(exists, |ui| {
+                                        if ui.button(display).on_hover_text(&path).clicked() {
+                                            self.request_project_action(
+                                                ProjectAction::OpenProjectPath(path),
+                                            );
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                            }
+                        });
                         if ui
                             .add(egui::Button::image_and_text(
                                 egui::Image::new(egui::include_image!("../../icons/edit-3.svg"))
@@ -2596,6 +3030,20 @@ impl DawApp {
                             .clicked()
                         {
                         if let Err(err) = self.save_project_dialog() {
+                            self.status = format!("Save failed: {err}");
+                        }
+                        ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/save.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(file_color),
+                                menu_text("Save New Version"),
+                            ))
+                            .clicked()
+                        {
+                        if let Err(err) = self.save_project_new_version() {
                             self.status = format!("Save failed: {err}");
                         }
                         ui.close_menu();
@@ -2965,12 +3413,36 @@ impl DawApp {
             if ui_host.close_requested.swap(false, Ordering::Relaxed) {
                 self.show_plugin_ui = false;
                 self.plugin_ui_hidden = true;
-                ui_host.editor.set_focus(false);
-                hide_plugin_window(ui_host.hwnd);
-                release_mouse_capture();
+                if is_window_alive(ui_host.hwnd) {
+                    ui_host.editor.set_focus(false);
+                    hide_plugin_window(ui_host.hwnd);
+                } else {
+                    self.destroy_plugin_ui();
+                }
                 ctx.request_repaint();
                 return;
             }
+        }
+        let should_close_hidden = self
+            .plugin_ui
+            .as_ref()
+            .map(|ui_host| !is_window_visible(ui_host.hwnd))
+            .unwrap_or(false)
+            && self.show_plugin_ui
+            && !self.plugin_ui_hidden;
+        if should_close_hidden {
+            self.show_plugin_ui = false;
+            if let Some(ui_host) = self.plugin_ui.as_ref() {
+                self.plugin_ui_hidden = true;
+                if is_window_alive(ui_host.hwnd) {
+                    ui_host.editor.set_focus(false);
+                    hide_plugin_window(ui_host.hwnd);
+                } else {
+                    self.destroy_plugin_ui();
+                }
+            }
+            ctx.request_repaint();
+            return;
         }
         if let Some(ui_host) = self.plugin_ui.as_ref() {
             if !is_window_visible(ui_host.hwnd) {
@@ -3005,6 +3477,13 @@ impl DawApp {
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
             if !is_window_alive(ui_host.hwnd) {
+                self.destroy_plugin_ui();
+                self.show_plugin_ui = false;
+                self.plugin_ui_hidden = false;
+                ctx.request_repaint();
+                return;
+            }
+            if ui_host.child_hwnd != ui_host.hwnd && !is_window_alive(ui_host.child_hwnd) {
                 self.destroy_plugin_ui();
                 self.show_plugin_ui = false;
                 self.plugin_ui_hidden = false;
@@ -3067,9 +3546,10 @@ impl DawApp {
                 hide_plugin_window(ui_host.hwnd);
                 release_mouse_capture();
             }
-            self.destroy_plugin_ui();
             open = false;
-            self.plugin_ui_hidden = false;
+            if self.plugin_ui.is_some() {
+                self.plugin_ui_hidden = true;
+            }
             ctx.request_repaint();
         }
         self.show_plugin_ui = open;
@@ -3348,7 +3828,7 @@ impl DawApp {
             .rect_filled(icon_rect, 2.0, icon_color.linear_multiply(0.9));
 
         let text_x = icon_rect.max.x + 6.0;
-        let font_id = egui::FontId::proportional(13.0);
+        let font_id = egui::FontId::proportional(BASE_UI_FONT_SIZE);
         let text_color = if selected {
             egui::Color32::from_rgb(220, 230, 244)
         } else {
@@ -3363,7 +3843,7 @@ impl DawApp {
             if let Some(ext) = label.rsplit('.').next() {
                 if ext.len() > 0 && ext.len() <= 6 {
                     let badge_text = ext.to_ascii_uppercase();
-                    let badge_font = egui::FontId::proportional(10.0);
+                    let badge_font = egui::FontId::proportional(BASE_UI_FONT_SIZE);
                     let badge_galley = ui.fonts(|f| {
                         f.layout_no_wrap(
                             badge_text.clone(),
@@ -3443,15 +3923,18 @@ impl DawApp {
             .resizable(true)
             .show(ctx, |ui| {
             let mut style = ui.style().as_ref().clone();
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(12.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(10.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(10.0));
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::proportional(BASE_UI_FONT_SIZE),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(BASE_UI_FONT_SIZE),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(BASE_UI_FONT_SIZE),
+            );
             ui.set_style(style);
 
             ui.heading("Mixer");
@@ -3732,7 +4215,7 @@ impl DawApp {
                                     egui::pos2(label_rect.left() + 6.0, label_rect.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     &label,
-                                    egui::FontId::proportional(12.0),
+                                    egui::FontId::proportional(BASE_UI_FONT_SIZE),
                                     egui::Color32::from_gray(240),
                                 );
                                 let swatch_rect = egui::Rect::from_min_max(
@@ -3793,7 +4276,7 @@ impl DawApp {
                                     mute_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "M",
-                                    egui::FontId::proportional(11.0),
+                                    egui::FontId::proportional(BASE_UI_FONT_SIZE),
                                     egui::Color32::from_gray(220),
                                 );
                                 Self::outlined_text(
@@ -3801,7 +4284,7 @@ impl DawApp {
                                     solo_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "S",
-                                    egui::FontId::proportional(11.0),
+                                    egui::FontId::proportional(BASE_UI_FONT_SIZE),
                                     egui::Color32::from_gray(220),
                                 );
                                 let mute_clicked = mute_resp.clicked();
@@ -4623,7 +5106,7 @@ impl DawApp {
                                 clip.name.as_str()
                             };
                             let header_text = ui.fonts(|f| {
-                                let font = egui::FontId::proportional(11.0);
+                                let font = egui::FontId::proportional(BASE_UI_FONT_SIZE);
                                 let max_width = (header_rect.width() - 10.0).max(4.0);
                                 let mut text = name.to_string();
                                 while text.len() > 1
@@ -4648,7 +5131,7 @@ impl DawApp {
                                 egui::pos2(header_rect.left() + 4.0, header_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 &header_text,
-                                egui::FontId::proportional(11.0),
+                                egui::FontId::proportional(BASE_UI_FONT_SIZE),
                                 egui::Color32::WHITE,
                             );
                             if clip.is_midi {
@@ -4763,6 +5246,7 @@ impl DawApp {
                                         audio_source_beats: clip.audio_source_beats,
                                         kind,
                                         undo_pushed: false,
+                                        grabbed: false,
                                     });
                                 }
                             };
@@ -4876,7 +5360,7 @@ impl DawApp {
                             egui::pos2(label_rect.left() + 18.0, label_rect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &format!("• {}", lane.name),
-                            egui::FontId::proportional(11.0),
+                            egui::FontId::proportional(BASE_UI_FONT_SIZE),
                             egui::Color32::from_rgb(140, 160, 200),
                         );
                     }
@@ -5048,7 +5532,7 @@ impl DawApp {
                         egui::pos2(bar_x + 4.0, header_rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
                         &format!("{bar}"),
-                        egui::FontId::proportional(10.0),
+                        egui::FontId::proportional(BASE_UI_FONT_SIZE),
                         egui::Color32::from_gray(160),
                     );
                 }
@@ -5097,7 +5581,7 @@ impl DawApp {
                         egui::pos2(overlay_x + 4.0, timeline_overlay_rect.top() + 2.0),
                         egui::Align2::LEFT_TOP,
                         &format!("{bar}"),
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(BASE_UI_FONT_SIZE),
                         egui::Color32::from_gray(200),
                     );
                 }
@@ -5226,7 +5710,7 @@ impl DawApp {
                     egui::pos2(name_rect.left(), name_rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &track.name,
-                    egui::FontId::proportional(12.0),
+                    egui::FontId::proportional(BASE_UI_FONT_SIZE),
                     name_color,
                 );
                 let meter_rect = egui::Rect::from_center_size(
@@ -5577,6 +6061,12 @@ impl DawApp {
                                     clip.audio_offset_beats = 0.0;
                                 }
                             }
+                            self.draw_effect_params_panel(
+                                ui,
+                                ti,
+                                track_color,
+                                &mut pending_automation_record,
+                            );
                         }
                     } else {
                         let track = selected_track_index.and_then(|i| self.tracks.get(i));
@@ -6505,141 +6995,6 @@ impl DawApp {
                                         }
                                     }
 
-                                    if !track.effect_paths.is_empty() {
-                                        ui.separator();
-                                        ui.label("Effects Params");
-                                        for (fx_index, fx_path) in track.effect_paths.iter().enumerate() {
-                                            let title = format!(
-                                                "FX {}: {}",
-                                                fx_index + 1,
-                                                Self::plugin_display_name(fx_path)
-                                            );
-                                            ui.collapsing(title, |ui| {
-                                                let params = track
-                                                    .effect_params
-                                                    .get(fx_index)
-                                                    .cloned()
-                                                    .unwrap_or_default();
-                                                if params.is_empty() {
-                                                    ui.label("(no parameters)");
-                                                    return;
-                                                }
-                                                if let Some(values) = track.effect_param_values.get_mut(fx_index) {
-                                                    if values.len() != params.len() {
-                                                        values.resize(params.len(), 0.0);
-                                                    }
-                                                }
-                                                let ids = track
-                                                    .effect_param_ids
-                                                    .get(fx_index)
-                                                    .cloned()
-                                                    .unwrap_or_default();
-                                                for param_index in 0..params.len() {
-                                                    let label = params[param_index].clone();
-                                                    let value = track
-                                                        .effect_param_values
-                                                        .get_mut(fx_index)
-                                                        .and_then(|vals| vals.get_mut(param_index));
-                                                    let Some(value) = value else {
-                                                        continue;
-                                                    };
-                                                    let slider = ui.push_id(
-                                                        format!("fx{}_param_{}", fx_index, label),
-                                                        |ui| {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(&label);
-                                                                Self::colored_slider(
-                                                                    ui,
-                                                                    value,
-                                                                    0.0..=1.0,
-                                                                    track_color,
-                                                                )
-                                                            })
-                                                            .inner
-                                                        },
-                                                    );
-                                                    let response = slider.response;
-                                                    let slider_response = slider.inner;
-                                                    let changed = slider_response.changed()
-                                                        || slider_response.dragged()
-                                                        || response.dragged();
-                                                    if changed {
-                                                        if let Some(param_id) = ids.get(param_index).copied() {
-                                                            if let Some(state) = selected_track_index
-                                                                .and_then(|i| self.track_audio.get(i))
-                                                            {
-                                                                if state.effect_hosts.get(fx_index).is_some() {
-                                                                    if let Ok(mut pending) =
-                                                                        state.pending_param_changes.lock()
-                                                                    {
-                                                                        pending.push(PendingParamChange {
-                                                                            target: PendingParamTarget::Effect(
-                                                                                fx_index,
-                                                                            ),
-                                                                            param_id,
-                                                                            value: *value as f64,
-                                                                        });
-                                                                    }
-                                                                }
-                                                            }
-                                                            if self.is_recording && self.record_automation {
-                                                                if let Some(track_index) = selected_track_index {
-                                                                    pending_automation_record.push((
-                                                                        track_index,
-                                                                        RecordedAutomationPoint {
-                                                                            param_id,
-                                                                            target: AutomationTarget::Effect(
-                                                                                fx_index,
-                                                                            ),
-                                                                            beat: self.playhead_beats,
-                                                                            value: *value,
-                                                                        },
-                                                                    ));
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    response.context_menu(|ui| {
-                                                        if ui
-                                                            .add(egui::Button::image_and_text(
-                                                                egui::Image::new(egui::include_image!(
-                                                                    "../../icons/activity.svg"
-                                                                ))
-                                                                .fit_to_exact_size(egui::vec2(12.0, 12.0))
-                                                                .tint(menu_color),
-                                                                egui::RichText::new("Create Automation Lane")
-                                                                    .color(menu_color),
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            if let Some(param_id) = ids.get(param_index).copied() {
-                                                                if !track.automation_lanes.iter().any(|l| {
-                                                                    l.param_id == param_id
-                                                                        && l.target
-                                                                            == AutomationTarget::Effect(fx_index)
-                                                                }) {
-                                                                    track.automation_lanes.push(AutomationLane {
-                                                                        name: format!(
-                                                                            "{}: {}",
-                                                                            Self::plugin_display_name(fx_path),
-                                                                            label
-                                                                        ),
-                                                                        param_id,
-                                                                        target: AutomationTarget::Effect(
-                                                                            fx_index,
-                                                                        ),
-                                                                        points: Vec::new(),
-                                                                    });
-                                                                }
-                                                            }
-                                                            ui.close_menu();
-                                                        }
-                                                    });
-                                                }
-                                            });
-                                        }
-                                    }
-
                                     if let Some((track_index, param_id, label)) = pending_midi_learn.take() {
                                         if let Ok(mut learn) = self.midi_learn.lock() {
                                             *learn = Some((track_index, param_id));
@@ -6687,6 +7042,14 @@ impl DawApp {
                                             });
                                         }
                                     }
+                                }
+                                if let Some(track_index) = selected_track_index {
+                                    self.draw_effect_params_panel(
+                                        ui,
+                                        track_index,
+                                        track_color,
+                                        &mut pending_automation_record,
+                                    );
                                 }
                                 for (track_index, point) in pending_automation_record {
                                     self.record_automation_point(
@@ -7004,10 +7367,13 @@ impl DawApp {
                             );
                         }
                     }
+                    let pointer_pos = roll_response
+                        .interact_pointer_pos()
+                        .or_else(|| roll_response.hover_pos());
                     let mut hovered_note: Option<(usize, egui::Rect)> = None;
                     if let Some(track_index) = self.selected_track {
                         if let Some(track) = self.tracks.get(track_index) {
-                            if self.selected_clip.is_some() && !track.midi_notes.is_empty() {
+                            if !track.midi_notes.is_empty() {
                                 for (index, note) in track.midi_notes.iter().enumerate() {
                                     let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
                                     let y = roll_rect.bottom() + self.piano_pan.y
@@ -7040,34 +7406,34 @@ impl DawApp {
                                             egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 240, 255)),
                                         );
                                     }
-                                    if roll_response.hovered() {
-                                        if let Some(pos) = roll_response.hover_pos() {
-                                            if pos.x >= roll_rect.left() && note_rect.contains(pos) {
-                                                hovered_note = Some((index, note_rect));
-                                            }
+                                    if let Some(pos) = pointer_pos {
+                                        if pos.x >= roll_rect.left() && note_rect.contains(pos) {
+                                            hovered_note = Some((index, note_rect));
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    if roll_response.hovered() {
-                        if let Some((_, note_rect)) = hovered_note {
-                            if let Some(pos) = roll_response.hover_pos() {
-                                if pos.x >= roll_rect.left() {
-                                    let right_edge = note_rect.right();
-                                    let icon = if (right_edge - pos.x).abs() <= 6.0 {
-                                        egui::CursorIcon::ResizeHorizontal
-                                    } else {
-                                        egui::CursorIcon::Grab
-                                    };
-                                    roll_response.clone().on_hover_cursor(icon);
-                                }
+                    if let Some((_, note_rect)) = hovered_note {
+                        if let Some(pos) = pointer_pos {
+                            if pos.x >= roll_rect.left() {
+                                let right_edge = note_rect.right();
+                                let icon = if (right_edge - pos.x).abs() <= 6.0 {
+                                    egui::CursorIcon::ResizeHorizontal
+                                } else {
+                                    egui::CursorIcon::Grab
+                                };
+                                roll_response.clone().on_hover_cursor(icon);
                             }
                         }
                     }
 
-                    if self.selected_clip.is_none() {
+                    if self.selected_clip.is_none()
+                        && self.selected_track.and_then(|i| self.tracks.get(i))
+                            .map(|t| t.midi_notes.is_empty())
+                            .unwrap_or(true)
+                    {
                         Self::outlined_text(
                             &painter,
                             roll_rect.center(),
@@ -7216,6 +7582,10 @@ impl DawApp {
                                 if pos.x < roll_rect.left() {
                                     return;
                                 }
+                                if !self.piano_selected.contains(&note_index) {
+                                    self.piano_selected.clear();
+                                    self.piano_selected.insert(note_index);
+                                }
                                 let right_edge = note_rect.right();
                                 let kind = if (right_edge - pos.x).abs() <= 6.0 {
                                     PianoDragKind::Resize
@@ -7223,12 +7593,47 @@ impl DawApp {
                                     PianoDragKind::Move
                                 };
                                 let offset_beats = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
-                                self.piano_drag = Some(PianoDragState {
-                                    track_index: self.selected_track.unwrap_or(0),
-                                    note_index,
-                                    kind,
-                                    offset_beats,
-                                });
+                                if let Some(track_index) = self.selected_track {
+                                    if let Some(track) = self.tracks.get(track_index) {
+                                        let (start_beats, start_length, start_pitch) = track
+                                            .midi_notes
+                                            .get(note_index)
+                                            .map(|note| (note.start_beats, note.length_beats, note.midi_note))
+                                            .unwrap_or((0.0, self.piano_note_len.max(0.03125), 60));
+                                        let mut selected_notes = Vec::new();
+                                        for index in self.piano_selected.iter().copied() {
+                                            if let Some(note) = track.midi_notes.get(index) {
+                                                selected_notes.push((
+                                                    index,
+                                                    note.start_beats,
+                                                    note.midi_note,
+                                                    note.length_beats,
+                                                ));
+                                            }
+                                        }
+                                        if selected_notes.is_empty() {
+                                            if let Some(note) = track.midi_notes.get(note_index) {
+                                                selected_notes.push((
+                                                    note_index,
+                                                    note.start_beats,
+                                                    note.midi_note,
+                                                    note.length_beats,
+                                                ));
+                                            }
+                                        }
+                                        self.piano_drag = Some(PianoDragState {
+                                            track_index,
+                                            note_index,
+                                            kind,
+                                            offset_beats,
+                                            start_beats,
+                                            start_length,
+                                            start_pitch,
+                                            start_pos_y: pos.y,
+                                            selected_notes,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -7240,24 +7645,55 @@ impl DawApp {
                                     return;
                                 }
                                 if let Some(track) = self.tracks.get_mut(drag.track_index) {
-                                    if let Some(note) = track.midi_notes.get_mut(drag.note_index) {
-                                        let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
-                                        match drag.kind {
-                                            PianoDragKind::Move => {
-                                                let snapped = if alt {
-                                                    beat - drag.offset_beats
-                                                } else {
-                                                    ((beat - drag.offset_beats) / quantize).round() * quantize
-                                                };
-                                                note.start_beats = snapped.max(0.0);
+                                    let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
+                                    match drag.kind {
+                                        PianoDragKind::Move => {
+                                            let raw_delta = beat - drag.offset_beats;
+                                            let delta = if alt {
+                                                raw_delta
+                                            } else {
+                                                let snapped = ((drag.start_beats + raw_delta) / quantize)
+                                                    .round()
+                                                    * quantize;
+                                                snapped - drag.start_beats
+                                            };
+                                            let delta_pitch = if shift {
+                                                0
+                                            } else {
+                                                let rows = ((drag.start_pos_y - pos.y) / note_height).round() as i32;
+                                                rows
+                                            };
+                                            if !drag.selected_notes.is_empty() {
+                                                for (index, start, pitch, _) in &drag.selected_notes {
+                                                    if let Some(note) = track.midi_notes.get_mut(*index) {
+                                                        note.start_beats = (start + delta).max(0.0);
+                                                        let next_pitch = (*pitch as i32 + delta_pitch)
+                                                            .clamp(0, 127) as u8;
+                                                        note.midi_note = next_pitch;
+                                                    }
+                                                }
+                                            } else if let Some(note) = track.midi_notes.get_mut(drag.note_index) {
+                                                note.start_beats = (drag.start_beats + delta).max(0.0);
+                                                let next_pitch = (drag.start_pitch as i32 + delta_pitch)
+                                                    .clamp(0, 127) as u8;
+                                                note.midi_note = next_pitch;
                                             }
-                                            PianoDragKind::Resize => {
-                                                let length = beat - note.start_beats;
-                                                let snapped = if alt {
-                                                    length
-                                                } else {
-                                                    (length / quantize).round() * quantize
-                                                };
+                                        }
+                                        PianoDragKind::Resize => {
+                                            let length = beat - drag.start_beats;
+                                            let snapped = if alt {
+                                                length
+                                            } else {
+                                                (length / quantize).round() * quantize
+                                            };
+                                            let delta_len = snapped - drag.start_length;
+                                            if !drag.selected_notes.is_empty() {
+                                                for (index, _, _, start_len) in &drag.selected_notes {
+                                                    if let Some(note) = track.midi_notes.get_mut(*index) {
+                                                        note.length_beats = (start_len + delta_len).max(quantize);
+                                                    }
+                                                }
+                                            } else if let Some(note) = track.midi_notes.get_mut(drag.note_index) {
                                                 note.length_beats = snapped.max(quantize);
                                             }
                                         }
@@ -7760,6 +8196,18 @@ impl DawApp {
                                         }
                                     });
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("Autosave (minutes)");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.settings.autosave_minutes)
+                                        .clamp_range(0..=120),
+                                );
+                            });
+                            ui.label("Set to 0 to disable autosave.");
+                            ui.checkbox(
+                                &mut self.settings.load_last_project,
+                                "Load last project at startup",
+                            );
                             ui.checkbox(&mut self.settings.triple_buffer, "Triple buffer");
                             ui.checkbox(&mut self.settings.safe_underruns, "Safe underruns");
                             ui.checkbox(&mut self.settings.adaptive_buffer, "Adaptive buffer");
@@ -8484,6 +8932,7 @@ impl DawApp {
                 self.project_name = name;
             }
         }
+        self.register_recent_project_path(&folder);
         self.clear_dirty();
         self.status = format!("Saved {}", self.project_path);
         Ok(())
@@ -8517,6 +8966,7 @@ impl DawApp {
                 self.project_name = name;
             }
         }
+        self.register_recent_project_path(folder);
         self.clear_dirty();
         self.status = format!("Loaded {}", self.project_path);
         Ok(())
@@ -8536,6 +8986,161 @@ impl DawApp {
             return self.save_project_to_folder(&folder);
         }
         Ok(())
+    }
+
+    fn save_project_new_version(&mut self) -> Result<(), String> {
+        let current = self.project_path.trim();
+        if current.is_empty() {
+            return Err("No project path to version".to_string());
+        }
+        let current_path = Path::new(current);
+        let parent = current_path
+            .parent()
+            .ok_or_else(|| "Project folder has no parent".to_string())?;
+        let name = current_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| "Project folder name unavailable".to_string())?;
+        let (base, version) = Self::split_version_suffix(name);
+        let base = base.trim_end();
+        if base.is_empty() {
+            return Err("Project name unavailable".to_string());
+        }
+        let mut next = version.unwrap_or(1).saturating_add(1);
+        loop {
+            let candidate_name = format!("{} v{}", base, next);
+            let candidate = parent.join(&candidate_name);
+            if !candidate.exists() {
+                self.save_project_to_folder(&candidate)?;
+                self.status = format!("Saved new version {}", self.project_path);
+                return Ok(());
+            }
+            next = next.saturating_add(1);
+            if next > 9999 {
+                return Err("No available version number".to_string());
+            }
+        }
+    }
+
+    fn open_project_from_path(&mut self, path: &str) -> Result<(), String> {
+        let folder = Path::new(path);
+        if !folder.exists() {
+            self.settings.recent_projects.retain(|p| !p.eq_ignore_ascii_case(path));
+            let _ = self.save_settings();
+            return Err("Project folder not found".to_string());
+        }
+        self.load_project_from_folder(folder)
+    }
+
+    fn load_template_from_path(&mut self, path: &str) -> Result<(), String> {
+        let path = Path::new(path);
+        let folder = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .ok_or_else(|| "Template folder unavailable".to_string())?
+                .to_path_buf()
+        };
+        let manifest_path = folder.join("project.json");
+        if !manifest_path.exists() {
+            return Err("Template project.json missing".to_string());
+        }
+        self.prepare_for_project_change();
+        let data = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+        let state: ProjectState = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        self.project_name = state.name;
+        self.metadata_artist = state.artist;
+        self.metadata_title = state.title;
+        self.metadata_album = state.album;
+        self.metadata_genre = state.genre;
+        self.metadata_year = state.year;
+        self.metadata_comment = state.comment;
+        self.tempo_bpm = state.tempo_bpm;
+        self.tracks = state.tracks;
+        self.selected_clip = None;
+        self.project_path.clear();
+        self.load_midi_from_folder(&folder)?;
+        self.sync_track_audio_states();
+        if self.project_name.trim().is_empty() {
+            if let Some(name) = folder.file_name().and_then(|s| s.to_str()) {
+                self.project_name = name.replace('_', " ");
+            }
+        }
+        self.clear_dirty();
+        self.status = "Template loaded".to_string();
+        Ok(())
+    }
+
+    fn list_templates(&self) -> Vec<(String, String)> {
+        let Some(root) = self.templates_dir() else {
+            return Vec::new();
+        };
+        let mut templates = Vec::new();
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if !path.join("project.json").exists() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Template")
+                    .replace('_', " ");
+                let normalized = Self::normalize_windows_path(&path);
+                templates.push((name, normalized.to_string_lossy().to_string()));
+            }
+        }
+        templates.sort_by(|a, b| a.0.cmp(&b.0));
+        templates
+    }
+
+    fn templates_dir(&self) -> Option<PathBuf> {
+        if let Ok(dir) = std::env::current_dir() {
+            let candidate = dir.join("templates");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let candidate = parent.join("templates");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    fn register_recent_project_path(&mut self, folder: &Path) {
+        let normalized = Self::normalize_windows_path(folder);
+        let path = normalized.to_string_lossy().to_string();
+        if path.trim().is_empty() {
+            return;
+        }
+        self.settings
+            .recent_projects
+            .retain(|p| !p.eq_ignore_ascii_case(&path));
+        self.settings.recent_projects.insert(0, path);
+        if self.settings.recent_projects.len() > 10 {
+            self.settings.recent_projects.truncate(10);
+        }
+        let _ = self.save_settings();
+    }
+
+    fn split_version_suffix(name: &str) -> (String, Option<u32>) {
+        if let Some((base, suffix)) = name.rsplit_once(" v") {
+            if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                if let Ok(num) = suffix.parse::<u32>() {
+                    return (base.to_string(), Some(num));
+                }
+            }
+        }
+        (name.to_string(), None)
     }
 
     fn begin_rename_project(&mut self) {
@@ -11301,11 +11906,12 @@ fn render_plan_to_wav(
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
         if has_state {
-            let _ = host.set_state_bytes(
+            let _ = host.apply_state_for_render(
                 track.plugin_state_component.as_deref(),
                 track.plugin_state_controller.as_deref(),
             );
-        } else if !track.param_ids.is_empty() {
+        }
+        if !track.param_ids.is_empty() {
             for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
                 host.push_param_change(*param_id, *value as f64);
             }
@@ -12115,8 +12721,9 @@ fn mix_track_hosts(
     let mut per_track_buffers: Vec<Vec<f32>> = vec![vec![0.0; output.len()]; track_count];
     let processed_any = Arc::new(AtomicBool::new(false));
 
+    // Process tracks on the calling thread to avoid VST3 thread-affinity issues.
     per_track_buffers
-        .par_iter_mut()
+        .iter_mut()
         .enumerate()
         .for_each(|(index, temp)| {
             let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
