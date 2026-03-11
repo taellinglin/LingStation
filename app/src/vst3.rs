@@ -1328,6 +1328,12 @@ impl Vst3Host {
         }
     }
 
+    pub fn get_param_normalized(&self, param_id: u32) -> Option<f64> {
+        self.controller
+            .as_ref()
+            .map(|controller| unsafe { controller.getParamNormalized(param_id) })
+    }
+
     pub fn take_last_param_change(&mut self) -> Option<(ParamID, ParamValue)> {
         if let Ok(mut last) = self.last_param_change.lock() {
             last.take()
@@ -1488,11 +1494,6 @@ impl Vst3Host {
                 let changes = std::mem::take(&mut *pending);
                 self.last_process_param_count
                     .store(changes.len(), Ordering::Relaxed);
-                if let Some(controller) = self.controller.as_ref() {
-                    for (param_id, value) in &changes {
-                        let _ = unsafe { controller.setParamNormalized(*param_id, *value) };
-                    }
-                }
                 let wrapper = ComWrapper::new(ParameterChanges::from_changes(changes));
                 param_changes_ptr = wrapper
                     .to_com_ptr::<IParameterChanges>()
@@ -1628,11 +1629,6 @@ impl Vst3Host {
                 let changes = std::mem::take(&mut *pending);
                 self.last_process_param_count
                     .store(changes.len(), Ordering::Relaxed);
-                if let Some(controller) = self.controller.as_ref() {
-                    for (param_id, value) in &changes {
-                        let _ = unsafe { controller.setParamNormalized(*param_id, *value) };
-                    }
-                }
                 let wrapper = ComWrapper::new(ParameterChanges::from_changes(changes));
                 param_changes_ptr = wrapper
                     .to_com_ptr::<IParameterChanges>()

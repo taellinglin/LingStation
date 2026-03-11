@@ -24,6 +24,7 @@ clack-extensions = { git = "https://github.com/prokopyl/clack", package = "clack
 clap-sys = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 raw-window-handle = "0.6"
 hound = "3.5"
 ogg = "0.8"
