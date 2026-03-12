@@ -11101,6 +11101,7 @@ impl DawApp {
     }
 
     fn save_project_to_folder(&mut self, folder: &Path) -> Result<(), String> {
+        let previous_folder = self.project_path.trim().to_string();
         self.capture_plugin_states();
         let state = ProjectState {
             name: self.project_name.clone(),
@@ -11124,6 +11125,10 @@ impl DawApp {
         fs::create_dir_all(&samples_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&audio_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&renders_dir).map_err(|e| e.to_string())?;
+        if !previous_folder.is_empty() {
+            let previous = PathBuf::from(previous_folder);
+            self.copy_project_assets_if_needed(&previous, &folder)?;
+        }
 
         let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
         let manifest_path = folder.join("project.json");
@@ -11179,6 +11184,62 @@ impl DawApp {
         self.clear_dirty();
         self.status = format!("Saved {}", self.project_path);
         Ok(())
+    }
+
+    fn copy_project_assets_if_needed(
+        &self,
+        source_folder: &Path,
+        target_folder: &Path,
+    ) -> Result<(), String> {
+        if !source_folder.exists() {
+            return Ok(());
+        }
+        if Self::paths_equal(source_folder, target_folder) {
+            return Ok(());
+        }
+        for name in ["audio", "samples"] {
+            let source = source_folder.join(name);
+            if !source.exists() {
+                continue;
+            }
+            let target = target_folder.join(name);
+            fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            Self::copy_dir_recursive(&source, &target)?;
+        }
+        Ok(())
+    }
+
+    fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+        let entries = fs::read_dir(source).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let dest = target.join(name);
+            if path.is_dir() {
+                fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+                Self::copy_dir_recursive(&path, &dest)?;
+            } else if !dest.exists() {
+                let _ = fs::copy(&path, &dest);
+            }
+        }
+        Ok(())
+    }
+
+    fn paths_equal(a: &Path, b: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            let left = Self::normalize_windows_path(a)
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let right = Self::normalize_windows_path(b)
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            return left == right;
+        }
+        #[cfg(not(windows))]
+        {
+            return a == b;
+        }
     }
 
     fn load_project(&mut self) -> Result<(), String> {
