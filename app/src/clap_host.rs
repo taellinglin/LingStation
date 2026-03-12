@@ -8,7 +8,11 @@ use clack_extensions::params::{HostParams, HostParamsImplMainThread, HostParamsI
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::prelude::*;
 use clack_host::process::audio_buffers::{AudioPortBuffer, AudioPortBufferType, AudioPorts, InputAudioBuffers};
-use std::ffi::CString;
+use clap_sys::entry::clap_plugin_entry;
+use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
+use clap_sys::plugin::clap_plugin_descriptor;
+use libloading::Library;
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -19,6 +23,12 @@ pub struct ParamInfo {
     pub id: u32,
     pub name: String,
     pub default_value: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClapPluginDescriptor {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Default)]
@@ -184,7 +194,8 @@ impl ClapHost {
     ) -> Result<Self, String> {
         let host_info = HostInfo::new("LingStation", "LingStation", "", "0.1")
             .map_err(|e| e.to_string())?;
-        let entry = unsafe { PluginEntry::load(path) }.map_err(|e| e.to_string())?;
+        let module_path = resolve_clap_binary(path)?;
+        let entry = unsafe { PluginEntry::load(&module_path) }.map_err(|e| e.to_string())?;
         let plugin_id = CString::new(plugin_id).map_err(|e| e.to_string())?;
 
         let mut instance = PluginInstance::<ClapHostHandlers>::new(
@@ -425,6 +436,18 @@ impl ClapHost {
         self.gui_parent.is_some()
     }
 
+    pub fn take_gui_resize(&mut self) -> Option<(i32, i32)> {
+        let packed = self
+            .instance
+            .access_shared_handler(|h| h.gui_resize.swap(0, Ordering::SeqCst));
+        if packed == 0 {
+            return None;
+        }
+        let size = GuiSize::unpack_from_u64(packed);
+        self.gui_size = Some(size);
+        Some((size.width as i32, size.height as i32))
+    }
+
     pub fn take_gui_closed(&mut self) -> bool {
         self.instance.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst))
     }
@@ -611,4 +634,125 @@ impl ClapHost {
             }
         }
     }
+}
+
+pub fn default_plugin_id(path: &str) -> Result<String, String> {
+    let plugins = enumerate_plugins(path)?;
+    plugins
+        .into_iter()
+        .next()
+        .map(|p| p.id)
+        .ok_or_else(|| "No CLAP plugins found".to_string())
+}
+
+pub fn enumerate_plugins(path: &str) -> Result<Vec<ClapPluginDescriptor>, String> {
+    let module_path = resolve_clap_binary(path)?;
+    unsafe {
+        let lib = Library::new(&module_path).map_err(|e| e.to_string())?;
+        let entry_symbol: libloading::Symbol<*const clap_plugin_entry> =
+            lib.get(b"clap_entry\0").map_err(|e| e.to_string())?;
+        let entry_ptr = *entry_symbol;
+        if entry_ptr.is_null() {
+            return Err("CLAP entry is null".to_string());
+        }
+        let entry = &*entry_ptr;
+        let c_path = CString::new(module_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(init) = entry.init {
+            if !init(c_path.as_ptr()) {
+                return Err("CLAP init failed".to_string());
+            }
+        }
+        let get_factory = entry
+            .get_factory
+            .ok_or_else(|| "CLAP get_factory missing".to_string())?;
+        let factory_ptr = get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr());
+        if factory_ptr.is_null() {
+            return Err("CLAP factory not found".to_string());
+        }
+        let factory = factory_ptr as *const clap_plugin_factory;
+        let get_count = (*factory)
+            .get_plugin_count
+            .ok_or_else(|| "CLAP get_plugin_count missing".to_string())?;
+        let get_desc = (*factory)
+            .get_plugin_descriptor
+            .ok_or_else(|| "CLAP get_plugin_descriptor missing".to_string())?;
+        let count = get_count(factory);
+        let mut out = Vec::new();
+        for index in 0..count {
+            let desc_ptr = get_desc(factory, index);
+            if desc_ptr.is_null() {
+                continue;
+            }
+            let desc: &clap_plugin_descriptor = &*desc_ptr;
+            let id = if desc.id.is_null() {
+                "".to_string()
+            } else {
+                CStr::from_ptr(desc.id).to_string_lossy().to_string()
+            };
+            let name = if desc.name.is_null() {
+                "CLAP Plugin".to_string()
+            } else {
+                CStr::from_ptr(desc.name).to_string_lossy().to_string()
+            };
+            out.push(ClapPluginDescriptor { id, name });
+        }
+        if let Some(deinit) = entry.deinit {
+            deinit();
+        }
+        Ok(out)
+    }
+}
+
+fn resolve_clap_binary(path: &str) -> Result<std::path::PathBuf, String> {
+    let input = std::path::Path::new(path);
+    if input.is_file() {
+        return Ok(input.to_path_buf());
+    }
+    if !input.is_dir() {
+        return Err("CLAP path not found".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let macos_dir = input.join("Contents").join("MacOS");
+        if let Ok(entries) = std::fs::read_dir(&macos_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    let mut stack = vec![input.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            #[cfg(windows)]
+            let ok = ext == "clap" || ext == "dll";
+            #[cfg(target_os = "linux")]
+            let ok = ext == "clap" || ext == "so";
+            #[cfg(target_os = "macos")]
+            let ok = ext == "clap";
+            if ok {
+                return Ok(path);
+            }
+        }
+    }
+    Err("CLAP binary not found".to_string())
 }
