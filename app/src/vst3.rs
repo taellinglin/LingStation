@@ -1198,7 +1198,9 @@ impl Vst3Host {
                 };
             }
             if bus_result != kResultOk {
-                eprintln!("VST3 setBusArrangements failed: {bus_result}");
+                eprintln!(
+                    "VST3 setBusArrangements failed: {bus_result} (continuing with defaults)"
+                );
             } else {
                 eprintln!("VST3 bus arrangement result: {bus_result}");
             }

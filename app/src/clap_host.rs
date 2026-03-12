@@ -492,6 +492,7 @@ impl ClapHost {
             self.input_events.push(&event);
         }
 
+        let max_offset = frames.saturating_sub(1) as u32;
         for event in midi_events {
             match *event {
                 VstMidiEvent::NoteOn {
@@ -500,10 +501,14 @@ impl ClapHost {
                     velocity,
                     sample_offset,
                 } => {
+                    let channel = channel.min(15);
+                    let note = note.min(127);
+                    let velocity = velocity.min(127);
+                    let offset = (sample_offset.max(0) as u32).min(max_offset);
                     let pckn =
                         clack_common::events::Pckn::new(0u8, channel, note, 0u8);
                     let event = NoteOnEvent::new(
-                        sample_offset.max(0) as u32,
+                        offset,
                         pckn,
                         (velocity as f64 / 127.0).clamp(0.0, 1.0),
                     );
@@ -515,10 +520,14 @@ impl ClapHost {
                     velocity,
                     sample_offset,
                 } => {
+                    let channel = channel.min(15);
+                    let note = note.min(127);
+                    let velocity = velocity.min(127);
+                    let offset = (sample_offset.max(0) as u32).min(max_offset);
                     let pckn =
                         clack_common::events::Pckn::new(0u8, channel, note, 0u8);
                     let event = NoteOffEvent::new(
-                        sample_offset.max(0) as u32,
+                        offset,
                         pckn,
                         (velocity as f64 / 127.0).clamp(0.0, 1.0),
                     );
@@ -529,6 +538,9 @@ impl ClapHost {
                     controller,
                     value,
                 } => {
+                    let channel = channel.min(15);
+                    let controller = controller.min(127);
+                    let value = value.min(127);
                     let status = 0xB0 | (channel & 0x0F);
                     let event = ClapMidiEvent::new(0, 0, [status, controller, value]);
                     self.input_events.push(&event);

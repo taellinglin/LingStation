@@ -297,6 +297,12 @@ struct SettingsState {
     autosave_minutes: u32,
     #[serde(default)]
     load_last_project: bool,
+    #[serde(default = "default_startup_sound")]
+    play_startup_sound: bool,
+}
+
+fn default_startup_sound() -> bool {
+    true
 }
 
 impl Default for SettingsState {
@@ -317,6 +323,7 @@ impl Default for SettingsState {
             recent_projects: Vec::new(),
             autosave_minutes: 5,
             load_last_project: false,
+            play_startup_sound: default_startup_sound(),
         }
     }
 }
@@ -923,6 +930,8 @@ struct DawApp {
     midi_conn: Option<MidiInputConnection<()>>,
     audio_stop: Arc<AtomicBool>,
     audio_callback_active: Arc<AtomicUsize>,
+    playback_panic: Arc<AtomicBool>,
+    playback_fade_in: Arc<AtomicBool>,
     midi_freq_bits: Arc<AtomicU32>,
     midi_gate: Arc<AtomicBool>,
     tempo_bits: Arc<AtomicU32>,
@@ -1453,6 +1462,8 @@ impl Default for DawApp {
             midi_conn: None,
             audio_stop: Arc::new(AtomicBool::new(false)),
             audio_callback_active: Arc::new(AtomicUsize::new(0)),
+            playback_panic: Arc::new(AtomicBool::new(false)),
+            playback_fade_in: Arc::new(AtomicBool::new(false)),
             midi_freq_bits: Arc::new(AtomicU32::new(440.0f32.to_bits())),
             midi_gate: Arc::new(AtomicBool::new(false)),
             tempo_bits: Arc::new(AtomicU32::new(120.0f32.to_bits())),
@@ -1608,8 +1619,10 @@ impl Default for DawApp {
             gm_presets_generated: false,
         };
         app.load_settings_or_default();
-        if let Err(err) = app.play_startup_sound() {
-            app.status = format!("Startup sound failed: {err}");
+        if app.settings.play_startup_sound {
+            if let Err(err) = app.play_startup_sound() {
+                app.status = format!("Startup sound failed: {err}");
+            }
         }
         app
     }
@@ -4479,12 +4492,23 @@ impl DawApp {
                 let play_icon = egui::Image::new(egui::include_image!("../../icons/play.svg"))
                     .fit_to_exact_size(egui::vec2(16.0, 16.0));
                 if ui
-                    .add(egui::Button::image(play_icon))
-                    .on_hover_text("Play")
+                    .add(egui::Button::image(if self.audio_running {
+                        egui::Image::new(egui::include_image!("../../icons/pause.svg"))
+                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                    } else {
+                        play_icon.clone()
+                    }))
+                    .on_hover_text(if self.audio_running { "Pause" } else { "Play" })
                     .clicked()
                 {
-                    if let Err(err) = self.start_audio_and_midi() {
-                        self.status = format!("Play failed: {err}");
+                    if self.audio_running {
+                        self.pause_audio_and_midi();
+                        self.status = "Paused".to_string();
+                    } else {
+                        self.seek_playhead(self.playhead_beats);
+                        if let Err(err) = self.start_audio_and_midi_internal(false) {
+                            self.status = format!("Play failed: {err}");
+                        }
                     }
                 }
                 let stop_icon = egui::Image::new(egui::include_image!("../../icons/stop-circle.svg"))
@@ -10417,6 +10441,10 @@ impl DawApp {
                                 &mut self.settings.load_last_project,
                                 "Load last project at startup",
                             );
+                            ui.checkbox(
+                                &mut self.settings.play_startup_sound,
+                                "Play startup sound",
+                            );
                             ui.checkbox(&mut self.settings.triple_buffer, "Triple buffer");
                             ui.checkbox(&mut self.settings.safe_underruns, "Safe underruns");
                             ui.checkbox(&mut self.settings.adaptive_buffer, "Adaptive buffer");
@@ -12083,6 +12111,7 @@ impl DawApp {
         if self.render_job.is_some() {
             return Ok(());
         }
+        self.ensure_synth_soundfont();
         self.capture_plugin_states();
         let folder = Self::normalize_windows_path(folder);
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -12363,6 +12392,74 @@ impl DawApp {
         "settings.ling.json".to_string()
     }
 
+    fn ensure_synth_soundfont(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        let synths_root = cwd.join("synths");
+        if !synths_root.exists() {
+            return;
+        }
+        let candidates = [
+            synths_root.join("FishSynth").join("Ling.sf2"),
+            synths_root
+                .join("FishSynth")
+                .join("FishSynth.vst3")
+                .join("Ling.sf2"),
+            synths_root
+                .join("FishSynth")
+                .join("FishSynth.vst3")
+                .join("Contents")
+                .join("x86_64-win")
+                .join("SF")
+                .join("Ling.sf2"),
+            synths_root
+                .join("FishSynth")
+                .join("FishSynth.vst3")
+                .join("Contents")
+                .join("x86_64-win")
+                .join("Resources")
+                .join("SF")
+                .join("Ling.sf2"),
+        ];
+        let source = candidates.iter().find(|path| path.exists()).cloned();
+        let Some(source) = source else {
+            return;
+        };
+        let targets = [
+            cwd.join("Ling.sf2"),
+            cwd.join("SF").join("Ling.sf2"),
+            cwd.join("Resources").join("SF").join("Ling.sf2"),
+            synths_root.join("Ling.sf2"),
+            synths_root.join("MiceSynth").join("Ling.sf2"),
+            synths_root
+                .join("MiceSynth")
+                .join("MiceSynth.vst3")
+                .join("Contents")
+                .join("x86_64-win")
+                .join("SF")
+                .join("Ling.sf2"),
+            synths_root
+                .join("MiceSynth")
+                .join("MiceSynth.vst3")
+                .join("Contents")
+                .join("x86_64-win")
+                .join("Resources")
+                .join("SF")
+                .join("Ling.sf2"),
+        ];
+        for target in targets {
+            if target.exists() {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+
     fn normalize_windows_path(path: &Path) -> PathBuf {
         #[cfg(windows)]
         {
@@ -12380,6 +12477,7 @@ impl DawApp {
     }
 
     fn render_to_wav_with_rate(&mut self, path: &str, sample_rate: u32) -> Result<(), String> {
+        self.ensure_synth_soundfont();
         let channels = 2u16;
         let tempo = self.tempo_bpm.max(1.0);
         let beats = self.project_end_beats().max(1.0);
@@ -12999,7 +13097,10 @@ impl DawApp {
         self.last_overrun.store(false, Ordering::Relaxed);
         if reset_transport {
             self.transport_samples.store(0, Ordering::Relaxed);
+            self.playback_panic.store(true, Ordering::Relaxed);
+            self.playback_fade_in.store(true, Ordering::Relaxed);
         }
+        self.ensure_synth_soundfont();
         self.tempo_bits.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         self.sync_track_audio_states();
         let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
@@ -13208,12 +13309,16 @@ impl DawApp {
         for index in micesynth_program_sync {
             self.apply_micesynth_program_from_midi(index);
         }
+        self.send_midi_stop_to_hosts();
+        self.warmup_hosts(channels, buffer_size_usize, 2);
         let track_audio = self.track_audio.clone();
         let track_mix = self.track_mix.clone();
         let tempo_bits = self.tempo_bits.clone();
         let transport_samples = self.transport_samples.clone();
         let loop_start_samples = self.loop_start_samples.clone();
         let loop_end_samples = self.loop_end_samples.clone();
+        let playback_panic = self.playback_panic.clone();
+        let playback_fade_in = self.playback_fade_in.clone();
         let audio_stop = self.audio_stop.clone();
         let audio_callback_active = self.audio_callback_active.clone();
         let audio_clip_cache = self.audio_clip_cache.clone();
@@ -13260,6 +13365,7 @@ impl DawApp {
                             &transport_samples,
                             &loop_start_samples,
                             &loop_end_samples,
+                            &playback_panic,
                             &track_audio,
                             &track_mix,
                             &audio_clip_timeline,
@@ -13280,6 +13386,7 @@ impl DawApp {
                                 &mut state,
                             );
                         }
+                        apply_fade_in_if_needed(data, channels, &playback_fade_in);
                         for sample in data.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
                         }
@@ -13338,6 +13445,7 @@ impl DawApp {
                             &transport_samples,
                             &loop_start_samples,
                             &loop_end_samples,
+                            &playback_panic,
                             &track_audio,
                             &track_mix,
                             &audio_clip_timeline,
@@ -13358,6 +13466,7 @@ impl DawApp {
                                 &mut state,
                             );
                         }
+                        apply_fade_in_if_needed(&mut temp, channels, &playback_fade_in);
                         for sample in temp.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
                         }
@@ -13421,6 +13530,7 @@ impl DawApp {
                             &transport_samples,
                             &loop_start_samples,
                             &loop_end_samples,
+                            &playback_panic,
                             &track_audio,
                             &track_mix,
                             &audio_clip_timeline,
@@ -13441,6 +13551,7 @@ impl DawApp {
                                 &mut state,
                             );
                         }
+                        apply_fade_in_if_needed(&mut temp, channels, &playback_fade_in);
                         for sample in temp.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
                         }
@@ -13614,6 +13725,31 @@ impl DawApp {
         self.stop_audio_and_midi_internal(true);
     }
 
+    fn pause_audio_and_midi(&mut self) {
+        if !self.audio_running {
+            return;
+        }
+        self.audio_stop.store(true, Ordering::Relaxed);
+        self.audio_running = false;
+        self.midi_conn = None;
+        let _stream = self.audio_stream.take();
+        let _input = self.audio_input_stream.take();
+        let start = std::time::Instant::now();
+        while self.audio_callback_active.load(Ordering::Relaxed) > 0 {
+            if start.elapsed() > std::time::Duration::from_millis(1000) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.send_midi_stop_to_hosts();
+        self.midi_gate.store(false, Ordering::Relaxed);
+        for state in &self.track_audio {
+            if let Ok(mut events) = state.midi_events.lock() {
+                events.clear();
+            }
+        }
+    }
+
     fn stop_audio_and_midi_internal(&mut self, reset_transport: bool) {
         self.audio_stop.store(true, Ordering::Relaxed);
         self.audio_running = false;
@@ -13660,6 +13796,29 @@ impl DawApp {
                 continue;
             };
             let _ = host.process_f32(&mut buffer, channels, &events);
+        }
+    }
+
+    fn warmup_hosts(&mut self, channels: usize, block_size: usize, blocks: usize) {
+        if channels == 0 || block_size == 0 || blocks == 0 {
+            return;
+        }
+        let frames = block_size.max(1);
+        let mut silence = vec![0.0f32; frames * channels];
+        let mut scratch = vec![0.0f32; frames * channels];
+        let events: [vst3::MidiEvent; 0] = [];
+        for _ in 0..blocks {
+            for state in &self.track_audio {
+                if let Some(host) = state.host.as_ref() {
+                    silence.fill(0.0);
+                    let _ = host.process_f32(&mut silence, channels, &events);
+                }
+                for fx in &state.effect_hosts {
+                    silence.fill(0.0);
+                    scratch.fill(0.0);
+                    let _ = fx.process_f32_with_input(&silence, &mut scratch, channels, &events);
+                }
+            }
         }
     }
 
@@ -15205,6 +15364,9 @@ fn render_plan_to_wav(
         }
     }
 
+    render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
+    render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
+
     let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -15236,7 +15398,10 @@ fn render_plan_to_wav(
                     }
                 }
             }
-            let mut events = if plan.render_tail_mode == RenderTailMode::Release && block_start == start_samples {
+            let mut events = if plan.render_tail_mode == RenderTailMode::Release
+                && start_samples > 0
+                && block_start == start_samples
+            {
                 (0u8..=127)
                     .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
                     .collect::<Vec<_>>()
@@ -15304,7 +15469,17 @@ fn render_plan_to_wav(
                     let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
                         .max(0.0);
                     let len = src_frames as f64;
-                    let src_pos = if len > 0.0 { pos % len } else { pos };
+                    let src_pos = if len > 0.0 {
+                        if plan.render_tail_mode == RenderTailMode::Wrap {
+                            pos % len
+                        } else if pos >= len {
+                            continue;
+                        } else {
+                            pos
+                        }
+                    } else {
+                        pos
+                    };
                     let base = src_pos.floor() as usize;
                     let frac = (src_pos - base as f64) as f32;
                     let next = (base + 1).min(src_frames.saturating_sub(1));
@@ -15374,6 +15549,66 @@ fn load_render_host(
             )
             .ok()
             .map(RenderHost::Clap)
+        }
+    }
+}
+
+fn render_send_midi_stop(
+    track_hosts: &mut [(RenderTrack, Option<RenderHost>, Vec<RenderHost>)],
+    channels: usize,
+    block_size: usize,
+) {
+    if channels == 0 {
+        return;
+    }
+    let frames = block_size.max(1);
+    let mut buffer = vec![0.0f32; frames * channels];
+    let mut input = vec![0.0f32; frames * channels];
+    let mut events = Vec::with_capacity(16 * 128);
+    for channel in 0u8..16 {
+        events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+        events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+        for note in 0u8..=127 {
+            events.push(vst3::MidiEvent::note_off_at(channel, note, 0, 0));
+        }
+    }
+    for (_, host, fx_hosts) in track_hosts.iter_mut() {
+        if let Some(host) = host.as_mut() {
+            buffer.fill(0.0);
+            let _ = host.process_f32(&mut buffer, channels, &events);
+        }
+        for fx in fx_hosts.iter_mut() {
+            input.fill(0.0);
+            buffer.fill(0.0);
+            let _ = fx.process_f32_with_input(&input, &mut buffer, channels, &events);
+        }
+    }
+}
+
+fn render_warmup_hosts(
+    track_hosts: &mut [(RenderTrack, Option<RenderHost>, Vec<RenderHost>)],
+    channels: usize,
+    block_size: usize,
+    blocks: usize,
+) {
+    if channels == 0 || block_size == 0 || blocks == 0 {
+        return;
+    }
+    let frames = block_size.max(1);
+    let mut buffer = vec![0.0f32; frames * channels];
+    let mut input = vec![0.0f32; frames * channels];
+    let events: [vst3::MidiEvent; 0] = [];
+    for _ in 0..blocks {
+        for (_, host, fx_hosts) in track_hosts.iter_mut() {
+            if let Some(host) = host.as_mut() {
+                buffer.fill(0.0);
+                let _ = host.process_f32(&mut buffer, channels, &events);
+            }
+            for fx in fx_hosts.iter_mut() {
+                input.fill(0.0);
+                buffer.fill(0.0);
+                let _ = fx.process_f32_with_input(&input, &mut buffer, channels, &events);
+            }
         }
     }
 }
@@ -15487,6 +15722,9 @@ where
         }
     }
 
+    render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
+    render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
+
     let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -15518,7 +15756,10 @@ where
                     }
                 }
             }
-            let mut events = if plan.render_tail_mode == RenderTailMode::Release && block_start == start_samples {
+            let mut events = if plan.render_tail_mode == RenderTailMode::Release
+                && start_samples > 0
+                && block_start == start_samples
+            {
                 (0u8..=127)
                     .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
                     .collect::<Vec<_>>()
@@ -15586,7 +15827,17 @@ where
                     let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
                         .max(0.0);
                     let len = src_frames as f64;
-                    let src_pos = if len > 0.0 { pos % len } else { pos };
+                    let src_pos = if len > 0.0 {
+                        if plan.render_tail_mode == RenderTailMode::Wrap {
+                            pos % len
+                        } else if pos >= len {
+                            continue;
+                        } else {
+                            pos
+                        }
+                    } else {
+                        pos
+                    };
                     let base = src_pos.floor() as usize;
                     let frac = (src_pos - base as f64) as f32;
                     let next = (base + 1).min(src_frames.saturating_sub(1));
@@ -15725,6 +15976,9 @@ fn render_plan_to_f32(
         }
     }
 
+    render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
+    render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
+
     let mut output_all = Vec::with_capacity(total_samples * channels as usize);
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -15812,7 +16066,17 @@ fn render_plan_to_f32(
                     let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
                         .max(0.0);
                     let len = src_frames as f64;
-                    let src_pos = if len > 0.0 { pos % len } else { pos };
+                    let src_pos = if len > 0.0 {
+                        if plan.render_tail_mode == RenderTailMode::Wrap {
+                            pos % len
+                        } else if pos >= len {
+                            continue;
+                        } else {
+                            pos
+                        }
+                    } else {
+                        pos
+                    };
                     let base = src_pos.floor() as usize;
                     let frac = (src_pos - base as f64) as f32;
                     let next = (base + 1).min(src_frames.saturating_sub(1));
@@ -16035,6 +16299,7 @@ fn mix_track_hosts(
     transport_samples: &AtomicU64,
     loop_start_samples: &AtomicU64,
     loop_end_samples: &AtomicU64,
+    playback_panic: &AtomicBool,
     track_audio: &[TrackAudioState],
     track_mix: &Arc<Mutex<Vec<TrackMixState>>>,
     audio_clips: &Arc<Mutex<Vec<AudioClipRender>>>,
@@ -16052,14 +16317,13 @@ fn mix_track_hosts(
     let mut block_end = block_start + frames as u64;
     let loop_start = loop_start_samples.load(Ordering::Relaxed);
     let loop_end = loop_end_samples.load(Ordering::Relaxed);
+    let panic_notes = playback_panic.swap(false, Ordering::Relaxed);
     let mut loop_wrapped = false;
-    if loop_end > loop_start {
-        if block_start >= loop_end || block_end > loop_end {
-            block_start = loop_start;
-            block_end = block_start + frames as u64;
-            transport_samples.store(block_end, Ordering::Relaxed);
-            loop_wrapped = true;
-        }
+    if loop_end > loop_start && block_start < loop_end && block_end > loop_end {
+        block_start = loop_start;
+        block_end = block_start + frames as u64;
+        transport_samples.store(block_end, Ordering::Relaxed);
+        loop_wrapped = true;
     }
     let block_beat = (block_start as f64 / samples_per_beat) as f32;
 
@@ -16171,12 +16435,36 @@ fn mix_track_hosts(
             if let Some(host) = state.host.as_ref() {
                 let mut events =
                     collect_block_events(&notes, block_start, block_end, samples_per_beat);
+                if panic_notes {
+                    for channel in 0u8..16 {
+                        events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+                        events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+                    }
+                    for channel in 0u8..16 {
+                        events.extend(
+                            (0u8..=127)
+                                .map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
+                        );
+                    }
+                    if frames > 1 {
+                        for event in events.iter_mut() {
+                            if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
+                                if *sample_offset == 0 {
+                                    *sample_offset = 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 if loop_wrapped {
                     events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
                 }
                 if let Ok(mut queued) = state.midi_events.lock() {
                     events.extend(queued.drain(..));
                 }
+                let has_note_on = events
+                    .iter()
+                    .any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
                 let pending_params = state
                     .pending_param_changes
                     .lock()
@@ -16208,6 +16496,10 @@ fn mix_track_hosts(
                             controller,
                             value,
                         } => {
+                            if controller >= 120 {
+                                filtered.push(event);
+                                continue;
+                            }
                             if let Some(param_id) = learned_map.get(&(channel, controller)) {
                                 let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
                                 host.push_param_change(*param_id, norm);
@@ -16221,6 +16513,9 @@ fn mix_track_hosts(
                 filtered_events = filtered;
                 if host.process_f32(temp, channels, &filtered_events).is_ok() {
                     track_processed = true;
+                }
+                if panic_notes && !has_note_on {
+                    temp.fill(0.0);
                 }
             }
 
@@ -16354,6 +16649,25 @@ fn mix_track_hosts(
     }
 
     processed_any.load(Ordering::Relaxed)
+}
+
+fn apply_fade_in_if_needed(samples: &mut [f32], channels: usize, flag: &AtomicBool) {
+    if !flag.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let frames = samples.len() / channels.max(1);
+    if frames == 0 {
+        return;
+    }
+    for frame in 0..frames {
+        let gain = (frame as f32 + 1.0) / frames as f32;
+        let base = frame * channels;
+        for ch in 0..channels {
+            if let Some(sample) = samples.get_mut(base + ch) {
+                *sample *= gain;
+            }
+        }
+    }
 }
 
 fn update_master_peak_f32(output: &[f32], peak_bits: &AtomicU32) {
