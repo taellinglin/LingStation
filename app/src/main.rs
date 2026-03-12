@@ -6,7 +6,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use rodio::{Decoder, OutputStream, Sink, Source};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
@@ -23,6 +22,7 @@ use std::sync::{
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+mod clap_host;
 mod vst3;
 
 const BASE_UI_FONT_SIZE: f32 = 9.0;
@@ -173,6 +173,10 @@ struct Clip {
     length_beats: f32,
     is_midi: bool,
     #[serde(default)]
+    midi_notes: Vec<PianoRollNote>,
+    #[serde(default)]
+    link_id: Option<usize>,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     audio_path: Option<String>,
@@ -197,7 +201,11 @@ struct Track {
     solo: bool,
     midi_notes: Vec<PianoRollNote>,
     instrument_path: Option<String>,
+    #[serde(default)]
+    instrument_clap_id: Option<String>,
     effect_paths: Vec<String>,
+    #[serde(default)]
+    effect_clap_ids: Vec<Option<String>>,
     #[serde(default)]
     effect_bypass: Vec<bool>,
     #[serde(default)]
@@ -241,6 +249,8 @@ struct ProjectState {
     comment: String,
     tempo_bpm: f32,
     tracks: Vec<Track>,
+    #[serde(default)]
+    master_settings: MasterCompSettings,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -315,6 +325,20 @@ impl Default for SettingsState {
 enum PluginTarget {
     Instrument(usize),
     Effect(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginKind {
+    Vst3,
+    Clap,
+}
+
+#[derive(Clone, Debug)]
+struct PluginCandidate {
+    path: String,
+    kind: PluginKind,
+    clap_id: Option<String>,
+    display: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,8 +462,8 @@ impl GmParamValues {
 
 #[derive(Clone)]
 struct TrackAudioState {
-    host: Option<Arc<Mutex<vst3::Vst3Host>>>,
-    effect_hosts: Vec<Arc<Mutex<vst3::Vst3Host>>>,
+    host: Option<PluginHostHandle>,
+    effect_hosts: Vec<PluginHostHandle>,
     effect_bypass: Arc<Mutex<Vec<bool>>>,
     midi_events: Arc<Mutex<Vec<vst3::MidiEvent>>>,
     clip_notes: Arc<Mutex<Vec<PianoRollNote>>>,
@@ -450,6 +474,146 @@ struct TrackAudioState {
     automation_lanes: Arc<Mutex<Vec<AutomationLane>>>,
     pending_param_changes: Arc<Mutex<Vec<PendingParamChange>>>,
     silent_blocks: Arc<AtomicU32>,
+}
+
+#[derive(Clone)]
+enum PluginHostHandle {
+    Vst3(Arc<Mutex<vst3::Vst3Host>>),
+    Clap(Arc<Mutex<clap_host::ClapHost>>),
+}
+
+impl PluginHostHandle {
+    fn enumerate_params(&self) -> Vec<vst3::ParamInfo> {
+        match self {
+            PluginHostHandle::Vst3(host) => host
+                .lock()
+                .ok()
+                .map(|host| host.enumerate_params())
+                .unwrap_or_default(),
+            PluginHostHandle::Clap(host) => host
+                .lock()
+                .ok()
+                .map(|mut host| {
+                    host.enumerate_params()
+                        .into_iter()
+                        .map(|param| vst3::ParamInfo {
+                            id: param.id,
+                            name: param.name,
+                            default_value: param.default_value,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn push_param_change(&self, param_id: u32, value: f64) {
+        match self {
+            PluginHostHandle::Vst3(host) => {
+                if let Ok(mut host) = host.lock() {
+                    host.push_param_change(param_id, value);
+                }
+            }
+            PluginHostHandle::Clap(host) => {
+                if let Ok(mut host) = host.lock() {
+                    host.push_param_change(param_id, value);
+                }
+            }
+        }
+    }
+
+    fn get_param_normalized(&self, param_id: u32) -> Option<f64> {
+        match self {
+            PluginHostHandle::Vst3(host) => host.lock().ok().and_then(|host| host.get_param_normalized(param_id)),
+            PluginHostHandle::Clap(_) => None,
+        }
+    }
+
+    fn get_state_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        match self {
+            PluginHostHandle::Vst3(host) => host
+                .lock()
+                .ok()
+                .map(|host| host.get_state_bytes())
+                .unwrap_or_default(),
+            PluginHostHandle::Clap(host) => host
+                .lock()
+                .ok()
+                .map(|mut host| (host.get_state_bytes(), Vec::new()))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn set_state_bytes(
+        &self,
+        component_state: Option<&[u8]>,
+        controller_state: Option<&[u8]>,
+    ) -> Result<(), String> {
+        match self {
+            PluginHostHandle::Vst3(host) => host
+                .lock()
+                .map_err(|_| "Plugin lock failed".to_string())?
+                .set_state_bytes(component_state, controller_state),
+            PluginHostHandle::Clap(host) => {
+                let bytes = component_state.unwrap_or(&[]);
+                host.lock()
+                    .map_err(|_| "Plugin lock failed".to_string())?
+                    .set_state_bytes(bytes)
+            }
+        }
+    }
+
+    fn prepare_for_drop(&self) {
+        match self {
+            PluginHostHandle::Vst3(host) => {
+                if let Ok(mut host) = host.lock() {
+                    host.prepare_for_drop();
+                }
+            }
+            PluginHostHandle::Clap(host) => {
+                if let Ok(mut host) = host.lock() {
+                    host.prepare_for_drop();
+                }
+            }
+        }
+    }
+
+    fn process_f32(
+        &self,
+        output: &mut [f32],
+        channels: usize,
+        midi_events: &[vst3::MidiEvent],
+    ) -> Result<(), String> {
+        match self {
+            PluginHostHandle::Vst3(host) => host
+                .lock()
+                .map_err(|_| "Plugin lock failed".to_string())?
+                .process_f32(output, channels, midi_events),
+            PluginHostHandle::Clap(host) => host
+                .lock()
+                .map_err(|_| "Plugin lock failed".to_string())?
+                .process_f32(output, channels, midi_events),
+        }
+    }
+
+    fn process_f32_with_input(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        channels: usize,
+        midi_events: &[vst3::MidiEvent],
+    ) -> Result<(), String> {
+        match self {
+            PluginHostHandle::Vst3(host) => host
+                .lock()
+                .map_err(|_| "Plugin lock failed".to_string())?
+                .process_f32_with_input(input, output, channels, midi_events),
+            PluginHostHandle::Clap(host) => host
+                .lock()
+                .map_err(|_| "Plugin lock failed".to_string())?
+                .process_f32_with_input(input, output, channels, midi_events),
+        }
+    }
 }
 
 impl TrackAudioState {
@@ -522,6 +686,8 @@ struct RenderPlan {
     end_beats: f32,
     bitrate_kbps: u32,
     wav_bit_depth: RenderWavBitDepth,
+    render_tail_mode: RenderTailMode,
+    render_release_seconds: f32,
     tracks: Vec<RenderTrack>,
     notes: Vec<PianoRollNote>,
     instrument_path: Option<String>,
@@ -531,6 +697,7 @@ struct RenderPlan {
     plugin_state_controller: Option<Vec<u8>>,
     audio_clips: Vec<AudioClipRender>,
     audio_cache: HashMap<String, Arc<AudioClipData>>,
+    master_settings: MasterCompSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -544,15 +711,78 @@ enum RenderTailMode {
 struct RenderTrack {
     notes: Vec<PianoRollNote>,
     instrument_path: Option<String>,
+    instrument_clap_id: Option<String>,
     param_ids: Vec<u32>,
     param_values: Vec<f32>,
     plugin_state_component: Option<Vec<u8>>,
     plugin_state_controller: Option<Vec<u8>>,
     effect_paths: Vec<String>,
+    effect_clap_ids: Vec<Option<String>>,
     effect_bypass: Vec<bool>,
     automation_lanes: Vec<AutomationLane>,
     level: f32,
     active: bool,
+}
+
+enum RenderHost {
+    Vst3(vst3::Vst3Host),
+    Clap(clap_host::ClapHost),
+}
+
+impl RenderHost {
+    fn push_param_change(&mut self, param_id: u32, value: f64) {
+        match self {
+            RenderHost::Vst3(host) => host.push_param_change(param_id, value),
+            RenderHost::Clap(host) => host.push_param_change(param_id, value),
+        }
+    }
+
+    fn set_state_bytes(
+        &mut self,
+        component_state: Option<&[u8]>,
+        controller_state: Option<&[u8]>,
+    ) -> Result<(), String> {
+        match self {
+            RenderHost::Vst3(host) => host.set_state_bytes(component_state, controller_state),
+            RenderHost::Clap(host) => host.set_state_bytes(component_state.unwrap_or(&[])),
+        }
+    }
+
+    fn apply_state_for_render(
+        &mut self,
+        component_state: Option<&[u8]>,
+        controller_state: Option<&[u8]>,
+    ) -> Result<(), String> {
+        match self {
+            RenderHost::Vst3(host) => host.apply_state_for_render(component_state, controller_state),
+            RenderHost::Clap(host) => host.set_state_bytes(component_state.unwrap_or(&[])),
+        }
+    }
+
+    fn process_f32(
+        &mut self,
+        output: &mut [f32],
+        channels: usize,
+        midi_events: &[vst3::MidiEvent],
+    ) -> Result<(), String> {
+        match self {
+            RenderHost::Vst3(host) => host.process_f32(output, channels, midi_events),
+            RenderHost::Clap(host) => host.process_f32(output, channels, midi_events),
+        }
+    }
+
+    fn process_f32_with_input(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        channels: usize,
+        midi_events: &[vst3::MidiEvent],
+    ) -> Result<(), String> {
+        match self {
+            RenderHost::Vst3(host) => host.process_f32_with_input(input, output, channels, midi_events),
+            RenderHost::Clap(host) => host.process_f32_with_input(input, output, channels, midi_events),
+        }
+    }
 }
 
 struct RenderJob {
@@ -638,6 +868,42 @@ struct RecordingBuffers {
     automation_points: Vec<RecordedAutomationPoint>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct MasterCompSettings {
+    enabled: bool,
+    threshold_db: f32,
+    ratio: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    makeup_db: f32,
+    level: f32,
+}
+
+impl Default for MasterCompSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_db: -18.0,
+            ratio: 2.0,
+            attack_ms: 10.0,
+            release_ms: 120.0,
+            makeup_db: 0.0,
+            level: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MasterCompState {
+    gain: f32,
+}
+
+impl Default for MasterCompState {
+    fn default() -> Self {
+        Self { gain: 1.0 }
+    }
+}
+
 struct DawApp {
     project_name: String,
     project_path: String,
@@ -663,6 +929,8 @@ struct DawApp {
     transport_samples: Arc<AtomicU64>,
     master_peak_bits: Arc<AtomicU32>,
     master_peak_display: f32,
+    master_settings: Arc<Mutex<MasterCompSettings>>,
+    master_comp_state: Arc<Mutex<MasterCompState>>,
     last_output_channels: usize,
     track_audio: Vec<TrackAudioState>,
     track_mix: Arc<Mutex<Vec<TrackMixState>>>,
@@ -731,7 +999,7 @@ struct DawApp {
     record_started_audio: bool,
     recording: Arc<Mutex<RecordingBuffers>>,
     audio_input_stream: Option<cpal::Stream>,
-    plugin_candidates: Vec<String>,
+    plugin_candidates: Vec<PluginCandidate>,
     plugin_search: String,
     plugin_target: Option<PluginTarget>,
     show_midi_import: bool,
@@ -782,17 +1050,22 @@ struct DawApp {
     loop_end_beats: Option<f32>,
     loop_start_samples: Arc<AtomicU64>,
     loop_end_samples: Arc<AtomicU64>,
-    orphaned_hosts: Vec<Arc<Mutex<vst3::Vst3Host>>>,
+    orphaned_hosts: Vec<PluginHostHandle>,
     automation_active: Option<(usize, usize)>,
     automation_rows_expanded: HashSet<usize>,
     gm_presets_generated: bool,
 }
 
+enum PluginUiEditor {
+    Vst3(vst3::Vst3Editor),
+    Clap,
+}
+
 struct PluginUiHost {
     hwnd: isize,
     child_hwnd: isize,
-    editor: vst3::Vst3Editor,
-    host: Arc<Mutex<vst3::Vst3Host>>,
+    editor: PluginUiEditor,
+    host: PluginHostHandle,
     target: PluginUiTarget,
     close_requested: Arc<AtomicBool>,
 }
@@ -935,21 +1208,12 @@ struct PianoDragState {
 impl Default for DawApp {
     fn default() -> Self {
         let clips = vec![
-            Clip { id: 1, track: 0, start_beats: 0.0, length_beats: 64.0, is_midi: true, name: "FishSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-        ];
-
-        let tracks = vec![
-            Track {
-                name: "FishSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 0).collect(),
-                level: 0.8,
-                muted: false,
-                solo: false,
+            Clip {
+                id: 1,
+                track: 0,
+                start_beats: 0.0,
+                length_beats: 64.0,
+                is_midi: true,
                 midi_notes: [
                     (0.0, 2.0, 62),
                     (2.0, 2.0, 65),
@@ -986,8 +1250,34 @@ impl Default for DawApp {
                 .copied()
                 .map(|(start, length, note)| PianoRollNote::new(start, length, note, 100))
                 .collect(),
+                link_id: None,
+                name: "FishSynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_time_mul: 1.0,
+            },
+            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), link_id: None, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), link_id: None, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), link_id: None, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), link_id: None, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), link_id: None, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+        ];
+
+        let tracks = vec![
+            Track {
+                name: "FishSynth".to_string(),
+                clips: clips.iter().cloned().filter(|c| c.track == 0).collect(),
+                level: 0.8,
+                muted: false,
+                solo: false,
+                midi_notes: Vec::new(),
                 instrument_path: Some("synths/FishSynth/FishSynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1010,7 +1300,9 @@ impl Default for DawApp {
                 solo: false,
                 midi_notes: Vec::new(),
                 instrument_path: Some("synths/CatSynth/CatSynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1033,7 +1325,9 @@ impl Default for DawApp {
                 solo: false,
                 midi_notes: Vec::new(),
                 instrument_path: Some("synths/SannySynth/SannySynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1056,7 +1350,9 @@ impl Default for DawApp {
                 solo: false,
                 midi_notes: Vec::new(),
                 instrument_path: Some("synths/DogSynth/DogSynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1079,7 +1375,9 @@ impl Default for DawApp {
                 solo: false,
                 midi_notes: Vec::new(),
                 instrument_path: Some("synths/LingSynth/LingSynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1102,7 +1400,9 @@ impl Default for DawApp {
                 solo: false,
                 midi_notes: Vec::new(),
                 instrument_path: Some("synths/MiceSynth/MiceSynth.vst3".to_string()),
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -1159,6 +1459,8 @@ impl Default for DawApp {
             transport_samples: Arc::new(AtomicU64::new(0)),
             master_peak_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             master_peak_display: 0.0,
+            master_settings: Arc::new(Mutex::new(MasterCompSettings::default())),
+            master_comp_state: Arc::new(Mutex::new(MasterCompState::default())),
             last_output_channels: 2,
             track_audio,
             track_mix: Arc::new(Mutex::new(track_mix_states)),
@@ -1673,18 +1975,14 @@ impl DawApp {
     const UNDO_LIMIT: usize = 4096;
 
     fn leak_hosts_on_exit(&mut self) {
-        let mut hosts: Vec<Arc<Mutex<vst3::Vst3Host>>> = Vec::new();
+        let mut hosts: Vec<PluginHostHandle> = Vec::new();
         for state in self.track_audio.iter_mut() {
             if let Some(host) = state.host.take() {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 hosts.push(host);
             }
             for host in state.effect_hosts.drain(..) {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 hosts.push(host);
             }
         }
@@ -1699,22 +1997,68 @@ impl DawApp {
             return;
         }
         let input = ctx.input(|i| i.clone());
-        let has_piano_selection = !self.piano_selected.is_empty();
-        if has_piano_selection {
-            if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
-                if let Some(track_index) = self.selected_track {
-                    let mut indices: Vec<usize> = self.piano_selected.iter().copied().collect();
-                    indices.sort_unstable_by(|a, b| b.cmp(a));
-                    self.push_undo_state();
-                    if let Some(track) = self.tracks.get_mut(track_index) {
-                        for index in indices {
-                            if index < track.midi_notes.len() {
-                                track.midi_notes.remove(index);
+        if input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::A) {
+            self.piano_selected.clear();
+            self.selected_clips.clear();
+            self.selected_clip = None;
+            return;
+        }
+        if input.modifiers.ctrl && input.key_pressed(egui::Key::A) {
+            if self.piano_roll_hovered {
+                if let Some(clip_id) = self.selected_clip {
+                    if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
+                        self.piano_selected.clear();
+                        if let Some(clip) = self
+                            .tracks
+                            .get(track_index)
+                            .and_then(|t| t.clips.get(clip_index))
+                        {
+                            for index in 0..clip.midi_notes.len() {
+                                self.piano_selected.insert(index);
                             }
                         }
                     }
-                    self.piano_selected.clear();
-                    self.sync_track_audio_notes(track_index);
+                }
+            } else {
+                self.selected_clips.clear();
+                let mut last_clip = None;
+                let mut last_track = None;
+                for track in &self.tracks {
+                    for clip in &track.clips {
+                        self.selected_clips.insert(clip.id);
+                        last_clip = Some(clip.id);
+                        last_track = Some(clip.track);
+                    }
+                }
+                self.selected_clip = last_clip;
+                if let Some(track_index) = last_track {
+                    self.selected_track = Some(track_index);
+                }
+            }
+            return;
+        }
+        let has_piano_selection = !self.piano_selected.is_empty();
+        if has_piano_selection {
+            if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
+                if let Some(clip_id) = self.selected_clip {
+                    if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
+                        let mut indices: Vec<usize> = self.piano_selected.iter().copied().collect();
+                        indices.sort_unstable_by(|a, b| b.cmp(a));
+                        self.push_undo_state();
+                        if let Some(clip) = self
+                            .tracks
+                            .get_mut(track_index)
+                            .and_then(|t| t.clips.get_mut(clip_index))
+                        {
+                            for index in indices {
+                                if index < clip.midi_notes.len() {
+                                    clip.midi_notes.remove(index);
+                                }
+                            }
+                        }
+                        self.piano_selected.clear();
+                        self.sync_track_audio_notes(track_index);
+                    }
                 }
                 return;
             }
@@ -1734,25 +2078,31 @@ impl DawApp {
             if (beat_delta.abs() > f32::EPSILON || pitch_delta != 0)
                 && self.selected_track.is_some()
             {
-                if let Some(track_index) = self.selected_track {
-                    let mut indices: Vec<usize> = self.piano_selected.iter().copied().collect();
-                    indices.sort_unstable();
-                    self.push_undo_state();
-                    if let Some(track) = self.tracks.get_mut(track_index) {
-                        for index in indices {
-                            if let Some(note) = track.midi_notes.get_mut(index) {
-                                if beat_delta.abs() > f32::EPSILON {
-                                    note.start_beats = (note.start_beats + beat_delta).max(0.0);
-                                }
-                                if pitch_delta != 0 {
-                                    let next_pitch = (note.midi_note as i32 + pitch_delta)
-                                        .clamp(0, 127) as u8;
-                                    note.midi_note = next_pitch;
+                if let Some(clip_id) = self.selected_clip {
+                    if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
+                        let mut indices: Vec<usize> = self.piano_selected.iter().copied().collect();
+                        indices.sort_unstable();
+                        self.push_undo_state();
+                        if let Some(clip) = self
+                            .tracks
+                            .get_mut(track_index)
+                            .and_then(|t| t.clips.get_mut(clip_index))
+                        {
+                            for index in indices {
+                                if let Some(note) = clip.midi_notes.get_mut(index) {
+                                    if beat_delta.abs() > f32::EPSILON {
+                                        note.start_beats = (note.start_beats + beat_delta).max(0.0);
+                                    }
+                                    if pitch_delta != 0 {
+                                        let next_pitch = (note.midi_note as i32 + pitch_delta)
+                                            .clamp(0, 127) as u8;
+                                        note.midi_note = next_pitch;
+                                    }
                                 }
                             }
                         }
+                        self.sync_track_audio_notes(track_index);
                     }
-                    self.sync_track_audio_notes(track_index);
                 }
                 return;
             }
@@ -1788,7 +2138,7 @@ impl DawApp {
                             break;
                         }
                     }
-                    if let Some((track_index, start_beats, length_beats, is_midi)) = clip_info {
+                    if let Some((track_index, start_beats, _length_beats, is_midi)) = clip_info {
                         let target_track = if track_delta != 0 {
                             let next = track_index as i32 + track_delta;
                             if next >= 0 && next < self.tracks.len() as i32 {
@@ -1806,15 +2156,15 @@ impl DawApp {
                                 && (beat_delta.abs() > f32::EPSILON
                                     || target_track != track_index)
                             {
-                                self.shift_midi_notes_for_clip_move(
-                                    track_index,
-                                    target_track,
-                                    start_beats,
-                                    length_beats,
-                                    new_start - start_beats,
-                                );
+                                self.shift_clip_notes_by_delta(clip_id, new_start - start_beats);
                             }
                             self.move_clip_by_id(clip_id, target_track, new_start);
+                            if is_midi {
+                                self.sync_track_audio_notes(track_index);
+                                if target_track != track_index {
+                                    self.sync_track_audio_notes(target_track);
+                                }
+                            }
                             self.selected_track = Some(target_track);
                         }
                     }
@@ -1858,7 +2208,16 @@ impl DawApp {
             self.toggle_recording();
         }
         if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
-            if let Some(clip_id) = self.selected_clip {
+            if !self.selected_clips.is_empty() {
+                let mut ids: Vec<usize> = self.selected_clips.iter().copied().collect();
+                ids.sort_unstable();
+                self.push_undo_state();
+                for clip_id in ids {
+                    self.remove_clip_and_notes_by_id(clip_id);
+                }
+                self.selected_clips.clear();
+                self.selected_clip = None;
+            } else if let Some(clip_id) = self.selected_clip {
                 self.push_undo_state();
                 self.remove_clip_and_notes_by_id(clip_id);
                 self.selected_clip = None;
@@ -1948,6 +2307,7 @@ impl DawApp {
     }
 
     fn sync_track_audio_states(&mut self) {
+        self.rebuild_all_track_midi_notes();
         if self.track_audio.len() != self.tracks.len() {
             self.track_audio = self
                 .tracks
@@ -1979,7 +2339,41 @@ impl DawApp {
         }
     }
 
+    fn master_settings_snapshot(&self) -> MasterCompSettings {
+        self.master_settings
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    fn rebuild_all_track_midi_notes(&mut self) {
+        for index in 0..self.tracks.len() {
+            self.rebuild_track_midi_notes(index);
+        }
+    }
+
+    fn rebuild_track_midi_notes(&mut self, index: usize) {
+        let Some(track) = self.tracks.get_mut(index) else {
+            return;
+        };
+        track.midi_notes.clear();
+        for clip in &track.clips {
+            if !clip.is_midi || clip.midi_notes.is_empty() {
+                continue;
+            }
+            track.midi_notes.extend(clip.midi_notes.iter().cloned());
+        }
+        if !track.midi_notes.is_empty() {
+            track.midi_notes.sort_by(|a, b| {
+                a.start_beats
+                    .partial_cmp(&b.start_beats)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+
     fn sync_track_audio_notes(&mut self, index: usize) {
+        self.rebuild_track_midi_notes(index);
         if let Some(track) = self.tracks.get(index) {
             if let Some(state) = self.track_audio.get(index) {
                 state.sync_notes(track);
@@ -1987,25 +2381,50 @@ impl DawApp {
         }
     }
 
-    fn selected_track_host(&self) -> Option<Arc<Mutex<vst3::Vst3Host>>> {
+    fn selected_track_host(&self) -> Option<PluginHostHandle> {
         let index = self.selected_track?;
         self.track_audio.get(index).and_then(|state| state.host.clone())
     }
 
-    fn ensure_track_host(&mut self, index: usize, channels: usize) -> Option<Arc<Mutex<vst3::Vst3Host>>> {
+    fn ensure_track_host(&mut self, index: usize, channels: usize) -> Option<PluginHostHandle> {
         let path = self.tracks.get(index).and_then(|t| t.instrument_path.clone())?;
         let state = self.track_audio.get_mut(index)?;
         if let Some(host) = state.host.as_ref() {
             return Some(host.clone());
         }
-        let host = vst3::Vst3Host::load(
-            &path,
-            self.settings.sample_rate as f64,
-            self.settings.buffer_size as usize,
-            channels.max(1),
-        )
-        .ok()?;
-        let host = Arc::new(Mutex::new(host));
+        let kind = Self::plugin_kind_from_path(&path);
+        let host = match kind {
+            PluginKind::Vst3 => {
+                let host = vst3::Vst3Host::load(
+                    &path,
+                    self.settings.sample_rate as f64,
+                    self.settings.buffer_size as usize,
+                    channels.max(1),
+                )
+                .ok()?;
+                PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))
+            }
+            PluginKind::Clap => {
+                let clap_id = self
+                    .tracks
+                    .get(index)
+                    .and_then(|t| t.instrument_clap_id.clone())
+                    .or_else(|| clap_host::default_plugin_id(&path).ok())?;
+                if let Some(track) = self.tracks.get_mut(index) {
+                    track.instrument_clap_id = Some(clap_id.clone());
+                }
+                let host = clap_host::ClapHost::load(
+                    &path,
+                    &clap_id,
+                    self.settings.sample_rate as f64,
+                    self.settings.buffer_size as u32,
+                    channels.max(1),
+                    channels.max(1),
+                )
+                .ok()?;
+                PluginHostHandle::Clap(Arc::new(Mutex::new(host)))
+            }
+        };
         state.host = Some(host.clone());
         Some(host)
     }
@@ -2015,26 +2434,56 @@ impl DawApp {
         track_index: usize,
         effect_index: usize,
         channels: usize,
-    ) -> Option<Arc<Mutex<vst3::Vst3Host>>> {
-        let track = self.tracks.get(track_index)?;
-        let paths = track.effect_paths.clone();
+    ) -> Option<PluginHostHandle> {
         let state = self.track_audio.get_mut(track_index)?;
+        let (paths, clap_ids) = {
+            let track = self.tracks.get(track_index)?;
+            (track.effect_paths.clone(), track.effect_clap_ids.clone())
+        };
         if state.effect_hosts.len() != paths.len() {
             for host in state.effect_hosts.drain(..) {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 self.orphaned_hosts.push(host);
             }
-            for path in &paths {
-                if let Ok(host) = vst3::Vst3Host::load_with_input(
-                    path,
-                    self.settings.sample_rate as f64,
-                    self.settings.buffer_size as usize,
-                    channels,
-                    channels,
-                ) {
-                    state.effect_hosts.push(Arc::new(Mutex::new(host)));
+            for (slot, path) in paths.iter().enumerate() {
+                let kind = Self::plugin_kind_from_path(path);
+                let host = match kind {
+                    PluginKind::Vst3 => vst3::Vst3Host::load_with_input(
+                        path,
+                        self.settings.sample_rate as f64,
+                        self.settings.buffer_size as usize,
+                        channels,
+                        channels,
+                    )
+                    .ok()
+                    .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                    PluginKind::Clap => {
+                        let clap_id = clap_ids
+                            .get(slot)
+                            .and_then(|id| id.clone())
+                            .or_else(|| clap_host::default_plugin_id(path).ok());
+                        clap_id.and_then(|clap_id| {
+                            if let Some(track) = self.tracks.get_mut(track_index) {
+                                if track.effect_clap_ids.len() < paths.len() {
+                                    track.effect_clap_ids.resize(paths.len(), None);
+                                }
+                                track.effect_clap_ids[slot] = Some(clap_id.clone());
+                            }
+                            clap_host::ClapHost::load(
+                                path,
+                                &clap_id,
+                                self.settings.sample_rate as f64,
+                                self.settings.buffer_size as u32,
+                                channels,
+                                channels,
+                            )
+                            .ok()
+                            .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                        })
+                    }
+                };
+                if let Some(host) = host {
+                    state.effect_hosts.push(host);
                 }
             }
         }
@@ -2071,14 +2520,12 @@ impl DawApp {
                 continue;
             }
             if let Some(host) = self.ensure_effect_host(track_index, fx_index, 2) {
-                if let Ok(host) = host.lock() {
-                    let params = host.enumerate_params();
-                    if !params.is_empty() {
-                        let names = params.iter().map(|p| p.name.clone()).collect();
-                        let ids = params.iter().map(|p| p.id).collect();
-                        let values = params.iter().map(|p| p.default_value as f32).collect();
-                        fx_updates.push((fx_index, names, ids, values));
-                    }
+                let params = host.enumerate_params();
+                if !params.is_empty() {
+                    let names = params.iter().map(|p| p.name.clone()).collect();
+                    let ids = params.iter().map(|p| p.id).collect();
+                    let values = params.iter().map(|p| p.default_value as f32).collect();
+                    fx_updates.push((fx_index, names, ids, values));
                 }
             }
         }
@@ -2371,16 +2818,12 @@ impl DawApp {
     }
 
     fn remove_clip_and_notes_by_id(&mut self, clip_id: usize) -> Option<Clip> {
-        for track in &mut self.tracks {
+        for (track_index, track) in self.tracks.iter_mut().enumerate() {
             if let Some(pos) = track.clips.iter().position(|c| c.id == clip_id) {
                 let clip = track.clips.remove(pos);
                 if clip.is_midi {
-                    let clip_start = clip.start_beats;
-                    let clip_end = clip.start_beats + clip.length_beats;
-                    track.midi_notes.retain(|note| {
-                        let note_end = note.start_beats + note.length_beats;
-                        note.start_beats >= clip_end || note_end <= clip_start
-                    });
+                    self.sync_track_audio_notes(track_index);
+                    self.send_all_notes_off(track_index);
                 }
                 return Some(clip);
             }
@@ -2401,12 +2844,158 @@ impl DawApp {
         }
     }
 
+    fn next_clip_link_id(&self) -> usize {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().filter_map(|clip| clip.link_id))
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn ensure_clip_link_id(&mut self, track_index: usize, clip_id: usize) -> Option<usize> {
+        let existing = self
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.iter().find(|c| c.id == clip_id))
+            .and_then(|clip| clip.link_id);
+        if let Some(link_id) = existing {
+            return Some(link_id);
+        }
+        let new_id = self.next_clip_link_id();
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            if let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) {
+                clip.link_id = Some(new_id);
+            }
+        }
+        Some(new_id)
+    }
+
+    fn unique_clip_name(&self, track_index: usize, base: &str, exclude_id: usize) -> String {
+        let base = if base.trim().is_empty() { "Clip" } else { base.trim() };
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{} {}", base, suffix);
+            let exists = self
+                .tracks
+                .get(track_index)
+                .map(|track| {
+                    track
+                        .clips
+                        .iter()
+                        .any(|c| c.id != exclude_id && c.name.eq_ignore_ascii_case(&candidate))
+                })
+                .unwrap_or(false);
+            if !exists {
+                return candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+
+    fn make_clip_unique(&mut self, track_index: usize, clip_id: usize) {
+        let needs_update = self
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.iter().find(|c| c.id == clip_id))
+            .map(|clip| clip.link_id.is_some())
+            .unwrap_or(false);
+        if !needs_update {
+            return;
+        }
+        let current_name = self
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.iter().find(|c| c.id == clip_id))
+            .map(|clip| clip.name.clone())
+            .unwrap_or_else(|| "Clip".to_string());
+        let next_name = self.unique_clip_name(track_index, &current_name, clip_id);
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            if let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) {
+                clip.name = next_name;
+                clip.link_id = None;
+            }
+        }
+        self.mark_dirty();
+    }
+
+    fn sync_linked_clips_for_clip(&mut self, track_index: usize, source_clip_id: usize) {
+        let (link_id, source_start, source_len, notes_snapshot) = {
+            let track = match self.tracks.get(track_index) {
+                Some(track) => track,
+                None => return,
+            };
+            let Some(source_clip) = track.clips.iter().find(|c| c.id == source_clip_id) else {
+                return;
+            };
+            let Some(link_id) = source_clip.link_id else {
+                return;
+            };
+            (
+                link_id,
+                source_clip.start_beats,
+                source_clip.length_beats,
+                source_clip.midi_notes.clone(),
+            )
+        };
+
+        let source_end = source_start + source_len;
+        let mut pattern_notes: Vec<PianoRollNote> = Vec::new();
+        for note in &notes_snapshot {
+            let note_end = note.start_beats + note.length_beats;
+            if note.start_beats < source_end && note_end > source_start {
+                let mut relative = note.clone();
+                relative.start_beats = (relative.start_beats - source_start).max(0.0);
+                pattern_notes.push(relative);
+            }
+        }
+        if pattern_notes.is_empty() {
+            return;
+        }
+
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        for target in track
+            .clips
+            .iter_mut()
+            .filter(|c| c.link_id == Some(link_id) && c.id != source_clip_id)
+        {
+            let target_start = target.start_beats;
+            let mut shifted_notes = Vec::new();
+            for note in &pattern_notes {
+                let mut shifted = note.clone();
+                shifted.start_beats = (shifted.start_beats + target_start).max(0.0);
+                shifted_notes.push(shifted);
+            }
+            target.midi_notes = shifted_notes;
+        }
+        self.sync_track_audio_notes(track_index);
+        self.mark_dirty();
+    }
+
+    fn sync_linked_notes_after_edit(&mut self, track_index: usize) {
+        let Some(clip_id) = self.selected_clip else {
+            return;
+        };
+        let mut found_track = None;
+        for (ti, track) in self.tracks.iter().enumerate() {
+            if track.clips.iter().any(|c| c.id == clip_id) {
+                found_track = Some(ti);
+                break;
+            }
+        }
+        if found_track == Some(track_index) {
+            self.sync_linked_clips_for_clip(track_index, clip_id);
+        }
+    }
+
     fn clone_clips_by_ids(&mut self, clip_ids: &[usize]) {
-        let mut copies: Vec<(Clip, usize, f32, f32)> = Vec::new();
+        let mut copies: Vec<(Clip, usize)> = Vec::new();
         for clip_id in clip_ids {
             for (track_index, track) in self.tracks.iter().enumerate() {
                 if let Some(clip) = track.clips.iter().find(|c| c.id == *clip_id) {
-                    copies.push((clip.clone(), track_index, clip.start_beats, clip.length_beats));
+                    copies.push((clip.clone(), track_index));
                     break;
                 }
             }
@@ -2417,21 +3006,17 @@ impl DawApp {
         self.push_undo_state();
         let mut new_ids = Vec::new();
         let mut last_track = None;
-        for (mut clip, track_index, start_beats, length_beats) in copies {
+        for (mut clip, track_index) in copies {
+            let link_id = self.ensure_clip_link_id(track_index, clip.id);
             let new_id = self.next_clip_id();
             clip.id = new_id;
             clip.track = track_index;
+            clip.link_id = link_id;
             if let Some(track) = self.tracks.get_mut(track_index) {
                 track.clips.push(clip.clone());
             }
             if clip.is_midi {
-                self.copy_midi_notes_for_clip_copy(
-                    track_index,
-                    track_index,
-                    start_beats,
-                    length_beats,
-                    0.0,
-                );
+                self.sync_track_audio_notes(track_index);
             }
             new_ids.push(new_id);
             last_track = Some(track_index);
@@ -2447,92 +3032,147 @@ impl DawApp {
         self.refresh_params_for_selected_track(false);
     }
 
-    fn shift_midi_notes_for_clip_move(
-        &mut self,
-        source_track: usize,
-        target_track: usize,
-        start_beats: f32,
-        length_beats: f32,
-        delta_beats: f32,
-    ) {
-        let end_beats = start_beats + length_beats;
-        if source_track == target_track {
-            if delta_beats.abs() <= f32::EPSILON {
-                return;
-            }
-            if let Some(track) = self.tracks.get_mut(source_track) {
-                for note in &mut track.midi_notes {
-                    let note_end = note.start_beats + note.length_beats;
-                    if note.start_beats < end_beats && note_end > start_beats {
-                        note.start_beats = (note.start_beats + delta_beats).max(0.0);
-                    }
+    fn can_merge_selected_clips(&self) -> bool {
+        if self.selected_clips.len() < 2 {
+            return false;
+        }
+        let mut clips: Vec<Clip> = Vec::new();
+        let mut track_index: Option<usize> = None;
+        for clip_id in &self.selected_clips {
+            let mut found = None;
+            for (ti, track) in self.tracks.iter().enumerate() {
+                if let Some(clip) = track.clips.iter().find(|c| c.id == *clip_id) {
+                    found = Some((ti, clip.clone()));
+                    break;
                 }
             }
-            self.sync_track_audio_notes(source_track);
-            return;
-        }
-
-        let mut moved = Vec::new();
-        if let Some(track) = self.tracks.get_mut(source_track) {
-            let mut index = 0;
-            while index < track.midi_notes.len() {
-                let note = &track.midi_notes[index];
-                let note_end = note.start_beats + note.length_beats;
-                if note.start_beats < end_beats && note_end > start_beats {
-                    let mut note = track.midi_notes.remove(index);
-                    note.start_beats = (note.start_beats + delta_beats).max(0.0);
-                    moved.push(note);
-                } else {
-                    index += 1;
+            let Some((ti, clip)) = found else {
+                return false;
+            };
+            if !clip.is_midi {
+                return false;
+            }
+            if let Some(expected) = track_index {
+                if expected != ti {
+                    return false;
                 }
+            } else {
+                track_index = Some(ti);
+            }
+            clips.push(clip);
+        }
+        clips.sort_by(|a, b| a.start_beats.partial_cmp(&b.start_beats).unwrap());
+        for pair in clips.windows(2) {
+            let prev = &pair[0];
+            let next = &pair[1];
+            let prev_end = prev.start_beats + prev.length_beats;
+            if (next.start_beats - prev_end).abs() > 0.001 {
+                return false;
             }
         }
-        if let Some(track) = self.tracks.get_mut(target_track) {
-            if !moved.is_empty() {
-                track.midi_notes.extend(moved);
-                track.midi_notes.sort_by(|a, b| {
-                    a.start_beats
-                        .partial_cmp(&b.start_beats)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-        }
-        self.sync_track_audio_notes(source_track);
-        self.sync_track_audio_notes(target_track);
+        true
     }
 
-    fn copy_midi_notes_for_clip_copy(
-        &mut self,
-        source_track: usize,
-        target_track: usize,
-        start_beats: f32,
-        length_beats: f32,
-        delta_beats: f32,
-    ) {
-        let end_beats = start_beats + length_beats;
-        let mut copied = Vec::new();
-        if let Some(track) = self.tracks.get(source_track) {
-            for note in &track.midi_notes {
-                let note_end = note.start_beats + note.length_beats;
-                if note.start_beats < end_beats && note_end > start_beats {
-                    let mut note = note.clone();
-                    note.start_beats = (note.start_beats + delta_beats).max(0.0);
-                    copied.push(note);
-                }
-            }
-        }
-        if copied.is_empty() {
+    fn merge_selected_clips(&mut self) {
+        if !self.can_merge_selected_clips() {
             return;
         }
-        if let Some(track) = self.tracks.get_mut(target_track) {
-            track.midi_notes.extend(copied);
-            track.midi_notes.sort_by(|a, b| {
-                a.start_beats
-                    .partial_cmp(&b.start_beats)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+        let mut clips: Vec<Clip> = Vec::new();
+        let mut track_index: Option<usize> = None;
+        for clip_id in &self.selected_clips {
+            let mut found = None;
+            for (ti, track) in self.tracks.iter().enumerate() {
+                if let Some(clip) = track.clips.iter().find(|c| c.id == *clip_id) {
+                    found = Some((ti, clip.clone()));
+                    break;
+                }
+            }
+            let Some((ti, clip)) = found else {
+                return;
+            };
+            track_index = track_index.or(Some(ti));
+            clips.push(clip);
         }
-        self.sync_track_audio_notes(target_track);
+        let Some(track_index) = track_index else {
+            return;
+        };
+        clips.sort_by(|a, b| a.start_beats.partial_cmp(&b.start_beats).unwrap());
+        let first = clips.first().cloned();
+        let last = clips.last().cloned();
+        let (Some(first), Some(last)) = (first, last) else {
+            return;
+        };
+        let start = first.start_beats;
+        let end = last.start_beats + last.length_beats;
+        let mut merged = first.clone();
+        merged.id = self.next_clip_id();
+        merged.track = track_index;
+        merged.start_beats = start;
+        merged.length_beats = (end - start).max(0.0);
+        merged.name = if merged.name.trim().is_empty() {
+            "Merged".to_string()
+        } else {
+            merged.name.clone()
+        };
+        self.push_undo_state();
+        for clip in clips {
+            self.remove_clip_by_id(clip.id);
+        }
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.clips.push(merged.clone());
+        }
+        if merged.is_midi {
+            self.sync_track_audio_notes(track_index);
+        }
+        self.selected_clips.clear();
+        self.selected_clips.insert(merged.id);
+        self.selected_clip = Some(merged.id);
+        self.selected_track = Some(track_index);
+        self.refresh_params_for_selected_track(false);
+    }
+
+    fn crop_clip_notes_to_clip_range(&mut self, clip_id: usize, new_start: f32, new_len: f32) {
+        let new_end = new_start + new_len;
+        let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) else {
+            return;
+        };
+        let Some(clip) = self
+            .tracks
+            .get_mut(track_index)
+            .and_then(|t| t.clips.get_mut(clip_index))
+        else {
+            return;
+        };
+        let mut index = 0usize;
+        while index < clip.midi_notes.len() {
+            let note = &mut clip.midi_notes[index];
+            let note_end = note.start_beats + note.length_beats;
+            if note_end <= new_start || note.start_beats >= new_end {
+                clip.midi_notes.remove(index);
+                continue;
+            }
+            let clamped_start = note.start_beats.max(new_start);
+            let clamped_end = note_end.min(new_end);
+            let next_len = clamped_end - clamped_start;
+            if next_len <= 0.0 {
+                clip.midi_notes.remove(index);
+                continue;
+            }
+            note.start_beats = clamped_start;
+            note.length_beats = next_len;
+            index += 1;
+        }
+        self.sync_track_audio_notes(track_index);
+        self.send_all_notes_off(track_index);
+    }
+
+    fn send_all_notes_off(&self, track_index: usize) {
+        let Some(state) = self.track_audio.get(track_index) else {
+            return;
+        };
+        if let Ok(mut events) = state.midi_events.lock() {
+            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
+        }
     }
 
     fn update_clip_by_id<F>(&mut self, clip_id: usize, mut apply: F)
@@ -2545,6 +3185,30 @@ impl DawApp {
                 return;
             }
         }
+    }
+
+    fn find_clip_indices_by_id(&self, clip_id: usize) -> Option<(usize, usize)> {
+        for (track_index, track) in self.tracks.iter().enumerate() {
+            if let Some(clip_index) = track.clips.iter().position(|c| c.id == clip_id) {
+                return Some((track_index, clip_index));
+            }
+        }
+        None
+    }
+
+    fn shift_clip_notes_by_delta(&mut self, clip_id: usize, delta_beats: f32) {
+        if delta_beats.abs() <= f32::EPSILON {
+            return;
+        }
+        let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) else {
+            return;
+        };
+        if let Some(clip) = self.tracks.get_mut(track_index).and_then(|t| t.clips.get_mut(clip_index)) {
+            for note in &mut clip.midi_notes {
+                note.start_beats = (note.start_beats + delta_beats).max(0.0);
+            }
+        }
+        self.sync_track_audio_notes(track_index);
     }
 
     fn remap_track_index(index: usize, from: usize, to: usize) -> usize {
@@ -2672,10 +3336,7 @@ impl DawApp {
         let Some(host) = host else {
             return;
         };
-        let params = match host.try_lock() {
-            Ok(host) => host.enumerate_params(),
-            Err(_) => return,
-        };
+        let params = host.enumerate_params();
         if params.is_empty() {
             return;
         }
@@ -2828,7 +3489,6 @@ impl DawApp {
                         .max(0.001)
                 });
             let offset_beats = clip.audio_offset_beats.max(0.0);
-            let source_span = (clip_len / time_mul).max(0.0);
             for index in 0..count {
                 let amp = if let Some((row_left, beat_width)) = timeline {
                     let x = rect.left() + index as f32 * step;
@@ -3872,7 +4532,7 @@ impl DawApp {
                 ui.separator();
                 ui.label(&self.status);
                 if self.show_hitboxes {
-                    if let Some(host) = self.selected_track_host() {
+                    if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
                         if let Ok(host) = host.try_lock() {
                             let last = host.debug_last_param_change();
                             let count = host.debug_last_process_param_count();
@@ -3931,7 +4591,9 @@ impl DawApp {
                 self.show_plugin_ui = false;
                 self.plugin_ui_hidden = true;
                 if is_window_alive(ui_host.hwnd) {
-                    ui_host.editor.set_focus(false);
+                    if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                        editor.set_focus(false);
+                    }
                     hide_plugin_window(ui_host.hwnd);
                 } else {
                     self.destroy_plugin_ui();
@@ -3952,7 +4614,9 @@ impl DawApp {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 self.plugin_ui_hidden = true;
                 if is_window_alive(ui_host.hwnd) {
-                    ui_host.editor.set_focus(false);
+                    if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                        editor.set_focus(false);
+                    }
                     hide_plugin_window(ui_host.hwnd);
                 } else {
                     self.destroy_plugin_ui();
@@ -3982,7 +4646,9 @@ impl DawApp {
         }
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
-                ui_host.editor.set_focus(false);
+                if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                    editor.set_focus(false);
+                }
                 hide_plugin_window(ui_host.hwnd);
             }
             if self.plugin_ui.is_some() {
@@ -4017,14 +4683,47 @@ impl DawApp {
             pump_plugin_messages(ui_host.hwnd);
             show_plugin_window(ui_host.hwnd);
             bring_window_to_front(ui_host.hwnd);
-            ui_host.editor.set_focus(true);
-            if let Some((cw, ch)) = client_window_size(ui_host.child_hwnd) {
-                ui_host.editor.set_size(cw, ch);
+            match &ui_host.editor {
+                PluginUiEditor::Vst3(editor) => {
+                    editor.set_focus(true);
+                    if let Some((cw, ch)) = client_window_size(ui_host.child_hwnd) {
+                        editor.set_size(cw, ch);
+                    }
+                }
+                PluginUiEditor::Clap => {
+                    if let PluginHostHandle::Clap(host) = &ui_host.host {
+                        if let Ok(mut host) = host.lock() {
+                            if let Some((gw, gh)) = host.take_gui_resize() {
+                                move_plugin_child_window(
+                                    ui_host.child_hwnd,
+                                    0,
+                                    0,
+                                    gw.max(200),
+                                    gh.max(120),
+                                );
+                                resize_plugin_top_window(ui_host.hwnd, gw.max(200), gh.max(120));
+                            }
+                            host.show_gui();
+                        }
+                    }
+                }
             }
             invalidate_plugin_window(ui_host.child_hwnd);
             invalidate_plugin_window(ui_host.hwnd);
         }
-        self.ensure_plugin_ui();
+        if self.show_plugin_ui {
+            let desired_target = self
+                .plugin_ui_target
+                .or_else(|| self.selected_track.map(PluginUiTarget::Instrument));
+            let needs_open = match (self.plugin_ui.as_ref(), desired_target) {
+                (None, Some(_)) => true,
+                (Some(ui_host), Some(target)) => ui_host.target != target,
+                _ => false,
+            };
+            if needs_open {
+                self.ensure_plugin_ui();
+            }
+        }
 
         let mut open = self.show_plugin_ui;
         let mut close_editor = false;
@@ -4043,7 +4742,9 @@ impl DawApp {
                 {
                     if let Some(ui_host) = self.plugin_ui.as_ref() {
                         bring_window_to_front(ui_host.hwnd);
-                        ui_host.editor.set_focus(true);
+                        if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                            editor.set_focus(true);
+                        }
                     }
                 }
                 if ui
@@ -4059,7 +4760,9 @@ impl DawApp {
             });
         if close_editor {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
-                ui_host.editor.set_focus(false);
+                if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                    editor.set_focus(false);
+                }
                 hide_plugin_window(ui_host.hwnd);
                 release_mouse_capture();
             }
@@ -4072,7 +4775,9 @@ impl DawApp {
         self.show_plugin_ui = open;
         if !self.show_plugin_ui {
             if let Some(ui_host) = self.plugin_ui.as_ref() {
-                ui_host.editor.set_focus(false);
+                if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                    editor.set_focus(false);
+                }
                 hide_plugin_window(ui_host.hwnd);
             }
             if self.plugin_ui.is_some() {
@@ -4109,79 +4814,157 @@ impl DawApp {
             }
         };
         let Some(host) = host else {
-            self.status = "No VST3 host for UI".to_string();
+            self.status = "No plugin host for UI".to_string();
             return;
         };
-        let mut editor = {
-            let host_guard = match host.try_lock() {
-                Ok(host) => host,
-                Err(_) => {
-                    self.status = "Plugin busy; try again".to_string();
+
+        match &host {
+            PluginHostHandle::Vst3(vst_host) => {
+                let mut editor = {
+                    let host_guard = match vst_host.try_lock() {
+                        Ok(host) => host,
+                        Err(_) => {
+                            self.status = "Plugin busy; try again".to_string();
+                            return;
+                        }
+                    };
+                    match host_guard.create_editor() {
+                        Some(editor) => editor,
+                        None => {
+                            self.status = "Plugin has no UI".to_string();
+                            return;
+                        }
+                    }
+                };
+                let (w, h) = editor.get_size().unwrap_or((520, 360));
+                eprintln!("Plugin UI size hint: {w}x{h}");
+                let hwnd = match create_plugin_top_window(w, h) {
+                    Some(hwnd) => hwnd,
+                    None => {
+                        self.status = "Failed to create plugin UI window".to_string();
+                        return;
+                    }
+                };
+                resize_plugin_top_window(hwnd, w.max(200), h.max(120));
+                eprintln!("Plugin UI window hwnd={hwnd}");
+                let mut child_hwnd = match create_plugin_child_window(hwnd) {
+                    Some(child_hwnd) => child_hwnd,
+                    None => {
+                        self.status = "Failed to create plugin UI child window".to_string();
+                        destroy_plugin_child_window(hwnd);
+                        return;
+                    }
+                };
+                move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
+                let mut attached = editor.attach_hwnd(child_hwnd).is_ok();
+                if !attached {
+                    destroy_plugin_child_window(child_hwnd);
+                    child_hwnd = hwnd;
+                    attached = editor.attach_hwnd(child_hwnd).is_ok();
+                }
+                if !attached {
+                    self.status = "VST3 view attach failed".to_string();
+                    destroy_plugin_child_window(hwnd);
                     return;
                 }
-            };
-            match host_guard.create_editor() {
-                Some(editor) => editor,
-                None => {
-                    self.status = "Plugin has no UI".to_string();
+                eprintln!("Plugin UI attached");
+                let (cw, ch) = client_window_size(child_hwnd).unwrap_or((w, h));
+                editor.set_size(cw, ch);
+                editor.set_focus(true);
+                bring_window_to_front(hwnd);
+                invalidate_plugin_window(child_hwnd);
+                invalidate_plugin_window(hwnd);
+                let close_requested = Arc::new(AtomicBool::new(false));
+                set_plugin_close_flag(hwnd, &close_requested);
+                self.plugin_ui = Some(PluginUiHost {
+                    hwnd,
+                    child_hwnd,
+                    editor: PluginUiEditor::Vst3(editor),
+                    host: host.clone(),
+                    target,
+                    close_requested,
+                });
+            }
+            PluginHostHandle::Clap(clap_host) => {
+                let (w, h) = clap_host
+                    .lock()
+                    .ok()
+                    .and_then(|host| host.gui_size())
+                    .unwrap_or((520, 360));
+                eprintln!("CLAP UI size hint: {w}x{h}");
+                let hwnd = match create_plugin_top_window(w, h) {
+                    Some(hwnd) => hwnd,
+                    None => {
+                        self.status = "Failed to create plugin UI window".to_string();
+                        return;
+                    }
+                };
+                resize_plugin_top_window(hwnd, w.max(200), h.max(120));
+                let mut child_hwnd = match create_plugin_child_window(hwnd) {
+                    Some(child_hwnd) => child_hwnd,
+                    None => {
+                        self.status = "Failed to create plugin UI child window".to_string();
+                        destroy_plugin_child_window(hwnd);
+                        return;
+                    }
+                };
+                move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
+                let mut attached = false;
+                if let Ok(mut host) = clap_host.lock() {
+                    attached = host.open_gui(child_hwnd).is_ok();
+                    if !attached {
+                        destroy_plugin_child_window(child_hwnd);
+                        child_hwnd = hwnd;
+                        attached = host.open_gui(hwnd).is_ok();
+                    }
+                    if attached {
+                        if let Some((gw, gh)) = host.gui_size() {
+                            let target_hwnd = if host.gui_embedded() { child_hwnd } else { hwnd };
+                            move_plugin_child_window(target_hwnd, 0, 0, gw.max(200), gh.max(120));
+                            resize_plugin_top_window(hwnd, gw.max(200), gh.max(120));
+                        }
+                    }
+                }
+                if !attached {
+                    self.status = "CLAP view attach failed".to_string();
+                    destroy_plugin_child_window(hwnd);
+                    self.show_plugin_ui = false;
+                    self.plugin_ui_hidden = false;
                     return;
                 }
+                bring_window_to_front(hwnd);
+                invalidate_plugin_window(child_hwnd);
+                invalidate_plugin_window(hwnd);
+                let close_requested = Arc::new(AtomicBool::new(false));
+                set_plugin_close_flag(hwnd, &close_requested);
+                self.plugin_ui = Some(PluginUiHost {
+                    hwnd,
+                    child_hwnd,
+                    editor: PluginUiEditor::Clap,
+                    host: host.clone(),
+                    target,
+                    close_requested,
+                });
             }
-        };
-        let (w, h) = editor.get_size().unwrap_or((520, 360));
-        eprintln!("Plugin UI size hint: {w}x{h}");
-        let hwnd = match create_plugin_top_window(w, h) {
-            Some(hwnd) => hwnd,
-            None => {
-                self.status = "Failed to create plugin UI window".to_string();
-                return;
-            }
-        };
-        eprintln!("Plugin UI window hwnd={hwnd}");
-        let mut child_hwnd = match create_plugin_child_window(hwnd) {
-            Some(child_hwnd) => child_hwnd,
-            None => {
-                self.status = "Failed to create plugin UI child window".to_string();
-                destroy_plugin_child_window(hwnd);
-                return;
-            }
-        };
-        move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
-        let mut attached = editor.attach_hwnd(child_hwnd).is_ok();
-        if !attached {
-            destroy_plugin_child_window(child_hwnd);
-            child_hwnd = hwnd;
-            attached = editor.attach_hwnd(child_hwnd).is_ok();
         }
-        if !attached {
-            self.status = "VST3 view attach failed".to_string();
-            destroy_plugin_child_window(hwnd);
-            return;
-        }
-        eprintln!("Plugin UI attached");
-        let (cw, ch) = client_window_size(child_hwnd).unwrap_or((w, h));
-        editor.set_size(cw, ch);
-        editor.set_focus(true);
-        bring_window_to_front(hwnd);
-        invalidate_plugin_window(child_hwnd);
-        invalidate_plugin_window(hwnd);
-        let close_requested = Arc::new(AtomicBool::new(false));
-        set_plugin_close_flag(hwnd, &close_requested);
-        self.plugin_ui = Some(PluginUiHost {
-            hwnd,
-            child_hwnd,
-            editor,
-            host: host.clone(),
-            target,
-            close_requested,
-        });
     }
 
     fn destroy_plugin_ui(&mut self) {
         let Some(mut ui_host) = self.plugin_ui.take() else {
             return;
         };
-        ui_host.editor.removed();
+        match &mut ui_host.editor {
+            PluginUiEditor::Vst3(editor) => {
+                editor.removed();
+            }
+            PluginUiEditor::Clap => {
+                if let PluginHostHandle::Clap(host) = &ui_host.host {
+                    if let Ok(mut host) = host.lock() {
+                        host.destroy_gui();
+                    }
+                }
+            }
+        }
         if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
             destroy_plugin_child_window(ui_host.child_hwnd);
         }
@@ -5018,6 +5801,107 @@ impl DawApp {
                         );
                     }
                 }
+
+                ui.separator();
+                let master_color = egui::Color32::from_rgb(200, 210, 230);
+                let master_fill = egui::Color32::from_rgba_premultiplied(40, 50, 70, 80);
+                egui::Frame::none()
+                    .fill(master_fill)
+                    .rounding(egui::Rounding::same(0.0))
+                    .inner_margin(egui::Margin::symmetric(6.0, 0.0))
+                    .show(ui, |ui| {
+                        let (label_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 18.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(label_rect, 0.0, master_fill);
+                        Self::outlined_text(
+                            ui.painter(),
+                            egui::pos2(label_rect.left() + 6.0, label_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Master",
+                            egui::FontId::proportional(BASE_UI_FONT_SIZE),
+                            master_color,
+                        );
+
+                        if let Ok(mut master) = self.master_settings.lock() {
+                            let level_response = ui.add_sized(
+                                [ui.available_width(), 12.0],
+                                egui::Slider::new(&mut master.level, 0.0..=1.5).text("Level"),
+                            );
+                            if level_response.changed() || level_response.dragged() {
+                                mix_dirty = true;
+                            }
+                            let meter_height = 12.0;
+                            let (meter_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), meter_height),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                meter_rect,
+                                3.0,
+                                egui::Color32::from_rgb(16, 20, 24),
+                            );
+                            let peak = self.master_peak_display.clamp(0.0, 1.0);
+                            let fill_w = meter_rect.width() * peak;
+                            if fill_w > 0.0 {
+                                let color = if peak > 0.9 {
+                                    egui::Color32::from_rgb(255, 90, 64)
+                                } else if peak > 0.7 {
+                                    egui::Color32::from_rgb(250, 200, 80)
+                                } else {
+                                    egui::Color32::from_rgb(90, 210, 120)
+                                };
+                                let fill_rect = egui::Rect::from_min_size(
+                                    meter_rect.min,
+                                    egui::vec2(fill_w, meter_rect.height()),
+                                );
+                                ui.painter().rect_filled(fill_rect, 2.0, color);
+                            }
+                            ui.separator();
+                            ui.checkbox(&mut master.enabled, "Compressor");
+                            ui.horizontal(|ui| {
+                                ui.label("Thresh (dB)");
+                                ui.add(
+                                    egui::DragValue::new(&mut master.threshold_db)
+                                        .speed(0.5)
+                                        .clamp_range(-60.0..=0.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Ratio");
+                                ui.add(
+                                    egui::DragValue::new(&mut master.ratio)
+                                        .speed(0.1)
+                                        .clamp_range(1.0..=20.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Attack (ms)");
+                                ui.add(
+                                    egui::DragValue::new(&mut master.attack_ms)
+                                        .speed(0.5)
+                                        .clamp_range(1.0..=200.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Release (ms)");
+                                ui.add(
+                                    egui::DragValue::new(&mut master.release_ms)
+                                        .speed(1.0)
+                                        .clamp_range(10.0..=1000.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Makeup (dB)");
+                                ui.add(
+                                    egui::DragValue::new(&mut master.makeup_db)
+                                        .speed(0.5)
+                                        .clamp_range(-12.0..=12.0),
+                                );
+                            });
+                        }
+                    });
             });
 
             if let Some(action) = action {
@@ -5042,9 +5926,7 @@ impl DawApp {
                         }
                         if let Some(state) = self.track_audio.get_mut(index) {
                             if let Some(host) = state.host.take() {
-                                if let Ok(mut host) = host.lock() {
-                                    host.prepare_for_drop();
-                                }
+                                host.prepare_for_drop();
                                 self.orphaned_hosts.push(host);
                             }
                         }
@@ -5062,6 +5944,9 @@ impl DawApp {
                             if fx_index < track.effect_paths.len() {
                                 track.effect_paths.remove(fx_index);
                             }
+                            if fx_index < track.effect_clap_ids.len() {
+                                track.effect_clap_ids.remove(fx_index);
+                            }
                             if fx_index < track.effect_bypass.len() {
                                 track.effect_bypass.remove(fx_index);
                             }
@@ -5078,9 +5963,7 @@ impl DawApp {
                         if let Some(state) = self.track_audio.get_mut(index) {
                             if fx_index < state.effect_hosts.len() {
                                 let host = state.effect_hosts.remove(fx_index);
-                                if let Ok(mut host) = host.lock() {
-                                    host.prepare_for_drop();
-                                }
+                                host.prepare_for_drop();
                                 self.orphaned_hosts.push(host);
                             }
                         }
@@ -5107,6 +5990,9 @@ impl DawApp {
                                 }
                                 if target_index < track.effect_param_values.len() {
                                     track.effect_param_values.swap(fx_index, target_index);
+                                }
+                                if target_index < track.effect_clap_ids.len() {
+                                    track.effect_clap_ids.swap(fx_index, target_index);
                                 }
                                 moved = true;
                             }
@@ -5190,7 +6076,7 @@ impl DawApp {
                 let icon_tint = egui::Color32::from_gray(220);
                 let mut tool_button = |tool: ArrangerTool, icon: egui::ImageSource<'static>, label: &str| {
                     let selected = self.arranger_tool == tool;
-                    let mut button = egui::Button::image_and_text(
+                    let button = egui::Button::image_and_text(
                         egui::Image::new(icon).fit_to_exact_size(icon_size).tint(icon_tint),
                         label,
                     )
@@ -5283,22 +6169,32 @@ impl DawApp {
                 }
             }
             let view_width = (rect.width() - lane_label_w - 8.0).max(1.0);
-            let min_zoom = (view_width - 160.0).max(1.0)
-                / (max_end_beats.max(0.25) * 22.0);
-            self.arranger_zoom = self.arranger_zoom.clamp(min_zoom.clamp(0.05, 4.0), 4.0);
+            self.arranger_zoom = self.arranger_zoom.clamp(0.05, 4.0);
             let beat_width = 22.0 * self.arranger_zoom;
-            let mut minor_step = 0.25;
-            while beat_width * minor_step < 28.0 {
-                minor_step *= 2.0;
-            }
-            while beat_width * minor_step > 96.0 && minor_step > 0.25 {
-                minor_step *= 0.5;
-            }
-            let major_step = minor_step * 4.0;
-            let arranger_snap = if self.arranger_snap_beats < 0.0 {
-                minor_step
+            let beats_per_view = view_width / beat_width.max(0.001);
+            let draw_step = if beats_per_view >= 64.0 {
+                16.0
+            } else if beats_per_view >= 32.0 {
+                4.0
+            } else if beats_per_view >= 20.0 {
+                2.0
+            } else if beats_per_view >= 12.0 {
+                1.0
+            } else if beats_per_view >= 8.0 {
+                0.5
             } else {
-                self.arranger_snap_beats
+                0.25
+            };
+            let major_step = 4.0f32;
+            let band_step = if draw_step >= major_step {
+                draw_step
+            } else {
+                major_step
+            };
+            let arranger_snap = if self.arranger_snap_beats.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                draw_step
             };
             let content_width = max_end_beats * beat_width + 160.0;
             let min_pan_x = (view_width - content_width).min(0.0);
@@ -5456,10 +6352,14 @@ impl DawApp {
                 egui::pos2(grid_left, grid_bottom),
             );
             let shelf_painter = painter.with_clip_rect(shelf_clip);
-            let major_div = (major_step / minor_step).round() as i32;
+            let major_div = if draw_step >= major_step {
+                1
+            } else {
+                (major_step / draw_step).round() as i32
+            };
             let mut minor_index = 0;
             let mut x = row_left;
-            let step_px = beat_width * minor_step;
+            let step_px = beat_width * draw_step;
             while x <= grid_right {
                 let major = major_div > 0 && minor_index % major_div == 0;
                 let line_x = x.round() + 0.5;
@@ -5476,7 +6376,7 @@ impl DawApp {
                 if major {
                     let band_rect = egui::Rect::from_min_max(
                         egui::pos2(x, grid_top),
-                        egui::pos2(x + beat_width * major_step, grid_bottom),
+                        egui::pos2(x + beat_width * band_step, grid_bottom),
                     );
                     let band_index = if major_div > 0 { minor_index / major_div } else { 0 };
                     let band_color = if band_index % 2 == 0 {
@@ -5522,7 +6422,7 @@ impl DawApp {
                 egui::pos2(row_left, header_rect.top()),
                 egui::pos2(header_rect.right(), header_rect.bottom()),
             );
-            let header_painter = painter.with_clip_rect(timeline_clip);
+            let _header_painter = painter.with_clip_rect(timeline_clip);
 
             let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
             if !dropped_files.is_empty() {
@@ -5595,8 +6495,8 @@ impl DawApp {
                 }
                 match *row {
                     ArrangerRow::Track { track_index } => {
-                        let (track_clips, track_midi_notes) = match self.tracks.get(track_index) {
-                            Some(track) => (track.clips.clone(), track.midi_notes.clone()),
+                        let track_clips = match self.tracks.get(track_index) {
+                            Some(track) => track.clips.clone(),
                             None => continue,
                         };
                         clip_painter.rect_filled(row_rect, 0.0, egui::Color32::from_rgb(0, 0, 0));
@@ -5722,47 +6622,15 @@ impl DawApp {
                             );
                             if clip.is_midi {
                                 let preview_rect = body_rect.shrink2(egui::vec2(6.0, 6.0));
-                                let mut preview_notes: Option<Vec<PianoRollNote>> = None;
-                                if let Some(drag) = self.clip_drag.as_ref() {
-                                    if drag.copy_mode && drag.clip_id == clip.id {
-                                        if let Some(origin) = self.tracks.get(drag.origin_track) {
-                                            let origin_start = drag.origin_start_beats;
-                                            let origin_end = drag.origin_start_beats + drag.origin_length_beats;
-                                            let delta = drag.start_beats - drag.origin_start_beats;
-                                            let mut notes = Vec::new();
-                                            for note in &origin.midi_notes {
-                                                let note_end = note.start_beats + note.length_beats;
-                                                if note.start_beats < origin_end && note_end > origin_start {
-                                                    let mut note = note.clone();
-                                                    note.start_beats = (note.start_beats + delta).max(0.0);
-                                                    notes.push(note);
-                                                }
-                                            }
-                                            preview_notes = Some(notes);
-                                        }
-                                    }
-                                }
-                                if let Some(notes) = preview_notes.as_ref() {
-                                    self.draw_midi_preview(
-                                        &clip_painter,
-                                        preview_rect,
-                                        notes,
-                                        clip.start_beats,
-                                        clip.length_beats,
-                                        clip_x,
-                                        beat_width,
-                                    );
-                                } else {
-                                    self.draw_midi_preview(
-                                        &clip_painter,
-                                        preview_rect,
-                                        &track_midi_notes,
-                                        clip.start_beats,
-                                        clip.length_beats,
-                                        clip_x,
-                                        beat_width,
-                                    );
-                                }
+                                self.draw_midi_preview(
+                                    &clip_painter,
+                                    preview_rect,
+                                    &clip.midi_notes,
+                                    clip.start_beats,
+                                    clip.length_beats,
+                                    clip_x,
+                                    beat_width,
+                                );
                             } else {
                                 let preview_rect = body_rect.shrink2(egui::vec2(6.0, 8.0));
                                 let waveform = self.get_waveform_for_clip(clip);
@@ -5901,17 +6769,12 @@ impl DawApp {
                                             let new_id = this.next_clip_id();
                                             copy.id = new_id;
                                             copy.track = ti;
+                                            copy.link_id = this.ensure_clip_link_id(ti, selected_id);
                                             if let Some(track) = this.tracks.get_mut(ti) {
                                                 track.clips.push(copy.clone());
                                             }
                                             if copy.is_midi {
-                                                this.copy_midi_notes_for_clip_copy(
-                                                    ti,
-                                                    ti,
-                                                    copy.start_beats,
-                                                    copy.length_beats,
-                                                    0.0,
-                                                );
+                                                this.sync_track_audio_notes(ti);
                                             }
                                             group_items.push(ClipDragGroupItem {
                                                 clip_id: new_id,
@@ -5939,10 +6802,15 @@ impl DawApp {
                                     if shift_copy && kind == ClipDragKind::Move {
                                         if group.is_none() {
                                             let new_id = this.next_clip_id();
+                                            let link_id = this.ensure_clip_link_id(track_index, clip.id);
                                             if let Some(track) = this.tracks.get_mut(track_index) {
                                                 let mut copy = clip.clone();
                                                 copy.id = new_id;
+                                                copy.link_id = link_id;
                                                 track.clips.push(copy);
+                                                if clip.is_midi {
+                                                    this.sync_track_audio_notes(track_index);
+                                                }
                                                 clip_id = new_id;
                                                 copy_mode = true;
                                                 undo_pushed = true;
@@ -6048,6 +6916,37 @@ impl DawApp {
                                         vec![clip.id]
                                     };
                                     self.clone_clips_by_ids(&clone_ids);
+                                    ui.close_menu();
+                                }
+                                if clip.link_id.is_some() {
+                                    if ui
+                                        .add(egui::Button::image_and_text(
+                                            egui::Image::new(egui::include_image!("../../icons/link-2.svg"))
+                                                .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                                                .tint(base),
+                                            egui::RichText::new("Make Unique").color(base),
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.make_clip_unique(track_index, clip.id);
+                                        ui.close_menu();
+                                    }
+                                }
+                                let can_merge = self.can_merge_selected_clips()
+                                    && self.selected_clips.contains(&clip.id);
+                                if ui
+                                    .add_enabled(
+                                        can_merge,
+                                        egui::Button::image_and_text(
+                                            egui::Image::new(egui::include_image!("../../icons/git-merge.svg"))
+                                                .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                                                .tint(base),
+                                            egui::RichText::new("Merge Clips").color(base),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.merge_selected_clips();
                                     ui.close_menu();
                                 }
                                 if ui
@@ -6313,6 +7212,8 @@ impl DawApp {
                                 start_beats: start,
                                 length_beats: (end - start).max(min_len),
                                 is_midi: true,
+                                midi_notes: Vec::new(),
+                                link_id: None,
                                 name: "MIDI Clip".to_string(),
                                 audio_path: None,
                                 audio_source_beats: None,
@@ -6355,60 +7256,52 @@ impl DawApp {
                 ],
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 30, 34)),
             );
-            let mut bar_index = 0;
-            let mut bar_x = row_left;
-            while bar_x <= rect.right() - 8.0 {
-                if bar_index % 4 == 0 {
-                    let bar = bar_index / 4 + 1;
-                    Self::outlined_text(
-                        &header_painter,
-                        egui::pos2(bar_x + 4.0, header_rect.top() + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        &format!("{bar}"),
-                        egui::FontId::proportional(BASE_UI_FONT_SIZE),
-                        egui::Color32::from_gray(160),
-                    );
-                }
-                bar_index += 1;
-                bar_x += beat_width;
-            }
-
             // Overlay timeline bar and grid/loop/playhead lines above clips.
             let timeline_overlay_rect = header_rect;
             painter.rect_filled(timeline_overlay_rect, 0.0, egui::Color32::from_rgb(0, 0, 0));
             let overlay_painter = painter.with_clip_rect(timeline_clip);
             let mut overlay_x = row_left;
-            let mut overlay_index = 0;
+            let mut overlay_step_index = 0i32;
+            let overlay_major_div = if draw_step >= major_step {
+                1
+            } else {
+                (major_step / draw_step).round() as i32
+            };
             while overlay_x <= rect.right() - 8.0 {
-                let major = overlay_index % 4 == 0;
+                let major = overlay_major_div > 0 && overlay_step_index % overlay_major_div == 0;
                 let line_x = overlay_x.round() + 0.5;
                 let line_width = if major { 2.0 } else { 1.0 };
                 let color = if major {
                     egui::Color32::from_rgba_premultiplied(48, 52, 60, 170)
                 } else {
-                    egui::Color32::from_rgba_premultiplied(32, 36, 44, 140)
+                    egui::Color32::from_rgba_premultiplied(32, 36, 44, 120)
                 };
                 if major {
-                    let bar_rect = egui::Rect::from_min_max(
+                    let band_rect = egui::Rect::from_min_max(
                         egui::pos2(overlay_x, timeline_overlay_rect.top()),
                         egui::pos2(
-                            (overlay_x + beat_width * 4.0).min(timeline_overlay_rect.right()),
+                            (overlay_x + beat_width * band_step).min(timeline_overlay_rect.right()),
                             timeline_overlay_rect.bottom(),
                         ),
                     );
-                    let shade = if (overlay_index / 4) % 2 == 0 {
+                    let band_index = if overlay_major_div > 0 {
+                        overlay_step_index / overlay_major_div
+                    } else {
+                        0
+                    };
+                    let shade = if band_index % 2 == 0 {
                         egui::Color32::from_rgb(8, 8, 8)
                     } else {
                         egui::Color32::from_rgb(0, 0, 0)
                     };
-                    overlay_painter.rect_filled(bar_rect, 0.0, shade);
+                    overlay_painter.rect_filled(band_rect, 0.0, shade);
                 }
                 grid_painter.line_segment(
                     [egui::pos2(line_x, grid_top), egui::pos2(line_x, grid_bottom)],
                     egui::Stroke::new(line_width, color),
                 );
                 if major {
-                    let bar = overlay_index / 4 + 1;
+                    let bar = ((overlay_step_index as f32 * draw_step) / 4.0).floor() as i32 + 1;
                     Self::outlined_text(
                         &overlay_painter,
                         egui::pos2(overlay_x + 4.0, timeline_overlay_rect.top() + 2.0),
@@ -6418,8 +7311,8 @@ impl DawApp {
                         egui::Color32::from_gray(200),
                     );
                 }
-                overlay_index += 1;
-                overlay_x += beat_width;
+                overlay_step_index += 1;
+                overlay_x += beat_width * draw_step;
             }
             painter.line_segment(
                 [
@@ -6618,25 +7511,26 @@ impl DawApp {
                 }
             }
 
-            if let Some((mut copy, source_track, target_track, delta, source_start, source_len)) =
+            if let Some((mut copy, source_track, target_track, delta, _source_start, _source_len)) =
                 pending_stamp_copy
             {
+                let source_clip_id = copy.id;
+                let link_id = self.ensure_clip_link_id(source_track, source_clip_id);
                 let new_id = self.next_clip_id();
                 copy.id = new_id;
                 copy.track = target_track;
-                copy.start_beats = (source_start + delta).max(0.0);
+                let base_start = copy.start_beats;
+                copy.start_beats = (base_start + delta).max(0.0);
+                copy.link_id = link_id;
                 self.push_undo_state();
                 if let Some(track) = self.tracks.get_mut(target_track) {
                     track.clips.push(copy.clone());
                 }
                 if copy.is_midi {
-                    self.copy_midi_notes_for_clip_copy(
-                        source_track,
-                        target_track,
-                        source_start,
-                        source_len,
-                        delta,
-                    );
+                    self.shift_clip_notes_by_delta(new_id, delta);
+                }
+                if copy.is_midi {
+                    self.sync_track_audio_notes(target_track);
                 }
                 pending_select = Some((new_id, target_track, false));
                 switch_to_move = true;
@@ -6733,31 +7627,30 @@ impl DawApp {
                                 let new_start = snap_value(raw_start).max(0.0);
                                 let delta = new_start - drag.start_beats;
                                 if let Some(group) = drag.group.as_mut() {
-                                    let track_delta = target_track as i32 - drag.source_track as i32;
                                     for item in group.iter_mut() {
-                                        let new_track = (item.source_track as i32 + track_delta)
-                                            .clamp(0, (self.tracks.len().saturating_sub(1)) as i32)
-                                            as usize;
+                                        let old_track = item.source_track;
+                                        let new_track = item.source_track;
                                         let new_item_start = (item.start_beats + delta).max(0.0);
                                         if item.is_midi
                                             && (delta.abs() > f32::EPSILON
                                                 || new_track != item.source_track)
                                         {
-                                            self.shift_midi_notes_for_clip_move(
-                                                item.source_track,
-                                                new_track,
-                                                item.start_beats,
-                                                item.length_beats,
-                                                delta,
-                                            );
+                                            self.shift_clip_notes_by_delta(item.clip_id, delta);
                                         }
                                         self.move_clip_by_id(item.clip_id, new_track, new_item_start);
+                                        if item.is_midi {
+                                            self.sync_track_audio_notes(old_track);
+                                            if new_track != old_track {
+                                                self.sync_track_audio_notes(new_track);
+                                            }
+                                        }
                                         item.start_beats = new_item_start;
                                         item.source_track = new_track;
                                     }
                                     drag.source_track = target_track;
                                     drag.start_beats = new_start;
                                 } else {
+                                    let old_track = drag.source_track;
                                     let is_midi = self
                                         .tracks
                                         .get(drag.source_track)
@@ -6765,19 +7658,18 @@ impl DawApp {
                                         .map(|clip| clip.is_midi)
                                         .unwrap_or(false);
                                     if is_midi
-                                        && !drag.copy_mode
                                         && (delta.abs() > f32::EPSILON
                                             || target_track != drag.source_track)
                                     {
-                                        self.shift_midi_notes_for_clip_move(
-                                            drag.source_track,
-                                            target_track,
-                                            drag.start_beats,
-                                            drag.length_beats,
-                                            delta,
-                                        );
+                                        self.shift_clip_notes_by_delta(drag.clip_id, delta);
                                     }
                                     self.move_clip_by_id(drag.clip_id, target_track, new_start);
+                                    if is_midi {
+                                        self.sync_track_audio_notes(old_track);
+                                        if target_track != old_track {
+                                            self.sync_track_audio_notes(target_track);
+                                        }
+                                    }
                                     drag.source_track = target_track;
                                     drag.start_beats = new_start;
                                 }
@@ -6837,6 +7729,25 @@ impl DawApp {
                     }
                 }
                 if pointer_released || !pointer_down {
+                    if matches!(
+                        drag.kind,
+                        ClipDragKind::ResizeStart
+                            | ClipDragKind::ResizeEnd
+                            | ClipDragKind::TrimStart
+                            | ClipDragKind::TrimEnd
+                    ) {
+                        if let Some(track) = self.tracks.get(drag.source_track) {
+                            if let Some(clip) = track.clips.iter().find(|c| c.id == drag.clip_id) {
+                                if clip.is_midi {
+                                    self.crop_clip_notes_to_clip_range(
+                                        clip.id,
+                                        clip.start_beats,
+                                        clip.length_beats,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if drag.copy_mode {
                         let is_midi = self
                             .tracks
@@ -6844,16 +7755,7 @@ impl DawApp {
                             .and_then(|track| track.clips.iter().find(|c| c.id == drag.clip_id))
                             .map(|clip| clip.is_midi)
                             .unwrap_or(false);
-                        if is_midi {
-                            let delta = drag.start_beats - drag.origin_start_beats;
-                            self.copy_midi_notes_for_clip_copy(
-                                drag.origin_track,
-                                drag.source_track,
-                                drag.origin_start_beats,
-                                drag.origin_length_beats,
-                                delta,
-                            );
-                        }
+                        let _ = is_midi;
                     }
                     self.clip_drag = None;
                 } else {
@@ -6926,7 +7828,7 @@ impl DawApp {
                     let icon_tint = egui::Color32::from_gray(220);
                     let mut tool_button = |tool: PianoTool, icon: egui::ImageSource<'static>, label: &str| {
                         let selected = self.piano_tool == tool;
-                        let mut button = egui::Button::image_and_text(
+                        let button = egui::Button::image_and_text(
                             egui::Image::new(icon).fit_to_exact_size(icon_size).tint(icon_tint),
                             label,
                         )
@@ -7090,9 +7992,7 @@ impl DawApp {
                                     }
                                     if let Some(state) = self.track_audio.get_mut(index) {
                                         if let Some(host) = state.host.take() {
-                                            if let Ok(mut host) = host.lock() {
-                                                host.prepare_for_drop();
-                                            }
+                                            host.prepare_for_drop();
                                             self.orphaned_hosts.push(host);
                                         }
                                     }
@@ -7103,7 +8003,7 @@ impl DawApp {
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             self.ensure_live_params();
-                            let host_change = if let Some(host) = self.selected_track_host() {
+                            let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
                                 if let Ok(mut host) = host.try_lock() {
                                     host.take_last_param_change()
                                 } else {
@@ -7315,7 +8215,9 @@ impl DawApp {
                                             if let Some(state) =
                                                 selected_track_index.and_then(|i| self.track_audio.get(i))
                                             {
-                                                if let Some(host) = state.host.as_ref() {
+                                                if let Some(PluginHostHandle::Vst3(host)) =
+                                                    state.host.as_ref()
+                                                {
                                                     if let Ok(host) = host.try_lock() {
                                                         if let Some((channel, controller)) =
                                                             host.param_to_cc(param_id)
@@ -7590,7 +8492,7 @@ impl DawApp {
                     let icon = egui::Image::new(Self::note_icon_source(value))
                         .fit_to_exact_size(note_icon_size)
                         .tint(note_icon_tint);
-                    let mut button = egui::Button::image(icon)
+                    let button = egui::Button::image(icon)
                         .min_size(note_button_size)
                         .fill(if selected { note_button_on } else { note_button_bg });
                     let response = ui
@@ -7627,7 +8529,7 @@ impl DawApp {
                     let icon = egui::Image::new(Self::note_icon_source(value))
                         .fit_to_exact_size(note_icon_size)
                         .tint(note_icon_tint);
-                    let mut button = egui::Button::image(icon)
+                    let button = egui::Button::image(icon)
                         .min_size(note_button_size)
                         .fill(if selected { note_button_on } else { note_button_bg });
                     let response = ui
@@ -7812,9 +8714,7 @@ impl DawApp {
                                         }
                                         if let Some(state) = self.track_audio.get_mut(index) {
                                             if let Some(host) = state.host.take() {
-                                                if let Ok(mut host) = host.lock() {
-                                                    host.prepare_for_drop();
-                                                }
+                                                host.prepare_for_drop();
                                                 self.orphaned_hosts.push(host);
                                             }
                                         }
@@ -7825,7 +8725,7 @@ impl DawApp {
                             ui.add_space(6.0);
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 self.ensure_live_params();
-                                let host_change = if let Some(host) = self.selected_track_host() {
+                                let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
                                     if let Ok(mut host) = host.try_lock() {
                                         host.take_last_param_change()
                                     } else {
@@ -7944,38 +8844,40 @@ impl DawApp {
                                                 if let Some(state) = selected_track_index
                                                     .and_then(|i| self.track_audio.get(i))
                                                 {
-                                                        if let Some(host) = state.host.as_ref() {
-                                                            if let Ok(host) = host.try_lock() {
-                                                                if let Some((channel, controller)) =
-                                                                    host.param_to_cc(param_id)
+                                                    if let Some(PluginHostHandle::Vst3(host)) =
+                                                        state.host.as_ref()
+                                                    {
+                                                        if let Ok(host) = host.try_lock() {
+                                                            if let Some((channel, controller)) =
+                                                                host.param_to_cc(param_id)
+                                                            {
+                                                                if let Ok(mut events) =
+                                                                    state.midi_events.lock()
                                                                 {
-                                                                    if let Ok(mut events) =
-                                                                        state.midi_events.lock()
-                                                                    {
-                                                                        let cc_value =
-                                                                            (*value * 127.0).round() as i32;
-                                                                        let cc_value =
-                                                                            cc_value.clamp(0, 127) as u8;
-                                                                        events.push(
-                                                                            vst3::MidiEvent::control_change(
-                                                                                channel,
-                                                                                controller,
-                                                                                cc_value,
-                                                                            ),
-                                                                        );
-                                                                    }
+                                                                    let cc_value =
+                                                                        (*value * 127.0).round() as i32;
+                                                                    let cc_value =
+                                                                        cc_value.clamp(0, 127) as u8;
+                                                                    events.push(
+                                                                        vst3::MidiEvent::control_change(
+                                                                            channel,
+                                                                            controller,
+                                                                            cc_value,
+                                                                        ),
+                                                                    );
                                                                 }
                                                             }
                                                         }
-                                                        if let Ok(mut pending) =
-                                                            state.pending_param_changes.lock()
-                                                        {
-                                                            pending.push(PendingParamChange {
-                                                                target: PendingParamTarget::Instrument,
-                                                                param_id,
-                                                                value: *value as f64,
-                                                            });
-                                                        }
+                                                    }
+                                                    if let Ok(mut pending) =
+                                                        state.pending_param_changes.lock()
+                                                    {
+                                                        pending.push(PendingParamChange {
+                                                            target: PendingParamTarget::Instrument,
+                                                            param_id,
+                                                            value: *value as f64,
+                                                        });
+                                                    }
                                                 }
                                                 if self.is_recording && self.record_automation {
                                                     if let Some(track_index) = selected_track_index {
@@ -8423,6 +9325,7 @@ impl DawApp {
                         );
                     }
                     let mut hovered_key: Option<u8> = None;
+                    let mut hovered_key_vel: Option<u8> = None;
                     for note in 0u8..=127 {
                         let y = roll_rect.bottom() + self.piano_pan.y
                             - (note as f32 - 40.0) * note_height;
@@ -8436,6 +9339,10 @@ impl DawApp {
                         if let Some(pos) = pointer_interact {
                             if key_rect.contains(pos) {
                                 hovered_key = Some(note);
+                                let t = ((pos.x - keyboard_rect.left()) / keyboard_rect.width())
+                                    .clamp(0.0, 1.0);
+                                let vel = (t * 127.0).round().clamp(1.0, 127.0) as u8;
+                                hovered_key_vel = Some(vel);
                             }
                         }
                         let is_black = matches!(note % 12, 1 | 3 | 6 | 8 | 10);
@@ -8465,12 +9372,18 @@ impl DawApp {
                     }
                     if let Some(note) = hovered_key {
                         if ctrl_down && pointer_clicked {
-                            if let Some(track_index) = self.selected_track {
-                                if let Some(track) = self.tracks.get(track_index) {
-                                    self.piano_selected.clear();
-                                    for (index, data) in track.midi_notes.iter().enumerate() {
-                                        if data.midi_note == note {
-                                            self.piano_selected.insert(index);
+                            if let Some(clip_id) = self.selected_clip {
+                                if let Some((track_index, clip_index)) =
+                                    self.find_clip_indices_by_id(clip_id)
+                                {
+                                    if let Some(clip) =
+                                        self.tracks.get(track_index).and_then(|t| t.clips.get(clip_index))
+                                    {
+                                        self.piano_selected.clear();
+                                        for (index, data) in clip.midi_notes.iter().enumerate() {
+                                            if data.midi_note == note {
+                                                self.piano_selected.insert(index);
+                                            }
                                         }
                                     }
                                 }
@@ -8485,7 +9398,8 @@ impl DawApp {
                                         if let Some(prev) = self.piano_key_down {
                                             self.piano_preview_note_off(prev);
                                         }
-                                        self.piano_preview_note_on(note, 100);
+                                        let vel = hovered_key_vel.unwrap_or(100);
+                                        self.piano_preview_note_on(note, vel);
                                         self.piano_key_down = Some(note);
                                     }
                                 }
@@ -8508,44 +9422,48 @@ impl DawApp {
                         .interact_pointer_pos()
                         .or_else(|| roll_response.hover_pos());
                     let mut hovered_note: Option<(usize, egui::Rect)> = None;
-                    if let Some(track_index) = self.selected_track {
-                        if let Some(track) = self.tracks.get(track_index) {
-                            if !track.midi_notes.is_empty() {
-                                for (index, note) in track.midi_notes.iter().enumerate() {
-                                    let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
-                                    let y = roll_rect.bottom() + self.piano_pan.y
-                                        - (note.midi_note as f32 - 40.0) * note_height;
-                                    let w = (note.length_beats * beat_width).max(12.0);
-                                    let note_rect = egui::Rect::from_min_size(
-                                        egui::pos2(x, y - note_height),
-                                        egui::vec2(w, note_height),
-                                    );
-                                    let base = if index % 2 == 0 {
-                                        egui::Color32::from_rgb(88, 210, 180)
-                                    } else {
-                                        egui::Color32::from_rgb(120, 130, 240)
-                                    };
-                                    let vel = (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
-                                    let alpha = (vel * 200.0 + 30.0).clamp(40.0, 230.0) as u8;
-                                    let pan = note.pan.clamp(-1.0, 1.0);
-                                    let pan_red = (pan.max(0.0) * 80.0) as u8;
-                                    let pan_blue = ((-pan).max(0.0) * 80.0) as u8;
-                                    let cutoff_green = (note.cutoff.clamp(0.0, 1.0) * 80.0) as u8;
-                                    let r = (base.r() as u16 + pan_red as u16).min(255) as u8;
-                                    let g = (base.g() as u16 + cutoff_green as u16).min(255) as u8;
-                                    let b = (base.b() as u16 + pan_blue as u16).min(255) as u8;
-                                    let color = egui::Color32::from_rgba_premultiplied(r, g, b, alpha);
-                                    painter.rect_filled(note_rect, 0.0, color);
-                                    if self.piano_selected.contains(&index) {
-                                        painter.rect_stroke(
-                                            note_rect,
-                                            0.0,
-                                            egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 240, 255)),
+                    if let Some(clip_id) = self.selected_clip {
+                        if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
+                            if let Some(clip) =
+                                self.tracks.get(track_index).and_then(|t| t.clips.get(clip_index))
+                            {
+                                if !clip.midi_notes.is_empty() {
+                                    for (index, note) in clip.midi_notes.iter().enumerate() {
+                                        let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
+                                        let y = roll_rect.bottom() + self.piano_pan.y
+                                            - (note.midi_note as f32 - 40.0) * note_height;
+                                        let w = (note.length_beats * beat_width).max(12.0);
+                                        let note_rect = egui::Rect::from_min_size(
+                                            egui::pos2(x, y - note_height),
+                                            egui::vec2(w, note_height),
                                         );
-                                    }
-                                    if let Some(pos) = pointer_pos {
-                                        if pos.x >= roll_rect.left() && note_rect.contains(pos) {
-                                            hovered_note = Some((index, note_rect));
+                                        let base = if index % 2 == 0 {
+                                            egui::Color32::from_rgb(88, 210, 180)
+                                        } else {
+                                            egui::Color32::from_rgb(120, 130, 240)
+                                        };
+                                        let vel = (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
+                                        let alpha = (vel * 200.0 + 30.0).clamp(40.0, 230.0) as u8;
+                                        let pan = note.pan.clamp(-1.0, 1.0);
+                                        let pan_red = (pan.max(0.0) * 80.0) as u8;
+                                        let pan_blue = ((-pan).max(0.0) * 80.0) as u8;
+                                        let cutoff_green = (note.cutoff.clamp(0.0, 1.0) * 80.0) as u8;
+                                        let r = (base.r() as u16 + pan_red as u16).min(255) as u8;
+                                        let g = (base.g() as u16 + cutoff_green as u16).min(255) as u8;
+                                        let b = (base.b() as u16 + pan_blue as u16).min(255) as u8;
+                                        let color = egui::Color32::from_rgba_premultiplied(r, g, b, alpha);
+                                        painter.rect_filled(note_rect, 0.0, color);
+                                        if self.piano_selected.contains(&index) {
+                                            painter.rect_stroke(
+                                                note_rect,
+                                                0.0,
+                                                egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 240, 255)),
+                                            );
+                                        }
+                                        if let Some(pos) = pointer_pos {
+                                            if pos.x >= roll_rect.left() && note_rect.contains(pos) {
+                                                hovered_note = Some((index, note_rect));
+                                            }
                                         }
                                     }
                                 }
@@ -8567,11 +9485,19 @@ impl DawApp {
                         }
                     }
 
-                    if self.selected_clip.is_none()
-                        && self.selected_track.and_then(|i| self.tracks.get(i))
-                            .map(|t| t.midi_notes.is_empty())
-                            .unwrap_or(true)
-                    {
+                    let needs_clip_hint = match self.selected_clip {
+                        None => true,
+                        Some(clip_id) => self
+                            .find_clip_indices_by_id(clip_id)
+                            .and_then(|(track_index, clip_index)| {
+                                self.tracks
+                                    .get(track_index)
+                                    .and_then(|t| t.clips.get(clip_index))
+                            })
+                            .map(|clip| !clip.is_midi)
+                            .unwrap_or(true),
+                    };
+                    if needs_clip_hint {
                         Self::outlined_text(
                             &painter,
                             roll_rect.center(),
@@ -8605,29 +9531,37 @@ impl DawApp {
                         if roll_response.drag_stopped() {
                             if let Some(end) = roll_response.interact_pointer_pos() {
                                 let select_rect = egui::Rect::from_two_pos(start, end);
-                                if let Some(track_index) = self.selected_track {
-                                    if let Some(track) = self.tracks.get(track_index) {
-                                        let mut hits: Vec<usize> = Vec::new();
-                                        for (index, note) in track.midi_notes.iter().enumerate() {
-                                            let x = roll_rect.left()
-                                                + self.piano_pan.x
-                                                + note.start_beats * beat_width;
-                                            let y = roll_rect.bottom() + self.piano_pan.y
-                                                - (note.midi_note as f32 - 40.0) * note_height;
-                                            let w = (note.length_beats * beat_width).max(12.0);
-                                            let note_rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, y - note_height),
-                                                egui::vec2(w, note_height),
-                                            );
-                                            if select_rect.intersects(note_rect) {
-                                                hits.push(index);
+                                if let Some(clip_id) = self.selected_clip {
+                                    if let Some((track_index, clip_index)) =
+                                        self.find_clip_indices_by_id(clip_id)
+                                    {
+                                        if let Some(clip) = self
+                                            .tracks
+                                            .get(track_index)
+                                            .and_then(|t| t.clips.get(clip_index))
+                                        {
+                                            let mut hits: Vec<usize> = Vec::new();
+                                            for (index, note) in clip.midi_notes.iter().enumerate() {
+                                                let x = roll_rect.left()
+                                                    + self.piano_pan.x
+                                                    + note.start_beats * beat_width;
+                                                let y = roll_rect.bottom() + self.piano_pan.y
+                                                    - (note.midi_note as f32 - 40.0) * note_height;
+                                                let w = (note.length_beats * beat_width).max(12.0);
+                                                let note_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(x, y - note_height),
+                                                    egui::vec2(w, note_height),
+                                                );
+                                                if select_rect.intersects(note_rect) {
+                                                    hits.push(index);
+                                                }
                                             }
-                                        }
-                                        if !self.piano_marquee_add {
-                                            self.piano_selected.clear();
-                                        }
-                                        for index in hits {
-                                            self.piano_selected.insert(index);
+                                            if !self.piano_marquee_add {
+                                                self.piano_selected.clear();
+                                            }
+                                            for index in hits {
+                                                self.piano_selected.insert(index);
+                                            }
                                         }
                                     }
                                 }
@@ -8657,38 +9591,47 @@ impl DawApp {
                             if pos.x < roll_rect.left() {
                                 return;
                             }
-                            if let Some(track_index) = self.selected_track {
-                                if let Some(track) = self.tracks.get_mut(track_index) {
-                                    if hovered_note.is_none() {
-                                        let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
-                                        let snapped = if alt {
-                                            beat
-                                        } else {
-                                            (beat / quantize).round() * quantize
-                                        };
-                                        let pitch_f = (roll_rect.bottom() + self.piano_pan.y - pos.y) / note_height;
-                                        let pitch = (40.0 + pitch_f).floor() as i32;
-                                        let pitch = pitch.clamp(0, 127) as u8;
-                                        if shift {
-                                            track.midi_notes.retain(|note| {
-                                                note.midi_note != pitch
-                                                    || note.start_beats + note.length_beats <= snapped
-                                                    || note.start_beats >= snapped + self.piano_note_len
-                                            });
-                                        }
-                                        track
-                                            .midi_notes
-                                            .push(PianoRollNote::new(
+                            if let Some(clip_id) = self.selected_clip {
+                                if let Some((track_index, clip_index)) =
+                                    self.find_clip_indices_by_id(clip_id)
+                                {
+                                    if let Some(clip) = self
+                                        .tracks
+                                        .get_mut(track_index)
+                                        .and_then(|t| t.clips.get_mut(clip_index))
+                                    {
+                                        if clip.is_midi && hovered_note.is_none() {
+                                            let beat =
+                                                (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
+                                            let snapped = if alt {
+                                                beat
+                                            } else {
+                                                (beat / quantize).round() * quantize
+                                            };
+                                            let pitch_f =
+                                                (roll_rect.bottom() + self.piano_pan.y - pos.y) / note_height;
+                                            let pitch = (40.0 + pitch_f).floor() as i32;
+                                            let pitch = pitch.clamp(0, 127) as u8;
+                                            if shift {
+                                                clip.midi_notes.retain(|note| {
+                                                    note.midi_note != pitch
+                                                        || note.start_beats + note.length_beats <= snapped
+                                                        || note.start_beats >= snapped + self.piano_note_len
+                                                });
+                                            }
+                                            clip.midi_notes.push(PianoRollNote::new(
                                                 snapped.max(0.0),
                                                 self.piano_note_len,
                                                 pitch,
                                                 100,
                                             ));
-                                        if let Some(index) = track.midi_notes.len().checked_sub(1) {
-                                            self.piano_selected.clear();
-                                            self.piano_selected.insert(index);
+                                            if let Some(index) = clip.midi_notes.len().checked_sub(1) {
+                                                self.piano_selected.clear();
+                                                self.piano_selected.insert(index);
+                                            }
+                                            self.sync_track_audio_notes(track_index);
+                                            self.sync_linked_notes_after_edit(track_index);
                                         }
-                                        self.sync_track_audio_notes(track_index);
                                     }
                                 }
                             }
@@ -8697,18 +9640,27 @@ impl DawApp {
 
                     if roll_response.clicked_by(egui::PointerButton::Secondary) {
                         if let Some((note_index, _)) = hovered_note {
-                            if let Some(track_index) = self.selected_track {
-                                if let Some(track) = self.tracks.get_mut(track_index) {
-                                    if note_index < track.midi_notes.len() {
-                                        track.midi_notes.remove(note_index);
-                                        self.piano_selected.remove(&note_index);
-                                        let shifted: HashSet<usize> = self
-                                            .piano_selected
-                                            .iter()
-                                            .map(|idx| if *idx > note_index { idx - 1 } else { *idx })
-                                            .collect();
-                                        self.piano_selected = shifted;
-                                        self.sync_track_audio_notes(track_index);
+                            if let Some(clip_id) = self.selected_clip {
+                                if let Some((track_index, clip_index)) =
+                                    self.find_clip_indices_by_id(clip_id)
+                                {
+                                    if let Some(clip) = self
+                                        .tracks
+                                        .get_mut(track_index)
+                                        .and_then(|t| t.clips.get_mut(clip_index))
+                                    {
+                                        if note_index < clip.midi_notes.len() {
+                                            clip.midi_notes.remove(note_index);
+                                            self.piano_selected.remove(&note_index);
+                                            let shifted: HashSet<usize> = self
+                                                .piano_selected
+                                                .iter()
+                                                .map(|idx| if *idx > note_index { idx - 1 } else { *idx })
+                                                .collect();
+                                            self.piano_selected = shifted;
+                                            self.sync_track_audio_notes(track_index);
+                                            self.sync_linked_notes_after_edit(track_index);
+                                        }
                                     }
                                 }
                             }
@@ -8735,78 +9687,85 @@ impl DawApp {
                                     PianoDragKind::Move
                                 };
                                 let offset_beats = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
-                                let mut shift_copy = shift;
+                                let shift_copy = shift;
                                 if shift_copy {
                                     self.push_undo_state();
                                 }
-                                if let Some(track_index) = self.selected_track {
-                                    if let Some(track) = self.tracks.get_mut(track_index) {
-                                        if shift_copy {
-                                            let mut selection: Vec<usize> =
-                                                self.piano_selected.iter().copied().collect();
-                                            selection.sort_unstable();
-                                            if selection.is_empty() {
-                                                selection.push(note_index);
-                                            }
-                                            let base_len = track.midi_notes.len();
-                                            let mut new_indices = Vec::new();
-                                            for idx in selection.iter().copied() {
-                                                if let Some(note) = track.midi_notes.get(idx).cloned() {
-                                                    track.midi_notes.push(note);
-                                                    new_indices.push(base_len + new_indices.len());
+                                if let Some(clip_id) = self.selected_clip {
+                                    if let Some((track_index, clip_index)) =
+                                        self.find_clip_indices_by_id(clip_id)
+                                    {
+                                        if let Some(clip) = self
+                                            .tracks
+                                            .get_mut(track_index)
+                                            .and_then(|t| t.clips.get_mut(clip_index))
+                                        {
+                                            if shift_copy {
+                                                let mut selection: Vec<usize> =
+                                                    self.piano_selected.iter().copied().collect();
+                                                selection.sort_unstable();
+                                                if selection.is_empty() {
+                                                    selection.push(note_index);
+                                                }
+                                                let base_len = clip.midi_notes.len();
+                                                let mut new_indices = Vec::new();
+                                                for idx in selection.iter().copied() {
+                                                    if let Some(note) = clip.midi_notes.get(idx).cloned() {
+                                                        clip.midi_notes.push(note);
+                                                        new_indices.push(base_len + new_indices.len());
+                                                    }
+                                                }
+                                                self.piano_selected.clear();
+                                                for idx in &new_indices {
+                                                    self.piano_selected.insert(*idx);
                                                 }
                                             }
-                                            self.piano_selected.clear();
-                                            for idx in &new_indices {
-                                                self.piano_selected.insert(*idx);
-                                            }
-                                            shift_copy = false;
-                                        }
 
-                                        let (start_beats, start_length, start_pitch) = track
-                                            .midi_notes
-                                            .get(note_index)
-                                            .map(|note| (note.start_beats, note.length_beats, note.midi_note))
-                                            .unwrap_or((0.0, self.piano_note_len.max(0.03125), 60));
-                                        let mut selected_notes = Vec::new();
-                                        for index in self.piano_selected.iter().copied() {
-                                            if let Some(note) = track.midi_notes.get(index) {
-                                                selected_notes.push((
-                                                    index,
-                                                    note.start_beats,
-                                                    note.midi_note,
-                                                    note.length_beats,
-                                                ));
+                                            let (start_beats, start_length, start_pitch) = clip
+                                                .midi_notes
+                                                .get(note_index)
+                                                .map(|note| (note.start_beats, note.length_beats, note.midi_note))
+                                                .unwrap_or((0.0, self.piano_note_len.max(0.03125), 60));
+                                            let mut selected_notes = Vec::new();
+                                            for index in self.piano_selected.iter().copied() {
+                                                if let Some(note) = clip.midi_notes.get(index) {
+                                                    selected_notes.push((
+                                                        index,
+                                                        note.start_beats,
+                                                        note.midi_note,
+                                                        note.length_beats,
+                                                    ));
+                                                }
                                             }
-                                        }
-                                        if selected_notes.is_empty() {
-                                            if let Some(note) = track.midi_notes.get(note_index) {
-                                                selected_notes.push((
-                                                    note_index,
-                                                    note.start_beats,
-                                                    note.midi_note,
-                                                    note.length_beats,
-                                                ));
+                                            if selected_notes.is_empty() {
+                                                if let Some(note) = clip.midi_notes.get(note_index) {
+                                                    selected_notes.push((
+                                                        note_index,
+                                                        note.start_beats,
+                                                        note.midi_note,
+                                                        note.length_beats,
+                                                    ));
+                                                }
                                             }
+                                            let primary_index =
+                                                selected_notes.first().map(|v| v.0).unwrap_or(note_index);
+                                            let primary = clip
+                                                .midi_notes
+                                                .get(primary_index)
+                                                .map(|note| (note.start_beats, note.length_beats, note.midi_note))
+                                                .unwrap_or((start_beats, start_length, start_pitch));
+                                            self.piano_drag = Some(PianoDragState {
+                                                track_index,
+                                                note_index: primary_index,
+                                                kind,
+                                                offset_beats,
+                                                start_beats: primary.0,
+                                                start_length: primary.1,
+                                                start_pitch: primary.2,
+                                                start_pos_y: pos.y,
+                                                selected_notes,
+                                            });
                                         }
-                                        let primary_index =
-                                            selected_notes.first().map(|v| v.0).unwrap_or(note_index);
-                                        let primary = track
-                                            .midi_notes
-                                            .get(primary_index)
-                                            .map(|note| (note.start_beats, note.length_beats, note.midi_note))
-                                            .unwrap_or((start_beats, start_length, start_pitch));
-                                        self.piano_drag = Some(PianoDragState {
-                                            track_index,
-                                            note_index: primary_index,
-                                            kind,
-                                            offset_beats,
-                                            start_beats: primary.0,
-                                            start_length: primary.1,
-                                            start_pitch: primary.2,
-                                            start_pos_y: pos.y,
-                                            selected_notes,
-                                        });
                                     }
                                 }
                             }
@@ -8819,7 +9778,18 @@ impl DawApp {
                                 if pos.x < roll_rect.left() {
                                     return;
                                 }
-                                if let Some(track) = self.tracks.get_mut(drag.track_index) {
+                                if let Some(clip_id) = self.selected_clip {
+                                    let clip_index = self
+                                        .find_clip_indices_by_id(clip_id)
+                                        .map(|(_, ci)| ci)
+                                        .unwrap_or(usize::MAX);
+                                    let Some(clip) = self
+                                        .tracks
+                                        .get_mut(drag.track_index)
+                                        .and_then(|t| t.clips.get_mut(clip_index))
+                                    else {
+                                        return;
+                                    };
                                     let beat = (pos.x - roll_rect.left() - self.piano_pan.x) / beat_width;
                                     match drag.kind {
                                         PianoDragKind::Move => {
@@ -8836,14 +9806,14 @@ impl DawApp {
                                                 ((drag.start_pos_y - pos.y) / note_height).round() as i32;
                                             if !drag.selected_notes.is_empty() {
                                                 for (index, start, pitch, _) in &drag.selected_notes {
-                                                    if let Some(note) = track.midi_notes.get_mut(*index) {
+                                                    if let Some(note) = clip.midi_notes.get_mut(*index) {
                                                         note.start_beats = (start + delta).max(0.0);
                                                         let next_pitch = (*pitch as i32 + delta_pitch)
                                                             .clamp(0, 127) as u8;
                                                         note.midi_note = next_pitch;
                                                     }
                                                 }
-                                            } else if let Some(note) = track.midi_notes.get_mut(drag.note_index) {
+                                            } else if let Some(note) = clip.midi_notes.get_mut(drag.note_index) {
                                                 note.start_beats = (drag.start_beats + delta).max(0.0);
                                                 let next_pitch = (drag.start_pitch as i32 + delta_pitch)
                                                     .clamp(0, 127) as u8;
@@ -8868,7 +9838,7 @@ impl DawApp {
                                                     1.0
                                                 };
                                                 for (index, start, _pitch, len) in &drag.selected_notes {
-                                                    if let Some(note) = track.midi_notes.get_mut(*index) {
+                                                    if let Some(note) = clip.midi_notes.get_mut(*index) {
                                                         note.start_beats = (anchor + (start - anchor) * scale).max(0.0);
                                                         note.length_beats = (len * scale).max(quantize);
                                                     }
@@ -8883,11 +9853,11 @@ impl DawApp {
                                                 let delta_len = snapped - drag.start_length;
                                                 if !drag.selected_notes.is_empty() {
                                                     for (index, _, _, start_len) in &drag.selected_notes {
-                                                        if let Some(note) = track.midi_notes.get_mut(*index) {
+                                                        if let Some(note) = clip.midi_notes.get_mut(*index) {
                                                             note.length_beats = (start_len + delta_len).max(quantize);
                                                         }
                                                     }
-                                                } else if let Some(note) = track.midi_notes.get_mut(drag.note_index) {
+                                                } else if let Some(note) = clip.midi_notes.get_mut(drag.note_index) {
                                                     note.length_beats = snapped.max(quantize);
                                                 }
                                             }
@@ -8901,6 +9871,7 @@ impl DawApp {
                     if roll_response.drag_stopped() {
                         if let Some(drag) = self.piano_drag.take() {
                             self.sync_track_audio_notes(drag.track_index);
+                            self.sync_linked_notes_after_edit(drag.track_index);
                         }
                     }
 
@@ -8985,114 +9956,144 @@ impl DawApp {
                             x += beat_width;
                         }
 
-                        if let Some(track_index) = self.selected_track {
-                            if let Some(track) = self.tracks.get(track_index) {
-                                match self.piano_lane_mode {
-                                    PianoLaneMode::Velocity => {
-                                        for note in &track.midi_notes {
-                                            let value = (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
-                                            let h = lane_rect.height() * value;
-                                            let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
-                                            let w = (note.length_beats * beat_width).max(6.0);
-                                            let bar_rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, lane_rect.bottom() - h),
-                                                egui::vec2(w, h),
-                                            );
-                                            lane_painter.rect_filled(
-                                                bar_rect,
-                                                0.0,
-                                                egui::Color32::from_rgba_premultiplied(180, 200, 220, 200),
-                                            );
-                                        }
-                                    }
-                                    PianoLaneMode::Pan => {
-                                        let center_y = lane_rect.center().y;
-                                        lane_painter.line_segment(
-                                            [
-                                                egui::pos2(lane_rect.left(), center_y),
-                                                egui::pos2(lane_rect.right(), center_y),
-                                            ],
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 36, 40)),
-                                        );
-                                        for note in &track.midi_notes {
-                                            let pan = note.pan.clamp(-1.0, 1.0);
-                                            let h = lane_rect.height() * 0.5 * pan.abs();
-                                            let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
-                                            let w = (note.length_beats * beat_width).max(6.0);
-                                            let (y, color) = if pan >= 0.0 {
-                                                (center_y - h, egui::Color32::from_rgb(210, 80, 80))
-                                            } else {
-                                                (center_y, egui::Color32::from_rgb(80, 120, 210))
-                                            };
-                                            let bar_rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, y),
-                                                egui::vec2(w, h.max(2.0)),
-                                            );
-                                            lane_painter.rect_filled(bar_rect, 0.0, color);
-                                        }
-                                    }
-                                    PianoLaneMode::Cutoff => {
-                                        for note in &track.midi_notes {
-                                            let value = note.cutoff.clamp(0.0, 1.0);
-                                            let h = lane_rect.height() * value;
-                                            let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
-                                            let w = (note.length_beats * beat_width).max(6.0);
-                                            let bar_rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, lane_rect.bottom() - h),
-                                                egui::vec2(w, h.max(2.0)),
-                                            );
-                                            lane_painter.rect_filled(
-                                                bar_rect,
-                                                0.0,
-                                                egui::Color32::from_rgb(90, 200, 120),
-                                            );
-                                        }
-                                    }
-                                    PianoLaneMode::Resonance => {
-                                        for note in &track.midi_notes {
-                                            let value = note.resonance.clamp(0.0, 1.0);
-                                            let h = lane_rect.height() * value;
-                                            let x = roll_rect.left() + self.piano_pan.x + note.start_beats * beat_width;
-                                            let w = (note.length_beats * beat_width).max(6.0);
-                                            let bar_rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, lane_rect.bottom() - h),
-                                                egui::vec2(w, h.max(2.0)),
-                                            );
-                                            lane_painter.rect_filled(
-                                                bar_rect,
-                                                0.0,
-                                                egui::Color32::from_rgb(210, 180, 80),
-                                            );
-                                        }
-                                    }
-                                    PianoLaneMode::MidiCc => {
-                                        if let Some(lane) = track
-                                            .midi_cc_lanes
-                                            .iter()
-                                            .find(|lane| lane.cc == self.piano_cc)
-                                        {
-                                            let mut points = lane.points.clone();
-                                            points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
-                                            for window in points.windows(2) {
-                                                let a = &window[0];
-                                                let b = &window[1];
-                                                let x1 = roll_rect.left() + self.piano_pan.x + a.beat * beat_width;
-                                                let x2 = roll_rect.left() + self.piano_pan.x + b.beat * beat_width;
-                                                let y1 = lane_rect.bottom() - a.value.clamp(0.0, 1.0) * lane_rect.height();
-                                                let y2 = lane_rect.bottom() - b.value.clamp(0.0, 1.0) * lane_rect.height();
-                                                lane_painter.line_segment(
-                                                    [egui::pos2(x1, y1), egui::pos2(x2, y2)],
-                                                    egui::Stroke::new(1.2, egui::Color32::from_rgb(150, 180, 230)),
-                                                );
+                        if let Some(clip_id) = self.selected_clip {
+                            if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
+                                if let Some(track) = self.tracks.get(track_index) {
+                                    let clip = track.clips.get(clip_index);
+                                    match self.piano_lane_mode {
+                                        PianoLaneMode::Velocity => {
+                                            if let Some(clip) = clip {
+                                                for note in &clip.midi_notes {
+                                                    let value =
+                                                        (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
+                                                    let h = lane_rect.height() * value;
+                                                    let x = roll_rect.left()
+                                                        + self.piano_pan.x
+                                                        + note.start_beats * beat_width;
+                                                    let w = (note.length_beats * beat_width).max(6.0);
+                                                    let bar_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(x, lane_rect.bottom() - h),
+                                                        egui::vec2(w, h),
+                                                    );
+                                                    lane_painter.rect_filled(
+                                                        bar_rect,
+                                                        0.0,
+                                                        egui::Color32::from_rgba_premultiplied(180, 200, 220, 200),
+                                                    );
+                                                }
                                             }
-                                            for point in &points {
-                                                let x = roll_rect.left() + self.piano_pan.x + point.beat * beat_width;
-                                                let y = lane_rect.bottom() - point.value.clamp(0.0, 1.0) * lane_rect.height();
-                                                lane_painter.circle_filled(
-                                                    egui::pos2(x, y),
-                                                    3.0,
-                                                    egui::Color32::from_rgb(180, 200, 240),
-                                                );
+                                        }
+                                        PianoLaneMode::Pan => {
+                                            let center_y = lane_rect.center().y;
+                                            lane_painter.line_segment(
+                                                [
+                                                    egui::pos2(lane_rect.left(), center_y),
+                                                    egui::pos2(lane_rect.right(), center_y),
+                                                ],
+                                                egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 36, 40)),
+                                            );
+                                            if let Some(clip) = clip {
+                                                for note in &clip.midi_notes {
+                                                    let pan = note.pan.clamp(-1.0, 1.0);
+                                                    let h = lane_rect.height() * 0.5 * pan.abs();
+                                                    let x = roll_rect.left()
+                                                        + self.piano_pan.x
+                                                        + note.start_beats * beat_width;
+                                                    let w = (note.length_beats * beat_width).max(6.0);
+                                                    let (y, color) = if pan >= 0.0 {
+                                                        (center_y - h, egui::Color32::from_rgb(210, 80, 80))
+                                                    } else {
+                                                        (center_y, egui::Color32::from_rgb(80, 120, 210))
+                                                    };
+                                                    let bar_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(x, y),
+                                                        egui::vec2(w, h.max(2.0)),
+                                                    );
+                                                    lane_painter.rect_filled(bar_rect, 0.0, color);
+                                                }
+                                            }
+                                        }
+                                        PianoLaneMode::Cutoff => {
+                                            if let Some(clip) = clip {
+                                                for note in &clip.midi_notes {
+                                                    let value = note.cutoff.clamp(0.0, 1.0);
+                                                    let h = lane_rect.height() * value;
+                                                    let x = roll_rect.left()
+                                                        + self.piano_pan.x
+                                                        + note.start_beats * beat_width;
+                                                    let w = (note.length_beats * beat_width).max(6.0);
+                                                    let bar_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(x, lane_rect.bottom() - h),
+                                                        egui::vec2(w, h.max(2.0)),
+                                                    );
+                                                    lane_painter.rect_filled(
+                                                        bar_rect,
+                                                        0.0,
+                                                        egui::Color32::from_rgb(90, 200, 120),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        PianoLaneMode::Resonance => {
+                                            if let Some(clip) = clip {
+                                                for note in &clip.midi_notes {
+                                                    let value = note.resonance.clamp(0.0, 1.0);
+                                                    let h = lane_rect.height() * value;
+                                                    let x = roll_rect.left()
+                                                        + self.piano_pan.x
+                                                        + note.start_beats * beat_width;
+                                                    let w = (note.length_beats * beat_width).max(6.0);
+                                                    let bar_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(x, lane_rect.bottom() - h),
+                                                        egui::vec2(w, h.max(2.0)),
+                                                    );
+                                                    lane_painter.rect_filled(
+                                                        bar_rect,
+                                                        0.0,
+                                                        egui::Color32::from_rgb(210, 180, 80),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        PianoLaneMode::MidiCc => {
+                                            if let Some(lane) = track
+                                                .midi_cc_lanes
+                                                .iter()
+                                                .find(|lane| lane.cc == self.piano_cc)
+                                            {
+                                                let mut points = lane.points.clone();
+                                                points.sort_by(|a, b| {
+                                                    a.beat
+                                                        .partial_cmp(&b.beat)
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                });
+                                                for window in points.windows(2) {
+                                                    let a = &window[0];
+                                                    let b = &window[1];
+                                                    let x1 = roll_rect.left() + self.piano_pan.x + a.beat * beat_width;
+                                                    let x2 = roll_rect.left() + self.piano_pan.x + b.beat * beat_width;
+                                                    let y1 = lane_rect.bottom()
+                                                        - a.value.clamp(0.0, 1.0) * lane_rect.height();
+                                                    let y2 = lane_rect.bottom()
+                                                        - b.value.clamp(0.0, 1.0) * lane_rect.height();
+                                                    lane_painter.line_segment(
+                                                        [egui::pos2(x1, y1), egui::pos2(x2, y2)],
+                                                        egui::Stroke::new(
+                                                            1.2,
+                                                            egui::Color32::from_rgb(150, 180, 230),
+                                                        ),
+                                                    );
+                                                }
+                                                for point in &points {
+                                                    let x = roll_rect.left() + self.piano_pan.x + point.beat * beat_width;
+                                                    let y = lane_rect.bottom()
+                                                        - point.value.clamp(0.0, 1.0) * lane_rect.height();
+                                                    lane_painter.circle_filled(
+                                                        egui::pos2(x, y),
+                                                        3.0,
+                                                        egui::Color32::from_rgb(180, 200, 240),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -9168,37 +10169,50 @@ impl DawApp {
                                         }
                                         _ => {
                                             if self.selected_clip.is_some() {
-                                                if let Some(track_index) = self.selected_track {
-                                                    let beat = (pos.x - roll_rect.left() - self.piano_pan.x)
-                                                        / beat_width;
-                                                    if beat >= 0.0 {
-                                                        if let Some(track) = self.tracks.get_mut(track_index) {
-                                                            if let Some(note_index) = track.midi_notes.iter().position(|note| {
-                                                                beat >= note.start_beats
-                                                                    && beat <= note.start_beats + note.length_beats
-                                                            }) {
-                                                                let value = (lane_rect.bottom() - pos.y)
-                                                                    / lane_rect.height();
-                                                                let value = value.clamp(0.0, 1.0);
-                                                                if let Some(note) = track.midi_notes.get_mut(note_index) {
-                                                                    match self.piano_lane_mode {
-                                                                        PianoLaneMode::Velocity => {
-                                                                            note.velocity = (value * 127.0).round() as u8;
+                                                if let Some(clip_id) = self.selected_clip {
+                                                    if let Some((track_index, clip_index)) =
+                                                        self.find_clip_indices_by_id(clip_id)
+                                                    {
+                                                        let beat = (pos.x - roll_rect.left() - self.piano_pan.x)
+                                                            / beat_width;
+                                                        if beat >= 0.0 {
+                                                            if let Some(clip) = self
+                                                                .tracks
+                                                                .get_mut(track_index)
+                                                                .and_then(|t| t.clips.get_mut(clip_index))
+                                                            {
+                                                                if let Some(note_index) = clip
+                                                                    .midi_notes
+                                                                    .iter()
+                                                                    .position(|note| {
+                                                                        beat >= note.start_beats
+                                                                            && beat <= note.start_beats + note.length_beats
+                                                                    })
+                                                                {
+                                                                    let value = (lane_rect.bottom() - pos.y)
+                                                                        / lane_rect.height();
+                                                                    let value = value.clamp(0.0, 1.0);
+                                                                    if let Some(note) = clip.midi_notes.get_mut(note_index) {
+                                                                        match self.piano_lane_mode {
+                                                                            PianoLaneMode::Velocity => {
+                                                                                note.velocity =
+                                                                                    (value * 127.0).round() as u8;
+                                                                            }
+                                                                            PianoLaneMode::Pan => {
+                                                                                let pan = (lane_rect.center().y - pos.y)
+                                                                                    / (lane_rect.height() * 0.5);
+                                                                                note.pan = pan.clamp(-1.0, 1.0);
+                                                                            }
+                                                                            PianoLaneMode::Cutoff => {
+                                                                                note.cutoff = value;
+                                                                            }
+                                                                            PianoLaneMode::Resonance => {
+                                                                                note.resonance = value;
+                                                                            }
+                                                                            PianoLaneMode::MidiCc => {}
                                                                         }
-                                                                        PianoLaneMode::Pan => {
-                                                                            let pan = (lane_rect.center().y - pos.y)
-                                                                                / (lane_rect.height() * 0.5);
-                                                                            note.pan = pan.clamp(-1.0, 1.0);
-                                                                        }
-                                                                        PianoLaneMode::Cutoff => {
-                                                                            note.cutoff = value;
-                                                                        }
-                                                                        PianoLaneMode::Resonance => {
-                                                                            note.resonance = value;
-                                                                        }
-                                                                        PianoLaneMode::MidiCc => {}
+                                                                        self.sync_track_audio_notes(track_index);
                                                                     }
-                                                                    self.sync_track_audio_notes(track_index);
                                                                 }
                                                             }
                                                         }
@@ -9481,12 +10495,12 @@ impl DawApp {
 
         if self.show_plugin_picker {
             let mut open = self.show_plugin_picker;
-            let mut chosen: Option<String> = None;
+            let mut chosen: Option<PluginCandidate> = None;
             let mut refresh = false;
-            egui::Window::new("VST3 Plugin Picker")
+            egui::Window::new("Plugin Picker")
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("Scanning: C:\\Program Files\\Common Files\\VST3");
+                    ui.label("Scanning VST3 + CLAP folders");
                     ui.horizontal(|ui| {
                         ui.label("Search");
                         ui.text_edit_singleline(&mut self.plugin_search);
@@ -9505,30 +10519,30 @@ impl DawApp {
 
                     let search = self.plugin_search.to_ascii_lowercase();
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for path in &self.plugin_candidates {
-                            let display = Self::plugin_display_name(path);
+                        for candidate in &self.plugin_candidates {
+                            let display = &candidate.display;
                             if !search.is_empty()
-                                && !path.to_ascii_lowercase().contains(&search)
+                                && !candidate.path.to_ascii_lowercase().contains(&search)
                                 && !display.to_ascii_lowercase().contains(&search)
                             {
                                 continue;
                             }
                             if ui.selectable_label(false, display).clicked() {
-                                chosen = Some(path.clone());
+                                chosen = Some(candidate.clone());
                             }
                         }
                     });
                 });
 
             if refresh {
-                self.plugin_candidates = self.scan_vst3_plugins();
+                self.plugin_candidates = self.scan_plugins();
             }
 
-            if let Some(path) = chosen {
+            if let Some(candidate) = chosen {
                 if let Some(target) = self.plugin_target {
                     match target {
                         PluginTarget::Instrument(index) => {
-                            self.replace_instrument(index, path);
+                            self.replace_instrument(index, candidate.path, candidate.clap_id);
                         }
                         PluginTarget::Effect(index) => {
                             let was_running = self.audio_running;
@@ -9536,7 +10550,8 @@ impl DawApp {
                                 self.stop_audio_and_midi();
                             }
                             if let Some(track) = self.tracks.get_mut(index) {
-                                track.effect_paths.push(path);
+                                track.effect_paths.push(candidate.path);
+                                track.effect_clap_ids.push(candidate.clap_id);
                                 track.effect_bypass.push(false);
                                 track.effect_params.push(Vec::new());
                                 track.effect_param_ids.push(Vec::new());
@@ -9544,9 +10559,7 @@ impl DawApp {
                             }
                             if let Some(state) = self.track_audio.get_mut(index) {
                                 for host in state.effect_hosts.drain(..) {
-                                    if let Ok(mut host) = host.lock() {
-                                        host.prepare_for_drop();
-                                    }
+                                    host.prepare_for_drop();
                                     self.orphaned_hosts.push(host);
                                 }
                             }
@@ -9554,7 +10567,7 @@ impl DawApp {
                                 if let Err(err) = self.start_audio_and_midi() {
                                     self.status = format!("Audio restart failed: {err}");
                                 } else {
-                                    self.status = "Audio restarted for new VST3".to_string();
+                                    self.status = "Audio restarted for new plugin".to_string();
                                 }
                             }
                             self.refresh_params_for_selected_track(true);
@@ -9833,7 +10846,9 @@ impl DawApp {
             solo: false,
             midi_notes: Vec::new(),
             instrument_path: None,
+            instrument_clap_id: None,
             effect_paths: Vec::new(),
+            effect_clap_ids: Vec::new(),
             effect_bypass: Vec::new(),
             effect_params: Vec::new(),
             effect_param_ids: Vec::new(),
@@ -9851,6 +10866,12 @@ impl DawApp {
         self.selected_clip = None;
         self.selected_track = Some(0);
         self.playhead_beats = 0.0;
+        if let Ok(mut master) = self.master_settings.lock() {
+            *master = MasterCompSettings::default();
+        }
+        if let Ok(mut state) = self.master_comp_state.lock() {
+            *state = MasterCompState::default();
+        }
         self.sync_track_audio_states();
         self.clear_dirty();
         self.status = "New project".to_string();
@@ -9865,7 +10886,9 @@ impl DawApp {
         self.show_plugin_ui = false;
         let plugin_hwnd = self.plugin_ui.as_ref().map(|ui_host| ui_host.hwnd);
         if let Some(ui_host) = self.plugin_ui.as_ref() {
-            ui_host.editor.set_focus(false);
+            if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
+                editor.set_focus(false);
+            }
             hide_plugin_window(ui_host.hwnd);
             release_mouse_capture();
         }
@@ -9877,18 +10900,14 @@ impl DawApp {
         if self.audio_running {
             self.stop_audio_and_midi();
         }
-        let mut hosts: Vec<Arc<Mutex<vst3::Vst3Host>>> = Vec::new();
+        let mut hosts: Vec<PluginHostHandle> = Vec::new();
         for state in self.track_audio.iter_mut() {
             if let Some(host) = state.host.take() {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 hosts.push(host);
             }
             for host in state.effect_hosts.drain(..) {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 hosts.push(host);
             }
         }
@@ -9906,7 +10925,9 @@ impl DawApp {
             solo: false,
             midi_notes: Vec::new(),
             instrument_path: None,
+            instrument_clap_id: None,
             effect_paths: Vec::new(),
+            effect_clap_ids: Vec::new(),
             effect_bypass: Vec::new(),
             effect_params: Vec::new(),
             effect_param_ids: Vec::new(),
@@ -9947,15 +10968,11 @@ impl DawApp {
                 if index < self.track_audio.len() {
                     let mut state = self.track_audio.remove(index);
                     if let Some(host) = state.host.take() {
-                        if let Ok(mut host) = host.lock() {
-                            host.prepare_for_drop();
-                        }
+                        host.prepare_for_drop();
                         self.orphaned_hosts.push(host);
                     }
                     for host in state.effect_hosts.drain(..) {
-                        if let Ok(mut host) = host.lock() {
-                            host.prepare_for_drop();
-                        }
+                        host.prepare_for_drop();
                         self.orphaned_hosts.push(host);
                     }
                 }
@@ -10038,9 +11055,6 @@ impl DawApp {
             let Some(host) = state.host.as_ref() else {
                 continue;
             };
-            let Ok(host) = host.lock() else {
-                continue;
-            };
             let (component, controller) = host.get_state_bytes();
             track.plugin_state_component = if component.is_empty() { None } else { Some(component) };
             track.plugin_state_controller = if controller.is_empty() { None } else { Some(controller) };
@@ -10070,6 +11084,7 @@ impl DawApp {
             comment: self.metadata_comment.clone(),
             tempo_bpm: self.tempo_bpm,
             tracks: self.tracks.clone(),
+            master_settings: self.master_settings_snapshot(),
         };
         let folder = Self::normalize_windows_path(folder);
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -10096,7 +11111,7 @@ impl DawApp {
                 let clip_start = clip.start_beats;
                 let clip_end = clip.start_beats + clip.length_beats;
                 let mut notes = Vec::new();
-                for note in &track.midi_notes {
+                for note in &clip.midi_notes {
                     let note_end = note.start_beats + note.length_beats;
                     if note_end < clip_start || note.start_beats > clip_end {
                         continue;
@@ -10112,7 +11127,7 @@ impl DawApp {
                 let file_name = if safe_clip.is_empty() {
                     format!("{:02}_{}_clip{}.mid", index + 1, safe_track, clip.id)
                 } else {
-                    format!("{:02}_{}_{}.mid", index + 1, safe_track, safe_clip)
+                    format!("{:02}_{}_{}_clip{}.mid", index + 1, safe_track, safe_clip, clip.id)
                 };
                 let midi_path = midi_dir.join(file_name);
                 export_midi(midi_path.to_string_lossy().as_ref(), &notes, 480)?;
@@ -10157,6 +11172,12 @@ impl DawApp {
         self.metadata_comment = state.comment;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
+        if let Ok(mut master) = self.master_settings.lock() {
+            *master = state.master_settings.clone();
+        }
+        if let Ok(mut comp_state) = self.master_comp_state.lock() {
+            *comp_state = MasterCompState::default();
+        }
         self.selected_clip = None;
         self.selected_clips.clear();
         self.piano_selected.clear();
@@ -10166,6 +11187,7 @@ impl DawApp {
         self.arranger_select_start = None;
         self.project_path = folder.to_string_lossy().to_string();
         self.load_midi_from_folder(folder)?;
+        self.migrate_track_notes_to_clips();
         self.sync_track_audio_states();
         self.selected_track = if self.tracks.is_empty() { None } else { Some(0) };
         if self.project_name.trim().is_empty() {
@@ -10264,6 +11286,12 @@ impl DawApp {
         self.metadata_comment = state.comment;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
+        if let Ok(mut master) = self.master_settings.lock() {
+            *master = state.master_settings.clone();
+        }
+        if let Ok(mut comp_state) = self.master_comp_state.lock() {
+            *comp_state = MasterCompState::default();
+        }
         self.selected_clip = None;
         self.selected_clips.clear();
         self.piano_selected.clear();
@@ -10273,6 +11301,7 @@ impl DawApp {
         self.arranger_select_start = None;
         self.project_path.clear();
         self.load_midi_from_folder(&folder)?;
+        self.migrate_track_notes_to_clips();
         self.sync_track_audio_states();
         self.selected_track = if self.tracks.is_empty() { None } else { Some(0) };
         if self.project_name.trim().is_empty() {
@@ -10498,6 +11527,8 @@ impl DawApp {
                 start_beats: start_beats.max(0.0),
                 length_beats: clip_len,
                 is_midi: false,
+                midi_notes: Vec::new(),
+                link_id: None,
                 name: safe_stem.clone(),
                 audio_path: Some(format!("audio/{}", target.file_name().unwrap().to_string_lossy())),
                 audio_source_beats: source_beats,
@@ -10565,6 +11596,10 @@ impl DawApp {
             .collect();
         entries.sort();
 
+        let mut clip_notes_by_id: HashMap<(usize, usize), Vec<PianoRollNote>> = HashMap::new();
+        let mut clip_notes_by_name: HashMap<(usize, String), Vec<PianoRollNote>> = HashMap::new();
+        let mut track_notes: HashMap<usize, Vec<PianoRollNote>> = HashMap::new();
+
         for path in entries {
             let file_name = path
                 .file_name()
@@ -10586,17 +11621,29 @@ impl DawApp {
             if notes.is_empty() {
                 continue;
             }
-            let next_clip_id = self.next_clip_id();
-            if let Some(track) = self.tracks.get_mut(track_index) {
-                track.midi_notes = notes;
+            if let Some(clip_id) = Self::clip_id_from_filename(file_name) {
+                clip_notes_by_id.insert((track_index, clip_id), notes);
+            } else {
                 let clip_name = Path::new(file_name)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("MIDI")
                     .replace('_', " ");
-                if track.clips.is_empty() {
-                    let max_end: f32 = track
-                        .midi_notes
+                clip_notes_by_name.insert((track_index, clip_name.clone()), notes.clone());
+                track_notes.entry(track_index).or_insert(notes);
+            }
+        }
+
+        let mut next_clip_id = self.next_clip_id();
+        let mut rebuild_indices = Vec::new();
+        for (track_index, track) in self.tracks.iter_mut().enumerate() {
+            for clip in track.clips.iter_mut() {
+                clip.midi_notes.clear();
+            }
+            let mut any_clip_notes = false;
+            if track.clips.is_empty() {
+                if let Some(notes) = track_notes.remove(&track_index) {
+                    let max_end: f32 = notes
                         .iter()
                         .map(|n| n.start_beats + n.length_beats)
                         .fold(1.0, |a, b| a.max(b));
@@ -10606,7 +11653,9 @@ impl DawApp {
                         start_beats: 0.0,
                         length_beats: max_end.max(1.0),
                         is_midi: true,
-                        name: clip_name,
+                        midi_notes: notes.clone(),
+                        link_id: None,
+                        name: "MIDI".to_string(),
                         audio_path: None,
                         audio_source_beats: None,
                         audio_offset_beats: 0.0,
@@ -10614,13 +11663,139 @@ impl DawApp {
                         audio_pitch_semitones: 0.0,
                         audio_time_mul: 1.0,
                     });
-                } else if track.clips[0].name.trim().is_empty() {
-                    track.clips[0].name = clip_name;
+                    next_clip_id = next_clip_id.saturating_add(1);
+                    any_clip_notes = true;
                 }
             }
+            for clip in track.clips.iter_mut() {
+                if !clip.is_midi {
+                    continue;
+                }
+                let mut clip_notes = clip_notes_by_id
+                    .remove(&(track_index, clip.id))
+                    .or_else(|| {
+                        if clip.name.trim().is_empty() {
+                            None
+                        } else {
+                            clip_notes_by_name.get(&(track_index, clip.name.clone())).cloned()
+                        }
+                    });
+                if let Some(mut notes) = clip_notes.take() {
+                    for note in &mut notes {
+                        note.start_beats = (note.start_beats + clip.start_beats).max(0.0);
+                    }
+                    clip.midi_notes = notes;
+                    any_clip_notes = true;
+                }
+            }
+            if !any_clip_notes {
+                if let Some(notes) = track_notes.remove(&track_index) {
+                    if track.clips.iter().any(|c| c.is_midi) {
+                        for clip in track.clips.iter_mut() {
+                            if !clip.is_midi {
+                                continue;
+                            }
+                            let mut shifted_notes = Vec::new();
+                            for note in &notes {
+                                let mut shifted = note.clone();
+                                shifted.start_beats = (shifted.start_beats + clip.start_beats).max(0.0);
+                                shifted_notes.push(shifted);
+                            }
+                            clip.midi_notes = shifted_notes;
+                        }
+                    } else {
+                        let max_end: f32 = notes
+                            .iter()
+                            .map(|n| n.start_beats + n.length_beats)
+                            .fold(1.0, |a, b| a.max(b));
+                        track.clips.push(Clip {
+                            id: next_clip_id,
+                            track: track_index,
+                            start_beats: 0.0,
+                            length_beats: max_end.max(1.0),
+                            is_midi: true,
+                            midi_notes: notes.clone(),
+                            link_id: None,
+                            name: "MIDI".to_string(),
+                            audio_path: None,
+                            audio_source_beats: None,
+                            audio_offset_beats: 0.0,
+                            audio_gain: 1.0,
+                            audio_pitch_semitones: 0.0,
+                            audio_time_mul: 1.0,
+                        });
+                        next_clip_id = next_clip_id.saturating_add(1);
+                    }
+                }
+            }
+            rebuild_indices.push(track_index);
+        }
+
+        for track_index in rebuild_indices {
+            self.rebuild_track_midi_notes(track_index);
         }
 
         Ok(())
+    }
+
+    fn migrate_track_notes_to_clips(&mut self) {
+        let mut next_clip_id = self.next_clip_id();
+        let mut rebuild_indices = Vec::new();
+        for (track_index, track) in self.tracks.iter_mut().enumerate() {
+            if track.midi_notes.is_empty() {
+                continue;
+            }
+            let has_clip_notes = track
+                .clips
+                .iter()
+                .any(|clip| clip.is_midi && !clip.midi_notes.is_empty());
+            if has_clip_notes {
+                continue;
+            }
+            if track.clips.is_empty() {
+                let max_end: f32 = track
+                    .midi_notes
+                    .iter()
+                    .map(|n| n.start_beats + n.length_beats)
+                    .fold(1.0, |a, b| a.max(b));
+                track.clips.push(Clip {
+                    id: next_clip_id,
+                    track: track_index,
+                    start_beats: 0.0,
+                    length_beats: max_end.max(1.0),
+                    is_midi: true,
+                    midi_notes: track.midi_notes.clone(),
+                    link_id: None,
+                    name: "MIDI".to_string(),
+                    audio_path: None,
+                    audio_source_beats: None,
+                    audio_offset_beats: 0.0,
+                    audio_gain: 1.0,
+                    audio_pitch_semitones: 0.0,
+                    audio_time_mul: 1.0,
+                });
+                next_clip_id = next_clip_id.saturating_add(1);
+            } else {
+                for clip in track.clips.iter_mut().filter(|c| c.is_midi) {
+                    let clip_start = clip.start_beats;
+                    let clip_end = clip.start_beats + clip.length_beats;
+                    let mut notes = Vec::new();
+                    for note in &track.midi_notes {
+                        let note_end = note.start_beats + note.length_beats;
+                        if note.start_beats < clip_end && note_end > clip_start {
+                            notes.push(note.clone());
+                        }
+                    }
+                    if !notes.is_empty() {
+                        clip.midi_notes = notes;
+                    }
+                }
+            }
+            rebuild_indices.push(track_index);
+        }
+        for track_index in rebuild_indices {
+            self.rebuild_track_midi_notes(track_index);
+        }
     }
 
     fn track_index_from_filename(file_name: &str) -> Option<usize> {
@@ -10637,6 +11812,17 @@ impl DawApp {
         }
         let index: usize = digits.parse().ok()?;
         index.checked_sub(1)
+    }
+
+    fn clip_id_from_filename(file_name: &str) -> Option<usize> {
+        let stem = Path::new(file_name).file_stem()?.to_str()?;
+        let marker = "_clip";
+        let pos = stem.rfind(marker)?;
+        let digits = &stem[pos + marker.len()..];
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
     }
 
     fn import_midi_dialog(&mut self) -> Result<(), String> {
@@ -10719,6 +11905,8 @@ impl DawApp {
                 start_beats: 0.0,
                 length_beats: max_end.max(1.0),
                 is_midi: true,
+                midi_notes: track_data.notes.clone(),
+                link_id: None,
                 name: format!("Track {}", track_data.track_index + 1),
                 audio_path: None,
                 audio_source_beats: None,
@@ -10762,9 +11950,11 @@ impl DawApp {
                 level: 0.8,
                 muted: false,
                 solo: false,
-                midi_notes: track_data.notes.clone(),
+                midi_notes: Vec::new(),
                 instrument_path,
+                instrument_clap_id: None,
                 effect_paths: Vec::new(),
+                effect_clap_ids: Vec::new(),
                 effect_bypass: Vec::new(),
                 effect_params: Vec::new(),
                 effect_param_ids: Vec::new(),
@@ -10906,6 +12096,11 @@ impl DawApp {
         if range_end <= range_start {
             range_end = project_end.max(range_start + 0.25);
         }
+        if self.render_tail_mode == RenderTailMode::Release {
+            let tail_beats = (self.render_release_seconds.max(0.0) * self.tempo_bpm.max(1.0) / 60.0)
+                .max(0.0);
+            range_end = range_end.max(range_start + 0.25) + tail_beats;
+        }
 
         let master_name = match format {
             RenderFormat::Wav => format!("{base_name}.wav"),
@@ -10992,11 +12187,13 @@ impl DawApp {
             .map(|track| RenderTrack {
                 notes: track.midi_notes.clone(),
                 instrument_path: track.instrument_path.clone(),
+                instrument_clap_id: track.instrument_clap_id.clone(),
                 param_ids: track.param_ids.clone(),
                 param_values: track.param_values.clone(),
                 plugin_state_component: track.plugin_state_component.clone(),
                 plugin_state_controller: track.plugin_state_controller.clone(),
                 effect_paths: track.effect_paths.clone(),
+                effect_clap_ids: track.effect_clap_ids.clone(),
                 effect_bypass: track.effect_bypass.clone(),
                 automation_lanes: track.automation_lanes.clone(),
                 level: track.level,
@@ -11012,6 +12209,8 @@ impl DawApp {
             end_beats: end_beats.max(start_beats + 0.25),
             bitrate_kbps: self.render_bitrate,
             wav_bit_depth: self.render_wav_bit_depth,
+            render_tail_mode: self.render_tail_mode,
+            render_release_seconds: self.render_release_seconds,
             tracks,
             notes: Vec::new(),
             instrument_path: None,
@@ -11021,6 +12220,7 @@ impl DawApp {
             plugin_state_controller: None,
             audio_clips,
             audio_cache,
+            master_settings: self.master_settings_snapshot(),
         }
     }
 
@@ -11033,13 +12233,14 @@ impl DawApp {
         end_beats: f32,
     ) -> RenderPlan {
         let block_size = self.settings.buffer_size.max(64) as usize;
-        let (notes, instrument_path, param_ids, param_values, component, controller, automation_lanes) = self
+        let (notes, instrument_path, instrument_clap_id, param_ids, param_values, component, controller, automation_lanes) = self
             .tracks
             .get(index)
             .map(|track| {
                 (
                     track.midi_notes.clone(),
                     track.instrument_path.clone(),
+                    track.instrument_clap_id.clone(),
                     track.param_ids.clone(),
                     track.param_values.clone(),
                     track.plugin_state_component.clone(),
@@ -11047,22 +12248,24 @@ impl DawApp {
                     track.automation_lanes.clone(),
                 )
             })
-            .unwrap_or_else(|| (Vec::new(), None, Vec::new(), Vec::new(), None, None, Vec::new()));
-        let (effect_paths, effect_bypass) = self
+            .unwrap_or_else(|| (Vec::new(), None, None, Vec::new(), Vec::new(), None, None, Vec::new()));
+        let (effect_paths, effect_bypass, effect_clap_ids) = self
             .tracks
             .get(index)
-            .map(|track| (track.effect_paths.clone(), track.effect_bypass.clone()))
-            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            .map(|track| (track.effect_paths.clone(), track.effect_bypass.clone(), track.effect_clap_ids.clone()))
+            .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
         let (audio_clips, audio_cache) =
             self.build_audio_clip_render_data(sample_rate, Some(index));
         let track = RenderTrack {
             notes,
             instrument_path,
+            instrument_clap_id,
             param_ids,
             param_values,
             plugin_state_component: component,
             plugin_state_controller: controller,
             effect_paths,
+            effect_clap_ids,
             effect_bypass,
             automation_lanes,
             level: 1.0,
@@ -11077,6 +12280,8 @@ impl DawApp {
             end_beats: end_beats.max(start_beats + 0.25),
             bitrate_kbps: self.render_bitrate,
             wav_bit_depth: self.render_wav_bit_depth,
+            render_tail_mode: self.render_tail_mode,
+            render_release_seconds: self.render_release_seconds,
             tracks: vec![track],
             notes: Vec::new(),
             instrument_path: None,
@@ -11086,6 +12291,7 @@ impl DawApp {
             plugin_state_controller: None,
             audio_clips,
             audio_cache,
+            master_settings: self.master_settings_snapshot(),
         }
     }
 
@@ -11200,6 +12406,8 @@ impl DawApp {
         };
 
         let notes = self.active_midi_notes();
+        let master_settings = self.master_settings_snapshot();
+        let mut master_state = MasterCompState::default();
         let mut cursor = 0usize;
         while cursor < total_samples {
             let frames = (total_samples - cursor).min(block_size);
@@ -11210,6 +12418,13 @@ impl DawApp {
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut output, channels as usize, &events);
             }
+            apply_master_processing(
+                &mut output,
+                channels as usize,
+                sample_rate as f32,
+                &master_settings,
+                &mut master_state,
+            );
             write_wav_samples(&mut writer, self.render_wav_bit_depth, &output)?;
             cursor += frames;
             self.render_progress = Some((cursor as u64, total_samples_u64));
@@ -11507,6 +12722,8 @@ impl DawApp {
                 start_beats,
                 length_beats: beats,
                 is_midi: false,
+                midi_notes: Vec::new(),
+                link_id: None,
                 name: "Recording".to_string(),
                 audio_path: Some(format!("audio/{file_name}")),
                 audio_source_beats: Some(beats),
@@ -11540,13 +12757,14 @@ impl DawApp {
             for note in &notes {
                 max_end = max_end.max(note.start_beats + note.length_beats);
             }
-            track.midi_notes.extend(notes);
             track.clips.push(Clip {
                 id: clip_id,
                 track: track_index,
                 start_beats,
                 length_beats: (max_end - start_beats).max(0.25),
                 is_midi: true,
+                midi_notes: notes,
+                link_id: None,
                 name: "MIDI Rec".to_string(),
                 audio_path: None,
                 audio_source_beats: None,
@@ -11774,6 +12992,8 @@ impl DawApp {
         let freq_bits = self.midi_freq_bits.clone();
         let gate = self.midi_gate.clone();
         let master_peak_bits = self.master_peak_bits.clone();
+        let master_settings = self.master_settings.clone();
+        let master_comp_state = self.master_comp_state.clone();
         self.adaptive_buffer_size
             .store(effective_buffer, Ordering::Relaxed);
         self.last_overrun.store(false, Ordering::Relaxed);
@@ -11804,13 +13024,40 @@ impl DawApp {
             };
             if let Some(path) = path {
                 if state.host.is_none() {
-                match vst3::Vst3Host::load(
-                    &path,
-                    self.settings.sample_rate as f64,
-                    buffer_size_usize,
-                    channels,
-                ) {
-                    Ok(host) => {
+                    let kind = Self::plugin_kind_from_path(&path);
+                    let host = match kind {
+                        PluginKind::Vst3 => vst3::Vst3Host::load(
+                            &path,
+                            self.settings.sample_rate as f64,
+                            buffer_size_usize,
+                            channels,
+                        )
+                        .ok()
+                        .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                        PluginKind::Clap => {
+                            let clap_id = self
+                                .tracks
+                                .get(index)
+                                .and_then(|track| track.instrument_clap_id.clone())
+                                .or_else(|| clap_host::default_plugin_id(&path).ok());
+                            clap_id.and_then(|clap_id| {
+                                if let Some(track) = self.tracks.get_mut(index) {
+                                    track.instrument_clap_id = Some(clap_id.clone());
+                                }
+                                clap_host::ClapHost::load(
+                                    &path,
+                                    &clap_id,
+                                    self.settings.sample_rate as f64,
+                                    buffer_size_usize as u32,
+                                    channels,
+                                    channels,
+                                )
+                                .ok()
+                                .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                            })
+                        }
+                    };
+                    if let Some(host) = host {
                         let params = host.enumerate_params();
                         if let Some(track) = self.tracks.get_mut(index) {
                             if !params.is_empty() {
@@ -11828,7 +13075,6 @@ impl DawApp {
                                 Self::apply_program_param(track);
                             }
                         }
-                        let host = Arc::new(Mutex::new(host));
                         state.host = Some(host.clone());
                         if sync_micesynth_program {
                             micesynth_program_sync.push(index);
@@ -11844,51 +13090,73 @@ impl DawApp {
                                     .as_ref()
                                     .map(|v| !v.is_empty())
                                     .unwrap_or(false);
-                            if let Ok(mut host) = host.lock() {
-                                if has_state {
-                                    let _ = host.set_state_bytes(
-                                        component.as_deref(),
-                                        controller.as_deref(),
-                                    );
-                                } else if !track.param_ids.is_empty() {
-                                    for (param_id, value) in
-                                        track.param_ids.iter().zip(track.param_values.iter())
-                                    {
-                                        host.push_param_change(*param_id, *value as f64);
-                                    }
+                            if has_state {
+                                let _ = host.set_state_bytes(
+                                    component.as_deref(),
+                                    controller.as_deref(),
+                                );
+                            } else if !track.param_ids.is_empty() {
+                                for (param_id, value) in
+                                    track.param_ids.iter().zip(track.param_values.iter())
+                                {
+                                    host.push_param_change(*param_id, *value as f64);
                                 }
                             }
                         }
+                    } else {
+                        self.status = "Plugin host error: unable to load".to_string();
                     }
-                    Err(err) => {
-                        self.status = format!("VST3 host error: {err}");
-                    }
-                }
                 }
             } else {
                 state.host = None;
             }
             if state.effect_hosts.len() != effect_paths.len() {
                 for host in state.effect_hosts.drain(..) {
-                    if let Ok(mut host) = host.lock() {
-                        host.prepare_for_drop();
-                    }
+                    host.prepare_for_drop();
                     self.orphaned_hosts.push(host);
                 }
-                for fx_path in effect_paths.iter() {
-                    match vst3::Vst3Host::load_with_input(
-                        fx_path,
-                        self.settings.sample_rate as f64,
-                        buffer_size_usize,
-                        channels,
-                        channels,
-                    ) {
-                        Ok(host) => {
-                            state.effect_hosts.push(Arc::new(Mutex::new(host)));
+                for (slot, fx_path) in effect_paths.iter().enumerate() {
+                    let kind = Self::plugin_kind_from_path(fx_path);
+                    let host = match kind {
+                        PluginKind::Vst3 => vst3::Vst3Host::load_with_input(
+                            fx_path,
+                            self.settings.sample_rate as f64,
+                            buffer_size_usize,
+                            channels,
+                            channels,
+                        )
+                        .ok()
+                        .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                        PluginKind::Clap => {
+                            let clap_id = self
+                                .tracks
+                                .get(index)
+                                .and_then(|track| track.effect_clap_ids.get(slot).and_then(|id| id.clone()))
+                                .or_else(|| clap_host::default_plugin_id(fx_path).ok());
+                            clap_id.and_then(|clap_id| {
+                                if let Some(track) = self.tracks.get_mut(index) {
+                                    if track.effect_clap_ids.len() < effect_paths.len() {
+                                        track.effect_clap_ids.resize(effect_paths.len(), None);
+                                    }
+                                    track.effect_clap_ids[slot] = Some(clap_id.clone());
+                                }
+                                clap_host::ClapHost::load(
+                                    fx_path,
+                                    &clap_id,
+                                    self.settings.sample_rate as f64,
+                                    buffer_size_usize as u32,
+                                    channels,
+                                    channels,
+                                )
+                                .ok()
+                                .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                            })
                         }
-                        Err(err) => {
-                            self.status = format!("FX host error: {err}");
-                        }
+                    };
+                    if let Some(host) = host {
+                        state.effect_hosts.push(host);
+                    } else {
+                        self.status = "FX host error: unable to load".to_string();
                     }
                 }
             }
@@ -11896,40 +13164,41 @@ impl DawApp {
                 if track.effect_bypass.len() != effect_paths.len() {
                     track.effect_bypass.resize(effect_paths.len(), false);
                 }
+                if track.effect_clap_ids.len() != effect_paths.len() {
+                    track.effect_clap_ids.resize(effect_paths.len(), None);
+                }
                 if track.effect_params.len() != effect_paths.len() {
                     track.effect_params.resize(effect_paths.len(), Vec::new());
                     track.effect_param_ids.resize(effect_paths.len(), Vec::new());
                     track.effect_param_values.resize(effect_paths.len(), Vec::new());
                 }
                 for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
-                    if let Ok(host) = fx_host.lock() {
-                        let params = host.enumerate_params();
-                        if !params.is_empty() {
-                            let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-                            let reuse = track
-                                .effect_param_ids
+                    let params = fx_host.enumerate_params();
+                    if !params.is_empty() {
+                        let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
+                        let reuse = track
+                            .effect_param_ids
+                            .get(fx_index)
+                            .map(|ids| *ids == next_ids)
+                            .unwrap_or(false)
+                            && track
+                                .effect_param_values
                                 .get(fx_index)
-                                .map(|ids| *ids == next_ids)
-                                .unwrap_or(false)
-                                && track
-                                    .effect_param_values
-                                    .get(fx_index)
-                                    .map(|vals| vals.len() == params.len())
-                                    .unwrap_or(false);
-                            let next_values = if reuse {
-                                track.effect_param_values[fx_index].clone()
-                            } else {
-                                params.iter().map(|p| p.default_value as f32).collect()
-                            };
-                            if let Some(slot) = track.effect_params.get_mut(fx_index) {
-                                *slot = params.iter().map(|p| p.name.clone()).collect();
-                            }
-                            if let Some(slot) = track.effect_param_ids.get_mut(fx_index) {
-                                *slot = next_ids;
-                            }
-                            if let Some(slot) = track.effect_param_values.get_mut(fx_index) {
-                                *slot = next_values;
-                            }
+                                .map(|vals| vals.len() == params.len())
+                                .unwrap_or(false);
+                        let next_values = if reuse {
+                            track.effect_param_values[fx_index].clone()
+                        } else {
+                            params.iter().map(|p| p.default_value as f32).collect()
+                        };
+                        if let Some(slot) = track.effect_params.get_mut(fx_index) {
+                            *slot = params.iter().map(|p| p.name.clone()).collect();
+                        }
+                        if let Some(slot) = track.effect_param_ids.get_mut(fx_index) {
+                            *slot = next_ids;
+                        }
+                        if let Some(slot) = track.effect_param_values.get_mut(fx_index) {
+                            *slot = next_values;
                         }
                     }
                 }
@@ -12001,6 +13270,16 @@ impl DawApp {
                         if !processed {
                             render_sine(data, channels, sample_rate, &freq_bits, &gate);
                         }
+                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.lock() {
+                            apply_master_processing(
+                                data,
+                                channels,
+                                sample_rate,
+                                &settings,
+                                &mut state,
+                            );
+                        }
                         for sample in data.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
                         }
@@ -12068,6 +13347,16 @@ impl DawApp {
                         );
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
+                        }
+                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.lock() {
+                            apply_master_processing(
+                                &mut temp,
+                                channels,
+                                sample_rate,
+                                &settings,
+                                &mut state,
+                            );
                         }
                         for sample in temp.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
@@ -12141,6 +13430,16 @@ impl DawApp {
                         );
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
+                        }
+                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.lock() {
+                            apply_master_processing(
+                                &mut temp,
+                                channels,
+                                sample_rate,
+                                &settings,
+                                &mut state,
+                            );
                         }
                         for sample in temp.iter_mut() {
                             *sample = sample.clamp(-1.0, 1.0);
@@ -12360,9 +13659,7 @@ impl DawApp {
             let Some(host) = state.host.as_ref() else {
                 continue;
             };
-            if let Ok(mut host) = host.lock() {
-                let _ = host.process_f32(&mut buffer, channels, &events);
-            }
+            let _ = host.process_f32(&mut buffer, channels, &events);
         }
     }
 
@@ -12436,7 +13733,7 @@ impl DawApp {
     }
     fn pick_vst_file(&self) -> Option<String> {
         let path = rfd::FileDialog::new()
-            .add_filter("VST3", &["vst3"])
+            .add_filter("Plugins", &["vst3", "clap"])
             .pick_file();
         path.map(|p| p.to_string_lossy().to_string())
     }
@@ -12444,19 +13741,163 @@ impl DawApp {
     fn open_plugin_picker(&mut self, target: PluginTarget) {
         self.plugin_target = Some(target);
         if self.plugin_candidates.is_empty() {
-            self.plugin_candidates = self.scan_vst3_plugins();
+            self.plugin_candidates = self.scan_plugins();
         }
         self.show_plugin_picker = true;
     }
 
-    fn scan_vst3_plugins(&self) -> Vec<String> {
-        let root = PathBuf::from("C:\\Program Files\\Common Files\\VST3");
-        let local = PathBuf::from("synths");
-        let mut found = Vec::new();
-        self.scan_dir(&root, &mut found);
-        self.scan_dir(&local, &mut found);
-        found.sort();
-        found
+    fn scan_plugins(&self) -> Vec<PluginCandidate> {
+        let mut candidates = Vec::new();
+        let mut vst3_paths = Vec::new();
+        for root in self.vst3_search_roots() {
+            self.scan_dir_for_exts(&root, &mut vst3_paths, &["vst3"]);
+        }
+        vst3_paths.sort();
+        for path in vst3_paths {
+            let display = Self::plugin_display_name(&path);
+            candidates.push(PluginCandidate {
+                path,
+                kind: PluginKind::Vst3,
+                clap_id: None,
+                display,
+            });
+        }
+
+        let mut clap_paths = Vec::new();
+        for root in self.clap_search_roots() {
+            self.scan_dir_for_exts(&root, &mut clap_paths, &["clap"]);
+        }
+        clap_paths.sort();
+        for path in clap_paths {
+            match clap_host::enumerate_plugins(&path) {
+                Ok(descriptors) if !descriptors.is_empty() => {
+                    for desc in descriptors {
+                        let display = format!("{} (CLAP)", desc.name);
+                        candidates.push(PluginCandidate {
+                            path: path.clone(),
+                            kind: PluginKind::Clap,
+                            clap_id: Some(desc.id),
+                            display,
+                        });
+                    }
+                }
+                _ => {
+                    let display = format!("{} (CLAP)", Self::plugin_display_name(&path));
+                    candidates.push(PluginCandidate {
+                        path: path.clone(),
+                        kind: PluginKind::Clap,
+                        clap_id: None,
+                        display,
+                    });
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()));
+        candidates
+    }
+
+    fn plugin_kind_from_path(path: &str) -> PluginKind {
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "clap" {
+            PluginKind::Clap
+        } else {
+            PluginKind::Vst3
+        }
+    }
+
+    fn enumerate_plugin_params_for_track(
+        &mut self,
+        index: usize,
+        path: &str,
+    ) -> Result<Vec<vst3::ParamInfo>, String> {
+        match Self::plugin_kind_from_path(path) {
+            PluginKind::Vst3 => vst3::enumerate_params(path),
+            PluginKind::Clap => {
+                let clap_id = self
+                    .tracks
+                    .get(index)
+                    .and_then(|t| t.instrument_clap_id.clone())
+                    .or_else(|| clap_host::default_plugin_id(path).ok())
+                    .ok_or_else(|| "CLAP plugin id not found".to_string())?;
+                if let Some(track) = self.tracks.get_mut(index) {
+                    track.instrument_clap_id = Some(clap_id.clone());
+                }
+                let mut host = clap_host::ClapHost::load(
+                    path,
+                    &clap_id,
+                    self.settings.sample_rate as f64,
+                    self.settings.buffer_size as u32,
+                    2,
+                    2,
+                )
+                .map_err(|e| e.to_string())?;
+                let params = host
+                    .enumerate_params()
+                    .into_iter()
+                    .map(|param| vst3::ParamInfo {
+                        id: param.id,
+                        name: param.name,
+                        default_value: param.default_value,
+                    })
+                    .collect();
+                Ok(params)
+            }
+        }
+    }
+
+    fn vst3_search_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        #[cfg(windows)]
+        {
+            roots.push(PathBuf::from("C:\\Program Files\\Common Files\\VST3"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            roots.push(PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
+            if let Some(home) = Self::home_dir() {
+                roots.push(home.join("Library/Audio/Plug-Ins/VST3"));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            roots.push(PathBuf::from("/usr/lib/vst3"));
+            roots.push(PathBuf::from("/usr/local/lib/vst3"));
+            if let Some(home) = Self::home_dir() {
+                roots.push(home.join(".vst3"));
+            }
+        }
+        roots.push(PathBuf::from("synths"));
+        roots
+    }
+
+    fn clap_search_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        #[cfg(windows)]
+        {
+            roots.push(PathBuf::from("C:\\Program Files\\Common Files\\CLAP"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            roots.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
+            if let Some(home) = Self::home_dir() {
+                roots.push(home.join("Library/Audio/Plug-Ins/CLAP"));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            roots.push(PathBuf::from("/usr/lib/clap"));
+            roots.push(PathBuf::from("/usr/local/lib/clap"));
+            if let Some(home) = Self::home_dir() {
+                roots.push(home.join(".clap"));
+            }
+        }
+        roots.push(PathBuf::from("synths"));
+        roots
     }
 
     fn plugin_display_name(path: &str) -> String {
@@ -12470,16 +13911,17 @@ impl DawApp {
 
     fn find_vst3_plugin_by_name(&mut self, name: &str) -> Option<String> {
         if self.plugin_candidates.is_empty() {
-            self.plugin_candidates = self.scan_vst3_plugins();
+            self.plugin_candidates = self.scan_plugins();
         }
         let needle = name.to_ascii_lowercase();
         self.plugin_candidates
             .iter()
-            .find(|path| {
-                let display = Self::plugin_display_name(path).to_ascii_lowercase();
+            .filter(|candidate| candidate.kind == PluginKind::Vst3)
+            .find(|candidate| {
+                let display = candidate.display.to_ascii_lowercase();
                 display == needle || display.contains(&needle)
             })
-            .cloned()
+            .map(|candidate| candidate.path.clone())
     }
 
     fn apply_program_param(track: &mut Track) {
@@ -12602,11 +14044,9 @@ impl DawApp {
 
         let (mut component_bytes, mut controller_bytes) = (Vec::new(), Vec::new());
         if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
-            if let Ok(host) = host.lock() {
-                let (component, controller) = host.get_state_bytes();
-                component_bytes = component;
-                controller_bytes = controller;
-            }
+            let (component, controller) = host.get_state_bytes();
+            component_bytes = component;
+            controller_bytes = controller;
         }
         if component_bytes.is_empty() {
             if let Some(bytes) = track.plugin_state_component.as_ref() {
@@ -12715,32 +14155,30 @@ impl DawApp {
         }
 
         if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
-            if let Ok(mut host) = host.lock() {
-                if !component_bytes.is_empty() || !controller_bytes.is_empty() {
-                    let _ = host.set_state_bytes(
-                        if component_bytes.is_empty() {
-                            None
-                        } else {
-                            Some(component_bytes.as_slice())
-                        },
-                        if controller_bytes.is_empty() {
-                            None
-                        } else {
-                            Some(controller_bytes.as_slice())
-                        },
-                    );
-                } else if let Some(track) = self.tracks.get(index) {
-                    for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
-                        host.push_param_change(*param_id, *value as f64);
-                    }
+            if !component_bytes.is_empty() || !controller_bytes.is_empty() {
+                let _ = host.set_state_bytes(
+                    if component_bytes.is_empty() {
+                        None
+                    } else {
+                        Some(component_bytes.as_slice())
+                    },
+                    if controller_bytes.is_empty() {
+                        None
+                    } else {
+                        Some(controller_bytes.as_slice())
+                    },
+                );
+            } else if let Some(track) = self.tracks.get(index) {
+                for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
+                    host.push_param_change(*param_id, *value as f64);
                 }
+            }
 
-                if let Some(track) = self.tracks.get_mut(index) {
-                    for (slot, param_id) in track.param_ids.iter().enumerate() {
-                        if let Some(value) = host.get_param_normalized(*param_id) {
-                            if let Some(target) = track.param_values.get_mut(slot) {
-                                *target = value as f32;
-                            }
+            if let Some(track) = self.tracks.get_mut(index) {
+                for (slot, param_id) in track.param_ids.iter().enumerate() {
+                    if let Some(value) = host.get_param_normalized(*param_id) {
+                        if let Some(target) = track.param_values.get_mut(slot) {
+                            *target = value as f32;
                         }
                     }
                 }
@@ -12762,7 +14200,28 @@ impl DawApp {
         plugin_path: &str,
         requested_program: u8,
     ) -> Result<(), String> {
-        let params = vst3::enumerate_params(plugin_path)?;
+        let params = match Self::plugin_kind_from_path(plugin_path) {
+            PluginKind::Vst3 => vst3::enumerate_params(plugin_path)?,
+            PluginKind::Clap => {
+                let clap_id = clap_host::default_plugin_id(plugin_path)?;
+                let mut host = clap_host::ClapHost::load(
+                    plugin_path,
+                    &clap_id,
+                    self.settings.sample_rate as f64,
+                    self.settings.buffer_size as u32,
+                    2,
+                    2,
+                )?;
+                host.enumerate_params()
+                    .into_iter()
+                    .map(|param| vst3::ParamInfo {
+                        id: param.id,
+                        name: param.name,
+                        default_value: param.default_value,
+                    })
+                    .collect()
+            }
+        };
         if params.is_empty() {
             return Err("Preset generation failed: no parameters".to_string());
         }
@@ -12944,13 +14403,11 @@ impl DawApp {
         }
 
         if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
-            if let Ok(mut host) = host.lock() {
-                host.push_param_change(program_param_id, normalized);
-                for (slot, param_id) in param_ids.iter().enumerate() {
-                    if let Some(value) = host.get_param_normalized(*param_id) {
-                        if let Some(target) = param_values.get_mut(slot) {
-                            *target = value as f32;
-                        }
+            host.push_param_change(program_param_id, normalized);
+            for (slot, param_id) in param_ids.iter().enumerate() {
+                if let Some(value) = host.get_param_normalized(*param_id) {
+                    if let Some(target) = param_values.get_mut(slot) {
+                        *target = value as f32;
                     }
                 }
             }
@@ -12962,86 +14419,111 @@ impl DawApp {
     }
 
     fn scan_dir(&self, dir: &Path, out: &mut Vec<String>) {
+        self.scan_dir_for_exts(dir, out, &["vst3"]);
+    }
+
+    fn scan_dir_for_exts(&self, dir: &Path, out: &mut Vec<String>, exts: &[&str]) {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(_) => return,
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let matches_ext = exts.iter().any(|e| *e == ext);
             if path.is_dir() {
-                self.scan_dir(&path, out);
-            } else if let Some(ext) = path.extension() {
-                if ext.to_ascii_lowercase() == "vst3" {
+                if matches_ext {
                     out.push(path.to_string_lossy().to_string());
+                    continue;
                 }
+                self.scan_dir_for_exts(&path, out, exts);
+            } else if matches_ext {
+                out.push(path.to_string_lossy().to_string());
             }
         }
     }
 
+    fn home_dir() -> Option<PathBuf> {
+        if cfg!(windows) {
+            std::env::var("USERPROFILE").ok().map(PathBuf::from)
+        } else {
+            std::env::var("HOME").ok().map(PathBuf::from)
+        }
+    }
+
     fn refresh_track_params(&mut self, index: usize) {
-        if let Some(track) = self.tracks.get_mut(index) {
-            if let Some(path) = track.instrument_path.as_deref() {
-                let params_result = self
-                    .track_audio
-                    .get(index)
-                    .and_then(|state| state.host.as_ref())
-                    .and_then(|host| host.try_lock().ok().map(|host| host.enumerate_params()))
-                    .map(Ok)
-                    .unwrap_or_else(|| vst3::enumerate_params(path));
-                match params_result {
-                    Ok(params) if !params.is_empty() => {
-                        let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-                        let reuse_values = track.param_ids == next_ids
-                            && track.param_values.len() == params.len();
-                        let next_values = if reuse_values {
-                            track.param_values.clone()
-                        } else {
-                            params.iter().map(|p| p.default_value as f32).collect()
-                        };
-                        track.params = params.iter().map(|p| p.name.clone()).collect();
-                        track.param_ids = next_ids;
-                        track.param_values = next_values;
-                        Self::apply_program_param(track);
-                        if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
-                            let mut lanes = Vec::new();
-                            for name in &track.automation_channels {
-                                if let Some((idx, param_id)) = track
-                                    .params
-                                    .iter()
-                                    .enumerate()
-                                    .find(|(_, n)| *n == name)
-                                    .and_then(|(i, _)| track.param_ids.get(i).copied().map(|id| (i, id)))
-                                {
-                                    let _ = idx;
-                                    lanes.push(AutomationLane {
-                                        name: name.clone(),
-                                        param_id,
-                                        target: AutomationTarget::Instrument,
-                                        points: Vec::new(),
-                                    });
-                                }
-                            }
-                            if !lanes.is_empty() {
-                                track.automation_lanes = lanes;
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        track.params = default_instrument_params();
-                        track.param_ids.clear();
-                        track.param_values.clear();
-                    }
-                    Err(err) => {
-                        track.params = default_instrument_params();
-                        track.param_ids.clear();
-                        track.param_values.clear();
-                        self.status = format!("VST3 params unavailable: {err}");
-                    }
-                }
-            } else {
+        let path = self
+            .tracks
+            .get(index)
+            .and_then(|track| track.instrument_path.clone());
+        let Some(path) = path else {
+            if let Some(track) = self.tracks.get_mut(index) {
                 track.params = default_midi_params();
                 track.param_ids.clear();
                 track.param_values.clear();
+            }
+            return;
+        };
+        let params_result = self
+            .track_audio
+            .get(index)
+            .and_then(|state| state.host.as_ref())
+            .map(|host| Ok(host.enumerate_params()))
+            .unwrap_or_else(|| self.enumerate_plugin_params_for_track(index, &path));
+        let Some(track) = self.tracks.get_mut(index) else {
+            return;
+        };
+        match params_result {
+            Ok(params) if !params.is_empty() => {
+                let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
+                let reuse_values = track.param_ids == next_ids && track.param_values.len() == params.len();
+                let next_values = if reuse_values {
+                    track.param_values.clone()
+                } else {
+                    params.iter().map(|p| p.default_value as f32).collect()
+                };
+                track.params = params.iter().map(|p| p.name.clone()).collect();
+                track.param_ids = next_ids;
+                track.param_values = next_values;
+                Self::apply_program_param(track);
+                if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
+                    let mut lanes = Vec::new();
+                    for name in &track.automation_channels {
+                        if let Some((idx, param_id)) = track
+                            .params
+                            .iter()
+                            .enumerate()
+                            .find(|(_, n)| *n == name)
+                            .and_then(|(i, _)| track.param_ids.get(i).copied().map(|id| (i, id)))
+                        {
+                            let _ = idx;
+                            lanes.push(AutomationLane {
+                                name: name.clone(),
+                                param_id,
+                                target: AutomationTarget::Instrument,
+                                points: Vec::new(),
+                            });
+                        }
+                    }
+                    if !lanes.is_empty() {
+                        track.automation_lanes = lanes;
+                    }
+                }
+            }
+            Ok(_) => {
+                track.params = default_instrument_params();
+                track.param_ids.clear();
+                track.param_values.clear();
+            }
+            Err(err) => {
+                track.params = default_instrument_params();
+                track.param_ids.clear();
+                track.param_values.clear();
+                self.status = format!("Plugin params unavailable: {err}");
             }
         }
     }
@@ -13102,7 +14584,7 @@ impl DawApp {
         }
     }
 
-    fn replace_instrument(&mut self, index: usize, path: String) {
+    fn replace_instrument(&mut self, index: usize, path: String, clap_id: Option<String>) {
         let mut reopen_ui = false;
         if self
             .plugin_ui
@@ -13119,15 +14601,14 @@ impl DawApp {
         }
         if let Some(track) = self.tracks.get_mut(index) {
             track.instrument_path = Some(path);
+            track.instrument_clap_id = clap_id;
             track.params = default_instrument_params();
             track.param_ids.clear();
             track.param_values.clear();
         }
         if let Some(state) = self.track_audio.get_mut(index) {
             if let Some(host) = state.host.take() {
-                if let Ok(mut host) = host.lock() {
-                    host.prepare_for_drop();
-                }
+                host.prepare_for_drop();
                 self.orphaned_hosts.push(host);
             }
         }
@@ -13333,6 +14814,40 @@ fn move_plugin_child_window(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
 
 #[cfg(not(windows))]
 fn move_plugin_child_window(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) {}
+
+#[cfg(windows)]
+fn resize_plugin_top_window(hwnd: isize, client_w: i32, client_h: i32) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AdjustWindowRectEx, GetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOZORDER,
+    };
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_w.max(1),
+        bottom: client_h.max(1),
+    };
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        AdjustWindowRectEx(&mut rect, style, 0, ex_style);
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn resize_plugin_top_window(_hwnd: isize, _client_w: i32, _client_h: i32) {}
 
 #[cfg(windows)]
 fn destroy_plugin_child_window(hwnd: isize) {
@@ -13601,29 +15116,32 @@ fn render_plan_to_wav(
     let file = std::fs::File::create(&plan.path).map_err(|e| e.to_string())?;
     let mut writer = hound::WavWriter::new(file, spec).map_err(|e| e.to_string())?;
 
-    let mut track_hosts: Vec<(RenderTrack, Option<vst3::Vst3Host>, Vec<vst3::Vst3Host>)> = Vec::new();
+    let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks {
             let host = if let Some(path) = track.instrument_path.as_ref() {
-                vst3::Vst3Host::load(
+                load_render_host(
                     path,
+                    track.instrument_clap_id.as_deref(),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
+                    false,
                 )
-                .ok()
             } else {
                 None
             };
             let mut fx_hosts = Vec::new();
-            for fx_path in &track.effect_paths {
-                if let Ok(fx) = vst3::Vst3Host::load_with_input(
+            for (fx_index, fx_path) in track.effect_paths.iter().enumerate() {
+                let fx = load_render_host(
                     fx_path,
+                    track.effect_clap_ids.get(fx_index).and_then(|id| id.as_deref()),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
-                    channels as usize,
-                ) {
+                    true,
+                );
+                if let Some(fx) = fx {
                     fx_hosts.push(fx);
                 }
             }
@@ -13631,24 +15149,27 @@ fn render_plan_to_wav(
         }
     } else {
         let host = if let Some(path) = plan.instrument_path.as_ref() {
-            vst3::Vst3Host::load(
+            load_render_host(
                 path,
+                None,
                 plan.sample_rate as f64,
                 plan.block_size,
                 channels as usize,
+                false,
             )
-            .ok()
         } else {
             None
         };
         let single = RenderTrack {
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
+            instrument_clap_id: None,
             param_ids: plan.param_ids.clone(),
             param_values: plan.param_values.clone(),
             plugin_state_component: plan.plugin_state_component.clone(),
             plugin_state_controller: plan.plugin_state_controller.clone(),
             effect_paths: Vec::new(),
+            effect_clap_ids: Vec::new(),
             effect_bypass: Vec::new(),
             automation_lanes: Vec::new(),
             level: 1.0,
@@ -13684,6 +15205,7 @@ fn render_plan_to_wav(
         }
     }
 
+    let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
         let frames = (total_samples - cursor).min(plan.block_size);
@@ -13714,7 +15236,19 @@ fn render_plan_to_wav(
                     }
                 }
             }
-            let events = collect_block_events(&track.notes, block_start, block_end, samples_per_beat);
+            let mut events = if plan.render_tail_mode == RenderTailMode::Release && block_start == start_samples {
+                (0u8..=127)
+                    .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            events.extend(collect_block_events(
+                &track.notes,
+                block_start,
+                block_end,
+                samples_per_beat,
+            ));
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
@@ -13789,6 +15323,13 @@ fn render_plan_to_wav(
                 }
             }
         }
+        apply_master_processing(
+            &mut output,
+            channels as usize,
+            plan.sample_rate as f32,
+            &plan.master_settings,
+            &mut master_state,
+        );
         write_wav_samples(&mut writer, plan.wav_bit_depth, &output)?;
         cursor += frames;
         done.store(cursor as u64, Ordering::Relaxed);
@@ -13797,6 +15338,44 @@ fn render_plan_to_wav(
     writer.finalize().map_err(|e| e.to_string())?;
     done.store(total_samples_u64, Ordering::Relaxed);
     Ok(())
+}
+
+fn load_render_host(
+    path: &str,
+    clap_id: Option<&str>,
+    sample_rate: f64,
+    block_size: usize,
+    channels: usize,
+    with_input: bool,
+) -> Option<RenderHost> {
+    match DawApp::plugin_kind_from_path(path) {
+        PluginKind::Vst3 => {
+            if with_input {
+                vst3::Vst3Host::load_with_input(path, sample_rate, block_size, channels, channels)
+                    .ok()
+                    .map(RenderHost::Vst3)
+            } else {
+                vst3::Vst3Host::load(path, sample_rate, block_size, channels)
+                    .ok()
+                    .map(RenderHost::Vst3)
+            }
+        }
+        PluginKind::Clap => {
+            let clap_id = clap_id
+                .map(|id| id.to_string())
+                .or_else(|| clap_host::default_plugin_id(path).ok())?;
+            clap_host::ClapHost::load(
+                path,
+                &clap_id,
+                sample_rate,
+                block_size as u32,
+                channels,
+                channels,
+            )
+            .ok()
+            .map(RenderHost::Clap)
+        }
+    }
 }
 
 fn render_plan_for_each_block<F>(
@@ -13820,29 +15399,32 @@ where
     let total_samples = end_samples.saturating_sub(start_samples) as usize;
     let total_samples_u64 = total_samples as u64;
 
-    let mut track_hosts: Vec<(RenderTrack, Option<vst3::Vst3Host>, Vec<vst3::Vst3Host>)> = Vec::new();
+    let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks.iter().cloned() {
             let host = if let Some(path) = track.instrument_path.as_ref() {
-                vst3::Vst3Host::load(
+                load_render_host(
                     path,
+                    track.instrument_clap_id.as_deref(),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
+                    false,
                 )
-                .ok()
             } else {
                 None
             };
             let mut fx_hosts = Vec::new();
-            for fx_path in &track.effect_paths {
-                if let Ok(fx) = vst3::Vst3Host::load_with_input(
+            for (fx_index, fx_path) in track.effect_paths.iter().enumerate() {
+                let fx = load_render_host(
                     fx_path,
+                    track.effect_clap_ids.get(fx_index).and_then(|id| id.as_deref()),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
-                    channels as usize,
-                ) {
+                    true,
+                );
+                if let Some(fx) = fx {
                     fx_hosts.push(fx);
                 }
             }
@@ -13850,24 +15432,27 @@ where
         }
     } else {
         let host = if let Some(path) = plan.instrument_path.as_ref() {
-            vst3::Vst3Host::load(
+            load_render_host(
                 path,
+                None,
                 plan.sample_rate as f64,
                 plan.block_size,
                 channels as usize,
+                false,
             )
-            .ok()
         } else {
             None
         };
         let single = RenderTrack {
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
+            instrument_clap_id: None,
             param_ids: plan.param_ids.clone(),
             param_values: plan.param_values.clone(),
             plugin_state_component: plan.plugin_state_component.clone(),
             plugin_state_controller: plan.plugin_state_controller.clone(),
             effect_paths: Vec::new(),
+            effect_clap_ids: Vec::new(),
             effect_bypass: Vec::new(),
             automation_lanes: Vec::new(),
             level: 1.0,
@@ -13902,6 +15487,7 @@ where
         }
     }
 
+    let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
         let frames = (total_samples - cursor).min(plan.block_size);
@@ -13932,7 +15518,19 @@ where
                     }
                 }
             }
-            let events = collect_block_events(&track.notes, block_start, block_end, samples_per_beat);
+            let mut events = if plan.render_tail_mode == RenderTailMode::Release && block_start == start_samples {
+                (0u8..=127)
+                    .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            events.extend(collect_block_events(
+                &track.notes,
+                block_start,
+                block_end,
+                samples_per_beat,
+            ));
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
@@ -14007,6 +15605,13 @@ where
                 }
             }
         }
+        apply_master_processing(
+            &mut output,
+            channels as usize,
+            plan.sample_rate as f32,
+            &plan.master_settings,
+            &mut master_state,
+        );
         on_block(&output, frames)?;
         cursor += frames;
         done.store(progress_offset + cursor as u64, Ordering::Relaxed);
@@ -14032,29 +15637,32 @@ fn render_plan_to_f32(
     let total_samples_u64 = total_samples as u64;
     total.store(total_samples_u64.max(1), Ordering::Relaxed);
 
-    let mut track_hosts: Vec<(RenderTrack, Option<vst3::Vst3Host>, Vec<vst3::Vst3Host>)> = Vec::new();
+    let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks {
             let host = if let Some(path) = track.instrument_path.as_ref() {
-                vst3::Vst3Host::load(
+                load_render_host(
                     path,
+                    track.instrument_clap_id.as_deref(),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
+                    false,
                 )
-                .ok()
             } else {
                 None
             };
             let mut fx_hosts = Vec::new();
-            for fx_path in &track.effect_paths {
-                if let Ok(fx) = vst3::Vst3Host::load_with_input(
+            for (fx_index, fx_path) in track.effect_paths.iter().enumerate() {
+                let fx = load_render_host(
                     fx_path,
+                    track.effect_clap_ids.get(fx_index).and_then(|id| id.as_deref()),
                     plan.sample_rate as f64,
                     plan.block_size,
                     channels as usize,
-                    channels as usize,
-                ) {
+                    true,
+                );
+                if let Some(fx) = fx {
                     fx_hosts.push(fx);
                 }
             }
@@ -14062,24 +15670,27 @@ fn render_plan_to_f32(
         }
     } else {
         let host = if let Some(path) = plan.instrument_path.as_ref() {
-            vst3::Vst3Host::load(
+            load_render_host(
                 path,
+                None,
                 plan.sample_rate as f64,
                 plan.block_size,
                 channels as usize,
+                false,
             )
-            .ok()
         } else {
             None
         };
         let single = RenderTrack {
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
+            instrument_clap_id: None,
             param_ids: plan.param_ids.clone(),
             param_values: plan.param_values.clone(),
             plugin_state_component: plan.plugin_state_component.clone(),
             plugin_state_controller: plan.plugin_state_controller.clone(),
             effect_paths: Vec::new(),
+            effect_clap_ids: Vec::new(),
             effect_bypass: Vec::new(),
             automation_lanes: Vec::new(),
             level: 1.0,
@@ -14572,47 +16183,44 @@ fn mix_track_hosts(
                     .ok()
                     .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
                     .unwrap_or_default();
-                if let Ok(mut host) = host.lock() {
-                    for pending in &pending_params {
-                        match pending.target {
-                            PendingParamTarget::Instrument => {
-                                host.push_param_change(pending.param_id, pending.value);
-                            }
-                            PendingParamTarget::Effect(_) => {
-                                remaining_params.push(*pending);
-                            }
+                for pending in &pending_params {
+                    match pending.target {
+                        PendingParamTarget::Instrument => {
+                            host.push_param_change(pending.param_id, pending.value);
+                        }
+                        PendingParamTarget::Effect(_) => {
+                            remaining_params.push(*pending);
                         }
                     }
-                    for lane in &automation {
-                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat)
-                        {
-                            if lane.target == AutomationTarget::Instrument {
-                                host.push_param_change(lane.param_id, value as f64);
-                            }
+                }
+                for lane in &automation {
+                    if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                        if lane.target == AutomationTarget::Instrument {
+                            host.push_param_change(lane.param_id, value as f64);
                         }
                     }
-                    let mut filtered = Vec::with_capacity(events.len());
-                    for event in events {
-                        match event {
-                            vst3::MidiEvent::ControlChange {
-                                channel,
-                                controller,
-                                value,
-                            } => {
-                                if let Some(param_id) = learned_map.get(&(channel, controller)) {
-                                    let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
-                                    host.push_param_change(*param_id, norm);
-                                } else {
-                                    filtered.push(event);
-                                }
+                }
+                let mut filtered = Vec::with_capacity(events.len());
+                for event in events {
+                    match event {
+                        vst3::MidiEvent::ControlChange {
+                            channel,
+                            controller,
+                            value,
+                        } => {
+                            if let Some(param_id) = learned_map.get(&(channel, controller)) {
+                                let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
+                                host.push_param_change(*param_id, norm);
+                            } else {
+                                filtered.push(event);
                             }
-                            _ => filtered.push(event),
                         }
+                        _ => filtered.push(event),
                     }
-                    filtered_events = filtered;
-                    if host.process_f32(temp, channels, &filtered_events).is_ok() {
-                        track_processed = true;
-                    }
+                }
+                filtered_events = filtered;
+                if host.process_f32(temp, channels, &filtered_events).is_ok() {
+                    track_processed = true;
                 }
             }
 
@@ -14673,31 +16281,29 @@ fn mix_track_hosts(
                         continue;
                     }
                     scratch_slice.fill(0.0);
-                    if let Ok(mut fx_host) = fx_host.lock() {
-                        let mut still_pending: Vec<PendingParamChange> = Vec::new();
-                        for pending in remaining_params.drain(..) {
-                            match pending.target {
-                                PendingParamTarget::Effect(target_index) if target_index == fx_index => {
-                                    fx_host.push_param_change(pending.param_id, pending.value);
-                                }
-                                _ => still_pending.push(pending),
+                    let mut still_pending: Vec<PendingParamChange> = Vec::new();
+                    for pending in remaining_params.drain(..) {
+                        match pending.target {
+                            PendingParamTarget::Effect(target_index) if target_index == fx_index => {
+                                fx_host.push_param_change(pending.param_id, pending.value);
+                            }
+                            _ => still_pending.push(pending),
+                        }
+                    }
+                    remaining_params = still_pending;
+                    for lane in &automation {
+                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                            if lane.target == AutomationTarget::Effect(fx_index) {
+                                fx_host.push_param_change(lane.param_id, value as f64);
                             }
                         }
-                        remaining_params = still_pending;
-                        for lane in &automation {
-                            if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                                if lane.target == AutomationTarget::Effect(fx_index) {
-                                    fx_host.push_param_change(lane.param_id, value as f64);
-                                }
-                            }
-                        }
-                        if fx_host
-                            .process_f32_with_input(current, scratch_slice, channels, &filtered_events)
-                            .is_ok()
-                        {
-                            std::mem::swap(&mut current, &mut scratch_slice);
-                            use_temp = !use_temp;
-                        }
+                    }
+                    if fx_host
+                        .process_f32_with_input(current, scratch_slice, channels, &filtered_events)
+                        .is_ok()
+                    {
+                        std::mem::swap(&mut current, &mut scratch_slice);
+                        use_temp = !use_temp;
                     }
                 }
                 if !remaining_params.is_empty() {
@@ -14883,6 +16489,60 @@ fn collect_block_events(
         }
     }
     events
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    10.0f32.powf(db / 20.0)
+}
+
+fn apply_master_processing(
+    samples: &mut [f32],
+    channels: usize,
+    sample_rate: f32,
+    settings: &MasterCompSettings,
+    state: &mut MasterCompState,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut gain = settings.level.clamp(0.0, 2.0);
+    if settings.enabled {
+        let threshold = db_to_gain(settings.threshold_db);
+        let ratio = settings.ratio.max(1.0);
+        let attack = (settings.attack_ms.max(0.1) / 1000.0).max(0.0001);
+        let release = (settings.release_ms.max(0.1) / 1000.0).max(0.0001);
+        let attack_coeff = (-1.0 / (attack * sample_rate.max(1.0))).exp();
+        let release_coeff = (-1.0 / (release * sample_rate.max(1.0))).exp();
+        let makeup = db_to_gain(settings.makeup_db);
+        gain *= makeup;
+
+        for frame in samples.chunks_mut(channels.max(1)) {
+            let mut level = 0.0f32;
+            for sample in frame.iter() {
+                level = level.max(sample.abs());
+            }
+            let target_gain = if level > threshold {
+                let over = (level / threshold).max(1.0);
+                let compressed = over.powf(1.0 / ratio);
+                (compressed / over).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if target_gain < state.gain {
+                state.gain = attack_coeff * (state.gain - target_gain) + target_gain;
+            } else {
+                state.gain = release_coeff * (state.gain - target_gain) + target_gain;
+            }
+            let frame_gain = state.gain * gain;
+            for sample in frame.iter_mut() {
+                *sample *= frame_gain;
+            }
+        }
+    } else if gain != 1.0 {
+        for sample in samples.iter_mut() {
+            *sample *= gain;
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
