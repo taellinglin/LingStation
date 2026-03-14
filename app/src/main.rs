@@ -5,7 +5,7 @@ use engine::timeline::PianoRollNote;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE;
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use rand::RngCore;
 use reqwest::blocking::Client;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::TAU;
 use std::fs;
 use std::io::{BufReader, Write};
@@ -34,10 +34,23 @@ const BASE_UI_FONT_SIZE: f32 = 9.0;
 const LICENSE_API_BASE: &str = "https://linglin.art";
 const LICENSE_PUBLIC_KEY_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJQEieMJP2VOEI8yM7BOpelBIUvC2AOUDm85k0OjtYNT";
 const LICENSE_PRODUCT_CODE: &str = "LingStation";
+const AUDIO_CLIP_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const AUDIO_CLIP_CACHE_MAX_ENTRIES: usize = 256;
+const WAVEFORM_CACHE_MAX_ENTRIES: usize = 256;
+const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
+const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
 
 fn main() -> eframe::Result<()> {
     install_crash_logger();
     init_windows_com();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "render" {
+        if let Err(err) = run_cli_render(&args[2..]) {
+            eprintln!("Render failed: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0]);
     if let Some(icon) = load_app_icon() {
@@ -52,6 +65,48 @@ fn main() -> eframe::Result<()> {
         configure_fonts(&cc.egui_ctx);
         Box::new(DawApp::default())
     }))
+}
+
+fn run_cli_render(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("Usage: LingStation render <project_folder> <output_folder> [wav|ogg|flac]".to_string());
+    }
+    let project_folder = PathBuf::from(args[0].trim());
+    let output_folder = PathBuf::from(args[1].trim());
+    let format = args.get(2).map(|s| s.as_str()).unwrap_or("wav");
+    let render_format = match format.to_ascii_lowercase().as_str() {
+        "wav" => RenderFormat::Wav,
+        "ogg" => RenderFormat::Ogg,
+        "flac" => RenderFormat::Flac,
+        other => return Err(format!("Unknown format: {other}")),
+    };
+
+    let mut app = DawApp::default();
+    app.load_project_from_folder(&project_folder)?;
+    app.render_format = render_format;
+    app.render_range_start = 0.0;
+    app.render_range_end = app.project_end_beats().max(0.25);
+    app.render_with_options(&output_folder)?;
+    wait_for_render_job(&mut app)
+}
+
+fn wait_for_render_job(app: &mut DawApp) -> Result<(), String> {
+    loop {
+        let Some(job) = app.render_job.as_ref() else {
+            return Ok(());
+        };
+        if job.finished.load(Ordering::Relaxed) {
+            let result = job
+                .result
+                .lock()
+                .map_err(|_| "Render result lock failed".to_string())?
+                .take()
+                .unwrap_or_else(|| Err("Render finished without status".to_string()));
+            app.render_job = None;
+            return result.map(|_| ());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn load_app_icon() -> Option<egui::IconData> {
@@ -318,6 +373,10 @@ struct SettingsState {
     #[serde(default)]
     license_file: String,
     #[serde(default)]
+    license_monthly_activations: Option<u64>,
+    #[serde(default)]
+    license_remaining_activations: Option<u64>,
+    #[serde(default)]
     triple_buffer: bool,
     #[serde(default)]
     safe_underruns: bool,
@@ -358,6 +417,8 @@ impl Default for SettingsState {
             auth_token: String::new(),
             registered_to: String::new(),
             license_file: String::new(),
+            license_monthly_activations: None,
+            license_remaining_activations: None,
             triple_buffer: false,
             safe_underruns: true,
             adaptive_buffer: true,
@@ -728,6 +789,128 @@ struct AudioClipData {
     sample_rate: u32,
 }
 
+struct AudioClipCache {
+    entries: HashMap<String, Arc<AudioClipData>>,
+    order: VecDeque<String>,
+    bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl AudioClipCache {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+            max_entries,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<AudioClipData>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, data: Arc<AudioClipData>) {
+        let new_size = Self::clip_bytes(&data);
+        if let Some(existing) = self.entries.get(&key) {
+            let old_size = Self::clip_bytes(existing);
+            self.bytes = self.bytes.saturating_sub(old_size);
+        }
+        self.entries.insert(key.clone(), data);
+        self.bytes = self.bytes.saturating_add(new_size);
+        self.touch(&key);
+        self.trim_to_limits();
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(data) = self.entries.remove(key) {
+            let size = Self::clip_bytes(&data);
+            self.bytes = self.bytes.saturating_sub(size);
+        }
+        self.order.retain(|entry| entry != key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn size_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.order.retain(|entry| entry != key);
+        self.order.push_back(key.to_string());
+    }
+
+    fn trim_to_limits(&mut self) {
+        while (self.max_entries > 0 && self.entries.len() > self.max_entries)
+            || (self.max_bytes > 0 && self.bytes > self.max_bytes)
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(data) = self.entries.remove(&oldest) {
+                let size = Self::clip_bytes(&data);
+                self.bytes = self.bytes.saturating_sub(size);
+            }
+        }
+    }
+
+    fn clip_bytes(data: &AudioClipData) -> usize {
+        data.samples.len().saturating_mul(std::mem::size_of::<f32>())
+    }
+}
+
+struct AudioRuntimeStats {
+    blocks: AtomicU64,
+    overruns: AtomicU64,
+    last_block_ms_bits: AtomicU32,
+    max_block_ms_bits: AtomicU32,
+}
+
+impl AudioRuntimeStats {
+    fn new() -> Self {
+        Self {
+            blocks: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            last_block_ms_bits: AtomicU32::new(0.0f32.to_bits()),
+            max_block_ms_bits: AtomicU32::new(0.0f32.to_bits()),
+        }
+    }
+
+    fn record_block(&self, elapsed_ms: f32, overrun: bool) {
+        self.blocks.fetch_add(1, Ordering::Relaxed);
+        if overrun {
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        self.last_block_ms_bits.store(elapsed_ms.to_bits(), Ordering::Relaxed);
+        let mut current_max = f32::from_bits(self.max_block_ms_bits.load(Ordering::Relaxed));
+        if elapsed_ms > current_max {
+            current_max = elapsed_ms;
+            self.max_block_ms_bits
+                .store(current_max.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, f32, f32) {
+        (
+            self.blocks.load(Ordering::Relaxed),
+            self.overruns.load(Ordering::Relaxed),
+            f32::from_bits(self.last_block_ms_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.max_block_ms_bits.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 #[derive(Clone)]
 struct AudioClipRender {
     path: String,
@@ -760,6 +943,7 @@ struct RenderPlan {
     audio_clips: Vec<AudioClipRender>,
     audio_cache: HashMap<String, Arc<AudioClipData>>,
     master_settings: MasterCompSettings,
+    license_comment: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -976,12 +1160,14 @@ struct LicenseJobResult {
     token: Option<String>,
     license_file: Option<String>,
     registered_to: Option<String>,
+    remaining_activations: Option<u64>,
 }
 
 struct LicensePayloadInfo {
     registered_to: Option<String>,
     license_type: Option<String>,
     max_activations: Option<u64>,
+    monthly_activations: Option<u64>,
 }
 
 struct DawApp {
@@ -1111,12 +1297,16 @@ struct DawApp {
     waveform_cache: RefCell<HashMap<String, Vec<f32>>>,
     waveform_color_cache: RefCell<HashMap<String, Vec<[f32; 3]>>>,
     waveform_len_seconds_cache: RefCell<HashMap<String, f32>>,
-    audio_clip_cache: Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>,
+    waveform_cache_order: RefCell<VecDeque<String>>,
+    waveform_color_cache_order: RefCell<VecDeque<String>>,
+    waveform_len_seconds_cache_order: RefCell<VecDeque<String>>,
+    audio_clip_cache: Arc<Mutex<AudioClipCache>>,
     audio_clip_timeline: Arc<Mutex<Vec<AudioClipRender>>>,
     audio_preview_stream: Option<OutputStream>,
     audio_preview_sink: Option<Sink>,
     audio_preview_loop: bool,
     audio_preview_clip_id: Option<usize>,
+    audio_stats: Arc<AudioRuntimeStats>,
     buffer_override: Option<u32>,
     adaptive_restart_requested: Arc<AtomicBool>,
     adaptive_buffer_size: Arc<AtomicU32>,
@@ -1143,6 +1333,7 @@ struct DawApp {
     pending_startup_maximize: bool,
     seen_nonzero_viewport: bool,
     pending_viewport_focus: bool,
+    pending_repaint_frames: u32,
     fs_expanded: HashSet<String>,
     fs_selected: Option<String>,
     browser_expanded: HashSet<String>,
@@ -1726,12 +1917,19 @@ impl Default for DawApp {
             waveform_cache: RefCell::new(HashMap::new()),
             waveform_color_cache: RefCell::new(HashMap::new()),
             waveform_len_seconds_cache: RefCell::new(HashMap::new()),
-            audio_clip_cache: Arc::new(Mutex::new(HashMap::new())),
+            waveform_cache_order: RefCell::new(VecDeque::new()),
+            waveform_color_cache_order: RefCell::new(VecDeque::new()),
+            waveform_len_seconds_cache_order: RefCell::new(VecDeque::new()),
+            audio_clip_cache: Arc::new(Mutex::new(AudioClipCache::new(
+                AUDIO_CLIP_CACHE_MAX_BYTES,
+                AUDIO_CLIP_CACHE_MAX_ENTRIES,
+            ))),
             audio_clip_timeline: Arc::new(Mutex::new(Vec::new())),
             audio_preview_stream: None,
             audio_preview_sink: None,
             audio_preview_loop: false,
             audio_preview_clip_id: None,
+            audio_stats: Arc::new(AudioRuntimeStats::new()),
             buffer_override: None,
             adaptive_restart_requested: Arc::new(AtomicBool::new(false)),
             adaptive_buffer_size: Arc::new(AtomicU32::new(0)),
@@ -1764,6 +1962,7 @@ impl Default for DawApp {
             pending_startup_maximize: true,
             seen_nonzero_viewport: false,
             pending_viewport_focus: false,
+            pending_repaint_frames: 0,
             fs_expanded: HashSet::new(),
             fs_selected: None,
             browser_expanded: HashSet::new(),
@@ -1803,6 +2002,7 @@ impl eframe::App for DawApp {
             }
         }
         self.poll_license_job();
+        self.sync_last_param_changes();
         let viewport = ctx.input(|i| i.viewport().clone());
         let viewport_has_size = viewport
             .outer_rect
@@ -1830,6 +2030,10 @@ impl eframe::App for DawApp {
         if self.pending_viewport_focus {
             self.pending_viewport_focus = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
+        if self.pending_repaint_frames > 0 {
+            self.pending_repaint_frames = self.pending_repaint_frames.saturating_sub(1);
             ctx.request_repaint();
         }
         self.apply_theme(ctx);
@@ -1898,6 +2102,14 @@ impl eframe::App for DawApp {
         }
         self.plugin_ui_window(ctx, frame);
         self.modals(ctx);
+        if self.pending_project_action.is_some() && !self.show_close_confirm {
+            if let Some(action) = self.pending_project_action.take() {
+                self.perform_project_action(action);
+                self.pending_viewport_focus = true;
+                self.pending_repaint_frames = self.pending_repaint_frames.max(12);
+                ctx.request_repaint();
+            }
+        }
         if self.exit_confirmed {
             self.exit_confirmed = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2460,7 +2672,7 @@ impl DawApp {
             self.pending_project_action = Some(action);
             self.show_close_confirm = true;
         } else {
-            self.perform_project_action(action);
+            self.pending_project_action = Some(action);
         }
     }
 
@@ -2744,6 +2956,9 @@ impl DawApp {
         let mut fx_updates: Vec<(usize, Vec<String>, Vec<u32>, Vec<f32>)> = Vec::new();
         for (fx_index, _) in effect_paths.iter().enumerate() {
             if !needs_params.get(fx_index).copied().unwrap_or(true) {
+                continue;
+            }
+            if !self.audio_running {
                 continue;
             }
             if let Some(host) = self.ensure_effect_host(track_index, fx_index, 2) {
@@ -3582,9 +3797,15 @@ impl DawApp {
         if params.is_empty() {
             return;
         }
+        track.param_values = Self::remap_param_values_by_id_or_name(
+            &track.param_ids,
+            &track.params,
+            &track.param_values,
+            &params,
+        );
         track.params = params.iter().map(|p| p.name.clone()).collect();
         track.param_ids = params.iter().map(|p| p.id).collect();
-        track.param_values = params.iter().map(|p| p.default_value as f32).collect();
+        Self::log_fm_ratio_param_from(index, "ensure_live", &track.params, &track.param_ids, &track.param_values);
     }
 
     fn refresh_clap_params_if_needed(&mut self) {
@@ -3607,10 +3828,41 @@ impl DawApp {
             return;
         }
         if let Some(track) = self.tracks.get_mut(index) {
+            if track.param_values.len() != params.len() {
+                track.param_values = Self::remap_param_values_by_id_or_name_clap(
+                    &track.param_ids,
+                    &track.params,
+                    &track.param_values,
+                    &params,
+                );
+            }
             track.params = params.iter().map(|p| p.name.clone()).collect();
             track.param_ids = params.iter().map(|p| p.id).collect();
-            if track.param_values.len() != params.len() {
-                track.param_values = params.iter().map(|p| p.default_value as f32).collect();
+            Self::log_fm_ratio_param_from(index, "refresh_clap", &track.params, &track.param_ids, &track.param_values);
+        }
+    }
+
+    fn sync_last_param_changes(&mut self) {
+        for (index, state) in self.track_audio.iter().enumerate() {
+            let Some(PluginHostHandle::Vst3(host)) = state.host.as_ref() else {
+                continue;
+            };
+            let mut host = match host.try_lock() {
+                Ok(host) => host,
+                Err(_) => continue,
+            };
+            let Some((param_id, value)) = host.take_last_param_change() else {
+                continue;
+            };
+            if let Some(track) = self.tracks.get_mut(index) {
+                if let Some(pos) = track.param_ids.iter().position(|id| *id == param_id) {
+                    if track.param_values.len() != track.param_ids.len() {
+                        track.param_values.resize(track.param_ids.len(), 0.0);
+                    }
+                    if let Some(target) = track.param_values.get_mut(pos) {
+                        *target = value as f32;
+                    }
+                }
             }
         }
     }
@@ -3961,6 +4213,27 @@ impl DawApp {
         self.default_project_dir().map(|dir| dir.join(rel))
     }
 
+    fn touch_cache_key(order: &mut VecDeque<String>, key: &str) {
+        order.retain(|entry| entry != key);
+        order.push_back(key.to_string());
+    }
+
+    fn trim_cache_entries<T>(
+        cache: &mut HashMap<String, T>,
+        order: &mut VecDeque<String>,
+        max_entries: usize,
+    ) {
+        if max_entries == 0 {
+            return;
+        }
+        while cache.len() > max_entries {
+            let Some(oldest) = order.pop_front() else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+    }
+
     fn get_waveform_for_clip(&self, clip: &Clip) -> Option<Vec<f32>> {
         let path = self.resolve_clip_audio_path(clip)?;
         let key = path.to_string_lossy().to_string();
@@ -3970,6 +4243,11 @@ impl DawApp {
                 if let Some(data) = Self::build_waveform(&path, 768) {
                     cache.insert(key.clone(), data);
                 }
+            }
+            if cache.contains_key(&key) {
+                let mut order = self.waveform_cache_order.borrow_mut();
+                Self::touch_cache_key(&mut order, &key);
+                Self::trim_cache_entries(&mut cache, &mut order, WAVEFORM_CACHE_MAX_ENTRIES);
             }
             cache.get(&key).cloned()
         }
@@ -3985,6 +4263,15 @@ impl DawApp {
                     cache.insert(key.clone(), data);
                 }
             }
+            if cache.contains_key(&key) {
+                let mut order = self.waveform_color_cache_order.borrow_mut();
+                Self::touch_cache_key(&mut order, &key);
+                Self::trim_cache_entries(
+                    &mut cache,
+                    &mut order,
+                    WAVEFORM_COLOR_CACHE_MAX_ENTRIES,
+                );
+            }
             cache.get(&key).cloned()
         }
     }
@@ -3998,6 +4285,15 @@ impl DawApp {
                 if let Some(seconds) = Self::audio_length_seconds(&path) {
                     cache.insert(key.clone(), seconds);
                 }
+            }
+            if cache.contains_key(&key) {
+                let mut order = self.waveform_len_seconds_cache_order.borrow_mut();
+                Self::touch_cache_key(&mut order, &key);
+                Self::trim_cache_entries(
+                    &mut cache,
+                    &mut order,
+                    WAVEFORM_LEN_CACHE_MAX_ENTRIES,
+                );
             }
             cache.get(&key).copied()
         }
@@ -4269,7 +4565,7 @@ impl DawApp {
         (renders, cache)
     }
 
-    fn preload_audio_clips(&self, cache: &Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>) {
+    fn preload_audio_clips(&self, cache: &Arc<Mutex<AudioClipCache>>) {
         for track in &self.tracks {
             for clip in &track.clips {
                 if clip.is_midi {
@@ -4283,7 +4579,7 @@ impl DawApp {
                     Ok(guard) => guard,
                     Err(_) => continue,
                 };
-                if guard.contains_key(&key) {
+                if guard.get(&key).is_some() {
                     continue;
                 }
                 if let Some(data) = Self::load_audio_clip_data(&path) {
@@ -4898,6 +5194,39 @@ impl DawApp {
                             }
                         }
                     }
+                    let (blocks, overruns, last_ms, max_ms) = self.audio_stats.snapshot();
+                    ui.label(format!(
+                        "Audio blocks {blocks} | overruns {overruns} | last {last_ms:.2} ms | max {max_ms:.2} ms"
+                    ));
+                    if let Ok(cache) = self.audio_clip_cache.lock() {
+                        let mb = cache.size_bytes() as f32 / (1024.0 * 1024.0);
+                        ui.label(format!(
+                            "Clip cache: {} items | {:.1} MB",
+                            cache.len(),
+                            mb
+                        ));
+                    }
+                    let waveform_bytes = self
+                        .waveform_cache
+                        .borrow()
+                        .values()
+                        .map(|v| v.len().saturating_mul(std::mem::size_of::<f32>()))
+                        .sum::<usize>();
+                    let waveform_color_bytes = self
+                        .waveform_color_cache
+                        .borrow()
+                        .values()
+                        .map(|v| v.len().saturating_mul(std::mem::size_of::<[f32; 3]>()))
+                        .sum::<usize>();
+                    let waveform_mb = waveform_bytes as f32 / (1024.0 * 1024.0);
+                    let waveform_color_mb = waveform_color_bytes as f32 / (1024.0 * 1024.0);
+                    ui.label(format!(
+                        "Waveforms: {} | {:.1} MB | Colors: {} | {:.1} MB",
+                        self.waveform_cache.borrow().len(),
+                        waveform_mb,
+                        self.waveform_color_cache.borrow().len(),
+                        waveform_color_mb
+                    ));
                 }
             });
 
@@ -4940,6 +5269,7 @@ impl DawApp {
                     self.destroy_plugin_ui();
                 }
                 self.pending_viewport_focus = true;
+                self.pending_repaint_frames = self.pending_repaint_frames.max(12);
                 ctx.request_repaint();
                 return;
             }
@@ -4964,6 +5294,8 @@ impl DawApp {
                     self.destroy_plugin_ui();
                 }
             }
+            self.pending_viewport_focus = true;
+            self.pending_repaint_frames = self.pending_repaint_frames.max(12);
             ctx.request_repaint();
             return;
         }
@@ -4987,6 +5319,7 @@ impl DawApp {
             }
         }
         if !self.show_plugin_ui {
+            let should_focus = self.plugin_ui.is_some() && !self.plugin_ui_hidden;
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                     editor.set_focus(false);
@@ -4995,6 +5328,10 @@ impl DawApp {
             }
             if self.plugin_ui.is_some() {
                 self.plugin_ui_hidden = true;
+            }
+            if should_focus {
+                self.pending_viewport_focus = true;
+                self.pending_repaint_frames = self.pending_repaint_frames.max(12);
             }
             ctx.request_repaint();
             return;
@@ -5121,10 +5458,13 @@ impl DawApp {
             if self.plugin_ui.is_some() {
                 self.plugin_ui_hidden = true;
             }
+            self.pending_viewport_focus = true;
+            self.pending_repaint_frames = self.pending_repaint_frames.max(12);
             ctx.request_repaint();
         }
         self.show_plugin_ui = open;
         if !self.show_plugin_ui {
+            let should_focus = self.plugin_ui.is_some() && !self.plugin_ui_hidden;
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                     editor.set_focus(false);
@@ -5133,6 +5473,10 @@ impl DawApp {
             }
             if self.plugin_ui.is_some() {
                 self.plugin_ui_hidden = true;
+            }
+            if should_focus {
+                self.pending_viewport_focus = true;
+                self.pending_repaint_frames = self.pending_repaint_frames.max(12);
             }
             ctx.request_repaint();
         }
@@ -5306,18 +5650,7 @@ impl DawApp {
         let Some(mut ui_host) = self.plugin_ui.take() else {
             return;
         };
-        match &mut ui_host.editor {
-            PluginUiEditor::Vst3(editor) => {
-                editor.removed();
-            }
-            PluginUiEditor::Clap => {
-                if let PluginHostHandle::Clap(host) = &ui_host.host {
-                    if let Ok(mut host) = host.lock() {
-                        host.destroy_gui();
-                    }
-                }
-            }
-        }
+        // Skip plugin GUI teardown callbacks here; some plugins hang the UI thread on close.
         if ui_host.child_hwnd != ui_host.hwnd && is_window_alive(ui_host.child_hwnd) {
             destroy_plugin_child_window(ui_host.child_hwnd);
         }
@@ -5492,6 +5825,13 @@ impl DawApp {
         self.waveform_cache.borrow_mut().remove(&key);
         self.waveform_color_cache.borrow_mut().remove(&key);
         self.waveform_len_seconds_cache.borrow_mut().remove(&key);
+        self.waveform_cache_order.borrow_mut().retain(|entry| entry != &key);
+        self.waveform_color_cache_order
+            .borrow_mut()
+            .retain(|entry| entry != &key);
+        self.waveform_len_seconds_cache_order
+            .borrow_mut()
+            .retain(|entry| entry != &key);
         if let Ok(mut cache) = self.audio_clip_cache.lock() {
             cache.remove(&key);
         }
@@ -6762,6 +7102,11 @@ impl DawApp {
                     self.arranger_pan += input.pointer.delta();
                     response.clone().on_hover_cursor(egui::CursorIcon::Move);
                 } else if input.modifiers.ctrl {
+                    let pointer_x = pointer_pos
+                        .map(|pos| pos.x)
+                        .unwrap_or(rect.left() + lane_label_w);
+                    let local_x = pointer_x - (rect.left() + lane_label_w);
+                    let before_zoom = self.arranger_zoom;
                     let zoom = input.zoom_delta();
                     if (zoom - 1.0).abs() > f32::EPSILON {
                         self.arranger_zoom = (self.arranger_zoom * zoom).clamp(0.05, 4.0);
@@ -6773,6 +7118,12 @@ impl DawApp {
                         let zoom_delta = (delta.x + delta.y) * 0.01;
                         self.arranger_zoom = (self.arranger_zoom + zoom_delta).clamp(0.05, 4.0);
                     }
+                    let scale = if before_zoom > 0.0 {
+                        self.arranger_zoom / before_zoom
+                    } else {
+                        1.0
+                    };
+                    self.arranger_pan.x = (self.arranger_pan.x - local_x) * scale + local_x;
                 } else {
                     let mut delta = input.smooth_scroll_delta;
                     if delta == egui::Vec2::ZERO {
@@ -12195,20 +12546,60 @@ impl DawApp {
                 .open(&mut open)
                 .default_size(egui::vec2(420.0, 260.0))
                 .show(ctx, |ui| {
-                    self.draw_animated_title(ui, ctx);
-                    ui.add_space(6.0);
-                    ui.label("A warm, focused DAW for fast music making.");
-                    ui.label("Special thanks to Sanny and Ling Lin for the spark and support.");
-                    ui.add_space(6.0);
-                    ui.separator();
-                    let version = env!("CARGO_PKG_VERSION");
-                    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-                    ui.label(format!("Version: {version}"));
-                    ui.label(format!("Build: {profile}"));
-                    ui.label(format!("Engine: {}", env!("CARGO_PKG_NAME")));
-                    ui.separator();
-                    ui.label("LingStation");
-                    ui.label("Copyright (c) 2026");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.draw_animated_title(ui, ctx);
+                        ui.add_space(6.0);
+                        ui.label("A warm, focused DAW for fast music making.");
+                        ui.label("Special thanks to Sanny and Ling Lin for the spark and support.");
+                        ui.add_space(6.0);
+                        ui.separator();
+                        let version = env!("CARGO_PKG_VERSION");
+                        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+                        ui.label(format!("Version: {version}"));
+                        ui.label(format!("Build: {profile}"));
+                        ui.label(format!("Engine: {}", env!("CARGO_PKG_NAME")));
+                        ui.separator();
+                        ui.heading("Bundled Synths");
+                        ui.add_space(4.0);
+                        ui.label("SannySynth: soft FM flavor with subtractive/wavetable focus.");
+                        ui.label("- Carrier waveform selection with wavetable blend and optional custom wavetable.");
+                        ui.label("- ADSR for amp plus dual filter envelopes (cutoff and resonance).");
+                        ui.label("- LFOs/mod routing, plus vibrato and tremolo controls.");
+                        ui.label("- Chorus, delay, reverb, and multi-stage filter options.");
+                        ui.add_space(4.0);
+                        ui.label("DogSynth: hard FM.");
+                        ui.label("- Classic plus wavetable osc blend with wavetable distortion.");
+                        ui.label("- FM controls (amount, ratio, feedback) and modulation targets for FM routing.");
+                        ui.label("- Unison, glide, and modulation matrix with LFOs and envelopes.");
+                        ui.label("- Multi-filter section plus distortion, EQ, saturation, and time FX.");
+                        ui.add_space(4.0);
+                        ui.label("FishSynth: FM plus wavetable, GM.");
+                        ui.label("- FM enable/ratio/amount with modulator waveform, plus sub osc and noise mix.");
+                        ui.label("- ADSR amp and filter envelopes with multiple filter types.");
+                        ui.label("- Vibrato/tremolo LFOs and chorus.");
+                        ui.label("- GM preset browsing and SF2/SoundFont-based program support.");
+                        ui.add_space(4.0);
+                        ui.label("MiceSynth: additive plus FM.");
+                        ui.label("- Additive engine controls (mix, partials, tilt, inharm, morph, decay, drift).");
+                        ui.label("- FM controls with modulation routing and classic/wavetable blend.");
+                        ui.label("- Mod matrix, unison/glide, and filter envelopes.");
+                        ui.label("- Preset system with morphing between snapshots.");
+                        ui.add_space(4.0);
+                        ui.label("CatSynth: drum synthesizer.");
+                        ui.label("- 16 drum slots with per-slot instrument model (kick/snare/hats/etc).");
+                        ui.label("- Exciter, resonator, material, and noise shaping per slot.");
+                        ui.label("- Pitch/decay/strike controls, plus tone and transient/body shaping.");
+                        ui.label("- Built-in 16-step drum sequencer per slot.");
+                        ui.add_space(4.0);
+                        ui.label("PlantSynth: drum sampler.");
+                        ui.label("- 16 sample slots with per-slot pitch, pan, drive, and 3-band tone.");
+                        ui.label("- Sample envelope controls (attack, decay, sustain, release).");
+                        ui.label("- Velocity sensitivity and pad trigger behavior per slot.");
+                        ui.label("- Master gain/drive/comp/clip controls.");
+                        ui.separator();
+                        ui.label("LingStation");
+                        ui.label("Copyright (c) 2026");
+                    });
                     ctx.request_repaint();
                 });
             self.show_help_about = open;
@@ -12276,6 +12667,13 @@ impl DawApp {
                         format!("Registered to: {}", self.settings.registered_to)
                     };
                     ui.label(registered);
+                    if let Some(limit) = self.settings.license_monthly_activations {
+                        ui.label(format!("Monthly activations: {limit}"));
+                    }
+                    if let Some(remaining) = self.settings.license_remaining_activations {
+                        ui.label(format!("Remaining this month: {remaining}"));
+                    }
+                    ui.label("Policy: 2 activations per month (no rollover).");
                     ui.separator();
 
                     ui.heading("Account Login");
@@ -12437,6 +12835,7 @@ impl DawApp {
         }
         self.plugin_ui_hidden = false;
         self.pending_viewport_focus = true;
+        self.pending_repaint_frames = 12;
         if self.audio_running {
             self.stop_audio_and_midi();
         }
@@ -12453,6 +12852,18 @@ impl DawApp {
         }
         self.orphaned_hosts.extend(hosts);
         self.track_audio.clear();
+        self.waveform_cache.borrow_mut().clear();
+        self.waveform_color_cache.borrow_mut().clear();
+        self.waveform_len_seconds_cache.borrow_mut().clear();
+        self.waveform_cache_order.borrow_mut().clear();
+        self.waveform_color_cache_order.borrow_mut().clear();
+        self.waveform_len_seconds_cache_order.borrow_mut().clear();
+        if let Ok(mut cache) = self.audio_clip_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut timeline) = self.audio_clip_timeline.lock() {
+            timeline.clear();
+        }
     }
 
     fn add_track(&mut self) {
@@ -12627,6 +13038,30 @@ impl DawApp {
             let (component, controller) = host.get_state_bytes();
             track.plugin_state_component = if component.is_empty() { None } else { Some(component) };
             track.plugin_state_controller = if controller.is_empty() { None } else { Some(controller) };
+            let has_state = track
+                .plugin_state_component
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+                || track
+                    .plugin_state_controller
+                    .as_ref()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+            if !has_state
+                && !track.param_ids.is_empty()
+                && (track.param_values.is_empty() || track.param_values.len() != track.param_ids.len())
+            {
+                track.param_values.resize(track.param_ids.len(), 0.0);
+                for (slot, param_id) in track.param_ids.iter().enumerate() {
+                    if let Some(value) = host.get_param_normalized(*param_id) {
+                        if let Some(target) = track.param_values.get_mut(slot) {
+                            *target = value as f32;
+                        }
+                    }
+                }
+            }
+            Self::log_fm_ratio_param_from(index, "capture", &track.params, &track.param_ids, &track.param_values);
         }
     }
 
@@ -12819,6 +13254,7 @@ impl DawApp {
         self.load_midi_from_folder(folder)?;
         self.migrate_track_notes_to_clips();
         self.sync_track_audio_states();
+        self.log_all_fm_ratio_params("after_load");
         self.selected_track = if self.tracks.is_empty() { None } else { Some(0) };
         if self.project_name.trim().is_empty() {
             if let Some(name) = self.project_name_from_path() {
@@ -13079,6 +13515,22 @@ impl DawApp {
             "render".to_string()
         };
         Self::sanitize_folder_name(&base)
+    }
+
+    fn render_license_comment(&self) -> Option<String> {
+        let status = self.license_status.trim();
+        let registered = status.starts_with("Registered")
+            || !self.settings.registered_to.trim().is_empty();
+        if registered {
+            let lower = status.to_ascii_lowercase();
+            if lower.contains("edu") || lower.contains("education") {
+                Some("Made with an Educational License".to_string())
+            } else {
+                None
+            }
+        } else {
+            Some("Made with LingStation[Unlicensed]".to_string())
+        }
     }
 
     fn note_icon_source(value: f32) -> egui::ImageSource<'static> {
@@ -13777,6 +14229,8 @@ impl DawApp {
         self.import_path = state.path;
         self.show_midi_import = false;
         self.mark_dirty();
+            self.pending_viewport_focus = true;
+            self.pending_repaint_frames = 12;
         if was_running {
             if let Err(err) = self.start_audio_and_midi() {
                 self.status = format!("Audio restart failed: {err}");
@@ -13857,6 +14311,7 @@ impl DawApp {
         }
         self.ensure_synth_soundfont();
         self.capture_plugin_states();
+        let license_comment = self.render_license_comment();
         let folder = Self::normalize_windows_path(folder);
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
         let sample_rate = self.render_sample_rate.max(1);
@@ -13886,6 +14341,7 @@ impl DawApp {
             sample_rate,
             range_start,
             range_end,
+            license_comment.clone(),
         );
         let mut plans = vec![master_plan];
         if self.render_split_tracks {
@@ -13904,6 +14360,7 @@ impl DawApp {
                     sample_rate,
                     range_start,
                     range_end,
+                    license_comment.clone(),
                 ));
             }
         }
@@ -13950,6 +14407,7 @@ impl DawApp {
         sample_rate: u32,
         start_beats: f32,
         end_beats: f32,
+        license_comment: Option<String>,
     ) -> RenderPlan {
         let block_size = self.settings.buffer_size.max(64) as usize;
         let has_solo = self.tracks.iter().any(|t| t.solo);
@@ -13994,6 +14452,7 @@ impl DawApp {
             audio_clips,
             audio_cache,
             master_settings: self.master_settings_snapshot(),
+            license_comment,
         }
     }
 
@@ -14004,6 +14463,7 @@ impl DawApp {
         sample_rate: u32,
         start_beats: f32,
         end_beats: f32,
+        license_comment: Option<String>,
     ) -> RenderPlan {
         let block_size = self.settings.buffer_size.max(64) as usize;
         let (notes, instrument_path, instrument_clap_id, param_ids, param_values, component, controller, automation_lanes) = self
@@ -14065,6 +14525,7 @@ impl DawApp {
             audio_clips,
             audio_cache,
             master_settings: self.master_settings_snapshot(),
+            license_comment,
         }
     }
 
@@ -14222,59 +14683,22 @@ impl DawApp {
 
     fn render_to_wav_with_rate(&mut self, path: &str, sample_rate: u32) -> Result<(), String> {
         self.ensure_synth_soundfont();
-        let channels = 2u16;
-        let tempo = self.tempo_bpm.max(1.0);
+        self.capture_plugin_states();
         let beats = self.project_end_beats().max(1.0);
-        let samples_per_beat = sample_rate as f64 * 60.0 / tempo as f64;
-        let total_samples = (beats as f64 * samples_per_beat).ceil() as usize;
-        let block_size = self.settings.buffer_size.max(64) as usize;
-        let total_samples_u64 = total_samples as u64;
-        self.render_progress = Some((0, total_samples_u64));
-
-        let spec = wav_spec_for_depth(sample_rate, channels, self.render_wav_bit_depth);
-        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        let mut writer = hound::WavWriter::new(file, spec).map_err(|e| e.to_string())?;
-
-        let mut host = if let Some(path) = self.active_instrument_path() {
-            vst3::Vst3Host::load(
-                &path,
-                sample_rate as f64,
-                block_size,
-                channels as usize,
-            )
-            .ok()
-        } else {
-            None
-        };
-
-        let notes = self.active_midi_notes();
-        let master_settings = self.master_settings_snapshot();
-        let mut master_state = MasterCompState::default();
-        let mut cursor = 0usize;
-        while cursor < total_samples {
-            let frames = (total_samples - cursor).min(block_size);
-            let block_start = cursor as u64;
-            let block_end = (cursor + frames) as u64;
-            let events = collect_block_events(&notes, block_start, block_end, samples_per_beat);
-            let mut output = vec![0.0f32; frames * channels as usize];
-            if let Some(host) = host.as_mut() {
-                let _ = host.process_f32(&mut output, channels as usize, &events);
-            }
-            apply_master_processing(
-                &mut output,
-                channels as usize,
-                sample_rate as f32,
-                &master_settings,
-                &mut master_state,
-            );
-            write_wav_samples(&mut writer, self.render_wav_bit_depth, &output)?;
-            cursor += frames;
-            self.render_progress = Some((cursor as u64, total_samples_u64));
-        }
-
-        writer.finalize().map_err(|e| e.to_string())?;
-        self.render_progress = Some((total_samples_u64, total_samples_u64));
-        Ok(())
+        let license_comment = self.render_license_comment();
+        let plan = self.build_master_render_plan(
+            Path::new(path),
+            sample_rate,
+            0.0,
+            beats,
+            license_comment,
+        );
+        let done = AtomicU64::new(0);
+        let total = AtomicU64::new(1);
+        self.render_progress = Some((0, 1));
+        let result = render_plan_to_wav(plan, &done, &total);
+        self.render_progress = Some((done.load(Ordering::Relaxed), total.load(Ordering::Relaxed)));
+        result
     }
 
     fn project_end_beats(&self) -> f32 {
@@ -14816,6 +15240,7 @@ impl DawApp {
         if self.audio_running {
             return Ok(());
         }
+        self.audio_stats = Arc::new(AudioRuntimeStats::new());
         self.audio_stop.store(false, Ordering::Relaxed);
         let host = cpal::default_host();
         let device = if self.settings.output_device.trim().is_empty() {
@@ -14910,16 +15335,14 @@ impl DawApp {
                         let params = host.enumerate_params();
                         if let Some(track) = self.tracks.get_mut(index) {
                             if !params.is_empty() {
-                                let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-                                let reuse = track.param_ids == next_ids
-                                    && track.param_values.len() == params.len();
-                                let next_values = if reuse {
-                                    track.param_values.clone()
-                                } else {
-                                    params.iter().map(|p| p.default_value as f32).collect()
-                                };
+                                let next_values = Self::remap_param_values_by_id_or_name(
+                                    &track.param_ids,
+                                    &track.params,
+                                    &track.param_values,
+                                    &params,
+                                );
                                 track.params = params.iter().map(|p| p.name.clone()).collect();
-                                track.param_ids = next_ids;
+                                track.param_ids = params.iter().map(|p| p.id).collect();
                                 track.param_values = next_values;
                                 Self::apply_program_param(track);
                             }
@@ -14944,6 +15367,18 @@ impl DawApp {
                                     component.as_deref(),
                                     controller.as_deref(),
                                 );
+                                if let Some(track) = self.tracks.get_mut(index) {
+                                    if track.param_values.len() != track.param_ids.len() {
+                                        track.param_values.resize(track.param_ids.len(), 0.0);
+                                    }
+                                    for (slot, param_id) in track.param_ids.iter().enumerate() {
+                                        if let Some(value) = host.get_param_normalized(*param_id) {
+                                            if let Some(target) = track.param_values.get_mut(slot) {
+                                                *target = value as f32;
+                                            }
+                                        }
+                                    }
+                                }
                             } else if !track.param_ids.is_empty() {
                                 for (param_id, value) in
                                     track.param_ids.iter().zip(track.param_values.iter())
@@ -14955,14 +15390,6 @@ impl DawApp {
                     } else {
                         self.status = "Plugin host error: unable to load".to_string();
                     }
-                }
-            } else {
-                state.host = None;
-            }
-            if state.effect_hosts.len() != effect_paths.len() {
-                for host in state.effect_hosts.drain(..) {
-                    host.prepare_for_drop();
-                    self.orphaned_hosts.push(host);
                 }
                 for (slot, fx_path) in effect_paths.iter().enumerate() {
                     let kind = Self::plugin_kind_from_path(fx_path);
@@ -15024,19 +15451,17 @@ impl DawApp {
                 for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
                     let params = fx_host.enumerate_params();
                     if !params.is_empty() {
-                        let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-                        let reuse = track
-                            .effect_param_ids
-                            .get(fx_index)
-                            .map(|ids| *ids == next_ids)
-                            .unwrap_or(false)
-                            && track
-                                .effect_param_values
-                                .get(fx_index)
-                                .map(|vals| vals.len() == params.len())
-                                .unwrap_or(false);
-                        let next_values = if reuse {
-                            track.effect_param_values[fx_index].clone()
+                        let next_values = if let (Some(old_ids), Some(old_names), Some(old_values)) = (
+                            track.effect_param_ids.get(fx_index),
+                            track.effect_params.get(fx_index),
+                            track.effect_param_values.get(fx_index),
+                        ) {
+                            Self::remap_param_values_by_id_or_name(
+                                old_ids,
+                                old_names,
+                                old_values,
+                                &params,
+                            )
                         } else {
                             params.iter().map(|p| p.default_value as f32).collect()
                         };
@@ -15044,7 +15469,7 @@ impl DawApp {
                             *slot = params.iter().map(|p| p.name.clone()).collect();
                         }
                         if let Some(slot) = track.effect_param_ids.get_mut(fx_index) {
-                            *slot = next_ids;
+                            *slot = params.iter().map(|p| p.id).collect();
                         }
                         if let Some(slot) = track.effect_param_values.get_mut(fx_index) {
                             *slot = next_values;
@@ -15078,6 +15503,7 @@ impl DawApp {
         let adaptive_restart_requested = self.adaptive_restart_requested.clone();
         let adaptive_buffer_size = self.adaptive_buffer_size.clone();
         let last_overrun = self.last_overrun.clone();
+        let audio_stats = self.audio_stats.clone();
 
         let mut stream_config: cpal::StreamConfig = config.clone().into();
         stream_config.sample_rate = cpal::SampleRate(self.settings.sample_rate);
@@ -15089,6 +15515,7 @@ impl DawApp {
                 let track_mix = track_mix.clone();
                 let tempo_bits = tempo_bits.clone();
                 let transport_samples = transport_samples.clone();
+                let audio_stats = audio_stats.clone();
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [f32], _| {
@@ -15141,7 +15568,9 @@ impl DawApp {
                         update_master_peak_f32(data, &master_peak_bits);
                         let elapsed = started.elapsed().as_secs_f32();
                         let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
-                        if elapsed > buffer_secs {
+                        let overrun = elapsed > buffer_secs;
+                        audio_stats.record_block(elapsed * 1000.0, overrun);
+                        if overrun {
                             if safe_underruns {
                                 last_overrun.store(true, Ordering::Relaxed);
                             }
@@ -15168,6 +15597,7 @@ impl DawApp {
                 let transport_samples = transport_samples.clone();
                 let audio_stop = audio_stop.clone();
                 let audio_callback_active = audio_callback_active.clone();
+                let audio_stats = audio_stats.clone();
                 let mut temp = Vec::<f32>::new();
                 device.build_output_stream(
                     &stream_config,
@@ -15224,7 +15654,9 @@ impl DawApp {
                         update_master_peak_f32(&temp, &master_peak_bits);
                         let elapsed = started.elapsed().as_secs_f32();
                         let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
-                        if elapsed > buffer_secs {
+                        let overrun = elapsed > buffer_secs;
+                        audio_stats.record_block(elapsed * 1000.0, overrun);
+                        if overrun {
                             if safe_underruns {
                                 last_overrun.store(true, Ordering::Relaxed);
                             }
@@ -15251,6 +15683,7 @@ impl DawApp {
                 let transport_samples = transport_samples.clone();
                 let audio_stop = audio_stop.clone();
                 let audio_callback_active = audio_callback_active.clone();
+                let audio_stats = audio_stats.clone();
                 let mut temp = Vec::<f32>::new();
                 device.build_output_stream(
                     &stream_config,
@@ -15309,7 +15742,9 @@ impl DawApp {
                         update_master_peak_f32(&temp, &master_peak_bits);
                         let elapsed = started.elapsed().as_secs_f32();
                         let buffer_secs = (data.len() / channels) as f32 / sample_rate.max(1.0);
-                        if elapsed > buffer_secs {
+                        let overrun = elapsed > buffer_secs;
+                        audio_stats.record_block(elapsed * 1000.0, overrun);
+                        if overrun {
                             if safe_underruns {
                                 last_overrun.store(true, Ordering::Relaxed);
                             }
@@ -15638,8 +16073,12 @@ impl DawApp {
             result_opt = guard.take();
         }
         if let Some(result) = result_opt {
+            let mut status_ok = false;
             match result.status {
-                Ok(message) => self.status = message,
+                Ok(message) => {
+                    self.status = message;
+                    status_ok = true;
+                }
                 Err(message) => self.status = message,
             }
             if let Some(token) = result.token {
@@ -15655,6 +16094,16 @@ impl DawApp {
                 self.settings.registered_to = registered_to;
                 let _ = self.save_settings();
             }
+            if let Some(remaining) = result.remaining_activations {
+                self.settings.license_remaining_activations = Some(remaining);
+                let _ = self.save_settings();
+                if status_ok {
+                    self.status = format!(
+                        "{} You have {remaining} activations remaining this month.",
+                        self.status
+                    );
+                }
+            }
         }
         self.license_job = None;
     }
@@ -15662,6 +16111,9 @@ impl DawApp {
     fn refresh_license_status(&mut self) {
         if self.settings.license_file.trim().is_empty() {
             self.license_status = "Unregistered".to_string();
+            self.settings.license_monthly_activations = None;
+            self.settings.license_remaining_activations = None;
+            let _ = self.save_settings();
             return;
         }
         match Self::verify_license_file(&self.settings.license_file) {
@@ -15671,6 +16123,8 @@ impl DawApp {
                     status = format!("Registered ({license_type})");
                 }
                 self.license_status = status;
+                self.settings.license_monthly_activations = info.monthly_activations;
+                let _ = self.save_settings();
                 if let Some(name) = info.registered_to {
                     self.settings.registered_to = name;
                     let _ = self.save_settings();
@@ -15748,6 +16202,7 @@ impl DawApp {
                 .or_else(|| Self::get_value_string(payload, &["registered_to"])),
             license_type: Self::get_value_string(payload, &["license_type"]),
             max_activations: Self::get_value_u64(payload, &["limits", "max_activations"]),
+            monthly_activations: Self::get_value_u64(payload, &["limits", "monthly_activations"]),
         })
     }
 
@@ -15759,13 +16214,33 @@ impl DawApp {
             .replace('\r', "")
             .trim()
             .to_string();
-        let raw = BASE64
+        let raw = BASE64_URL_SAFE
             .decode(cleaned.as_bytes())
             .map_err(|e| format!("Public key decode error: {e}"))?;
         if raw.len() == 32 {
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(&raw);
             return Ok(bytes);
+        }
+        // Accept Ed25519 SubjectPublicKeyInfo DER (44 bytes).
+        let spki_prefix: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        if raw.len() == 44 && raw.starts_with(&spki_prefix) {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&raw[12..]);
+            return Ok(bytes);
+        }
+        // Accept Ed25519 PKCS#8 private key DER (48 bytes) and derive the public key.
+        let pkcs8_prefix: [u8; 16] = [
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+            0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+        ];
+        if raw.len() == 48 && raw.starts_with(&pkcs8_prefix) {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&raw[16..]);
+            let signing_key = SigningKey::from_bytes(&seed);
+            return Ok(signing_key.verifying_key().to_bytes());
         }
         Err("Public key must be 32 bytes".to_string())
     }
@@ -15838,6 +16313,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -15858,6 +16334,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -15869,6 +16346,7 @@ impl DawApp {
                     token: None,
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 };
             }
             let token = serde_json::from_str::<serde_json::Value>(&text)
@@ -15880,6 +16358,7 @@ impl DawApp {
                     token: Some(token),
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 }
             } else {
                 LicenseJobResult {
@@ -15887,6 +16366,7 @@ impl DawApp {
                     token: None,
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 }
             }
         });
@@ -15908,6 +16388,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -15924,6 +16405,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -15935,6 +16417,7 @@ impl DawApp {
                     token: None,
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 };
             }
             let license_file = Self::license_file_from_response(&text);
@@ -15947,6 +16430,7 @@ impl DawApp {
                 token: None,
                 license_file,
                 registered_to,
+                remaining_activations: None,
             }
         });
     }
@@ -15973,6 +16457,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -15993,6 +16478,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -16004,6 +16490,7 @@ impl DawApp {
                     token: None,
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 };
             }
             let license_file = Self::license_file_from_response(&text);
@@ -16011,11 +16498,13 @@ impl DawApp {
                 .as_deref()
                 .and_then(|data| Self::verify_license_file(data).ok())
                 .and_then(|info| info.registered_to);
+            let remaining_activations = Self::license_remaining_from_response(&text);
             LicenseJobResult {
                 status: Ok("Device activated".to_string()),
                 token: None,
                 license_file,
                 registered_to,
+                remaining_activations,
             }
         });
     }
@@ -16036,6 +16525,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -16052,6 +16542,7 @@ impl DawApp {
                         token: None,
                         license_file: None,
                         registered_to: None,
+                        remaining_activations: None,
                     };
                 }
             };
@@ -16063,6 +16554,7 @@ impl DawApp {
                     token: None,
                     license_file: None,
                     registered_to: None,
+                    remaining_activations: None,
                 };
             }
             let license_file = Self::license_file_from_response(&text);
@@ -16075,6 +16567,7 @@ impl DawApp {
                 token: None,
                 license_file,
                 registered_to,
+                remaining_activations: None,
             }
         });
     }
@@ -16095,19 +16588,43 @@ impl DawApp {
         None
     }
 
+    fn license_remaining_from_response(body: &str) -> Option<u64> {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        Self::get_value_u64(&value, &["remaining_activations"])
+            .or_else(|| Self::get_value_u64(&value, &["limits", "remaining_activations"]))
+    }
+
     fn draw_animated_title(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let text = "Lingstation";
         let font = egui::FontId::proportional(28.0);
         let color = egui::Color32::from_rgb(220, 240, 255);
+        let registered = self.license_status.starts_with("Registered")
+            || !self.settings.registered_to.trim().is_empty();
+        let rainbow = [
+            egui::Color32::from_rgb(255, 48, 48),
+            egui::Color32::from_rgb(255, 144, 48),
+            egui::Color32::from_rgb(255, 224, 64),
+            egui::Color32::from_rgb(72, 220, 120),
+            egui::Color32::from_rgb(72, 200, 255),
+            egui::Color32::from_rgb(88, 120, 255),
+            egui::Color32::from_rgb(176, 96, 255),
+        ];
         let time = ctx.input(|i| i.time) as f32;
+        let color_offset = (time * 2.4) as usize;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
         let painter = ui.painter();
         let mut cursor_x = rect.left();
         for (index, ch) in text.chars().enumerate() {
             let wobble = (time * 2.4 + index as f32 * 0.5).sin() * 2.0;
             let pos = egui::pos2(cursor_x, rect.center().y + wobble);
-            painter.text(pos, egui::Align2::LEFT_CENTER, ch, font.clone(), color);
-            let galley = ui.fonts(|f| f.layout_no_wrap(ch.to_string(), font.clone(), color));
+            let paint_color = if registered {
+                let idx = (index + color_offset) % rainbow.len();
+                rainbow[idx]
+            } else {
+                color
+            };
+            painter.text(pos, egui::Align2::LEFT_CENTER, ch, font.clone(), paint_color);
+            let galley = ui.fonts(|f| f.layout_no_wrap(ch.to_string(), font.clone(), paint_color));
             cursor_x += galley.size().x + 1.0;
         }
     }
@@ -16672,6 +17189,119 @@ impl DawApp {
             .replace('-', "")
     }
 
+    fn debug_param_enabled() -> bool {
+        std::env::var("LING_DEBUG_PARAMS")
+            .map(|value| {
+                let value = value.to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes"
+            })
+            .unwrap_or(false)
+    }
+
+    fn log_fm_ratio_param(&self, track_index: usize, stage: &str) {
+        if !Self::debug_param_enabled() {
+            return;
+        }
+        let Some(track) = self.tracks.get(track_index) else {
+            return;
+        };
+        Self::log_fm_ratio_param_from(
+            track_index,
+            stage,
+            &track.params,
+            &track.param_ids,
+            &track.param_values,
+        );
+    }
+
+    fn log_fm_ratio_param_from(
+        track_index: usize,
+        stage: &str,
+        params: &[String],
+        param_ids: &[u32],
+        param_values: &[f32],
+    ) {
+        if !Self::debug_param_enabled() {
+            return;
+        }
+        let mut found = false;
+        for (index, name) in params.iter().enumerate() {
+            let key = Self::normalize_param_name(name);
+            if key.contains("fmratio") || (key.contains("fm") && key.contains("ratio")) {
+                let id = param_ids.get(index).copied().unwrap_or(0);
+                let value = param_values.get(index).copied().unwrap_or(0.0);
+                eprintln!(
+                    "[param-debug] {stage} track={track_index} name={name} id={id} value={value}"
+                );
+                found = true;
+            }
+        }
+        if !found {
+            eprintln!("[param-debug] {stage} track={track_index} fm_ratio not found");
+        }
+    }
+
+    fn log_all_fm_ratio_params(&self, stage: &str) {
+        if !Self::debug_param_enabled() {
+            return;
+        }
+        for index in 0..self.tracks.len() {
+            self.log_fm_ratio_param(index, stage);
+        }
+    }
+
+    fn remap_param_values_by_id_or_name(
+        old_ids: &[u32],
+        old_names: &[String],
+        old_values: &[f32],
+        new_params: &[vst3::ParamInfo],
+    ) -> Vec<f32> {
+        let mut id_map: HashMap<u32, f32> = HashMap::new();
+        for (id, value) in old_ids.iter().zip(old_values.iter()) {
+            id_map.insert(*id, *value);
+        }
+        let mut name_map: HashMap<String, f32> = HashMap::new();
+        for (name, value) in old_names.iter().zip(old_values.iter()) {
+            name_map.insert(Self::normalize_param_name(name), *value);
+        }
+        new_params
+            .iter()
+            .map(|p| {
+                id_map
+                    .get(&p.id)
+                    .copied()
+                    .or_else(|| name_map.get(&Self::normalize_param_name(&p.name)).copied())
+                    .unwrap_or(p.default_value as f32)
+            })
+            .collect()
+    }
+
+    fn remap_param_values_by_id_or_name_clap(
+        old_ids: &[u32],
+        old_names: &[String],
+        old_values: &[f32],
+        new_params: &[clap_host::ParamInfo],
+    ) -> Vec<f32> {
+        let mut id_map: HashMap<u32, f32> = HashMap::new();
+        for (id, value) in old_ids.iter().zip(old_values.iter()) {
+            id_map.insert(*id, *value);
+        }
+        let mut name_map: HashMap<String, f32> = HashMap::new();
+        for (name, value) in old_names.iter().zip(old_values.iter()) {
+            name_map.insert(Self::normalize_param_name(name), *value);
+        }
+        new_params
+            .iter()
+            .map(|p| {
+                id_map
+                    .get(&p.id)
+                    .copied()
+                    .or_else(|| name_map.get(&Self::normalize_param_name(&p.name)).copied())
+                    .unwrap_or(p.default_value as f32)
+            })
+            .collect()
+    }
+
     fn ensure_gm_presets_for_plugin(
         &mut self,
         plugin_path: &str,
@@ -16956,17 +17586,17 @@ impl DawApp {
         };
         match params_result {
             Ok(params) if !params.is_empty() => {
-                let next_ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-                let reuse_values = track.param_ids == next_ids && track.param_values.len() == params.len();
-                let next_values = if reuse_values {
-                    track.param_values.clone()
-                } else {
-                    params.iter().map(|p| p.default_value as f32).collect()
-                };
+                let next_values = Self::remap_param_values_by_id_or_name(
+                    &track.param_ids,
+                    &track.params,
+                    &track.param_values,
+                    &params,
+                );
                 track.params = params.iter().map(|p| p.name.clone()).collect();
-                track.param_ids = next_ids;
+                track.param_ids = params.iter().map(|p| p.id).collect();
                 track.param_values = next_values;
                 Self::apply_program_param(track);
+                Self::log_fm_ratio_param_from(index, "refresh_track", &track.params, &track.param_ids, &track.param_values);
                 if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
                     let mut lanes = Vec::new();
                     for name in &track.automation_channels {
@@ -17425,10 +18055,12 @@ fn pump_plugin_messages(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE, MSG,
     };
+    if hwnd == 0 {
+        return;
+    }
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
-        let target = if hwnd == 0 { 0 } else { 0 };
-        while PeekMessageW(&mut msg, target, 0, 0, PM_REMOVE) != 0 {
+        while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -17678,8 +18310,7 @@ fn render_plan_to_wav(
                 track.plugin_state_component.as_deref(),
                 track.plugin_state_controller.as_deref(),
             );
-        }
-        if !track.param_ids.is_empty() {
+        } else if !track.param_ids.is_empty() {
             for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
                 host.push_param_change(*param_id, *value as f64);
             }
@@ -17927,6 +18558,9 @@ fn render_plan_to_wav(
     }
 
     writer.finalize().map_err(|e| e.to_string())?;
+    if let Some(comment) = plan.license_comment.as_deref() {
+        let _ = append_wav_comment(&plan.path, comment);
+    }
     done.store(total_samples_u64, Ordering::Relaxed);
     Ok(())
 }
@@ -18131,7 +18765,7 @@ where
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
         if has_state {
-            let _ = host.set_state_bytes(
+            let _ = host.apply_state_for_render(
                 track.plugin_state_component.as_deref(),
                 track.plugin_state_controller.as_deref(),
             );
@@ -18399,7 +19033,7 @@ fn render_plan_to_f32(
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
         if has_state {
-            let _ = host.set_state_bytes(
+            let _ = host.apply_state_for_render(
                 track.plugin_state_component.as_deref(),
                 track.plugin_state_controller.as_deref(),
             );
@@ -18693,7 +19327,17 @@ fn render_plan_to_flac(
 
     let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
     use std::io::Write;
-    file.write_all(sink.as_slice()).map_err(|e| e.to_string())?;
+    if let Some(comment) = plan.license_comment.as_deref() {
+        let mut header = sink.as_slice().to_vec();
+        if let Some(first) = header.get_mut(0) {
+            *first &= 0x7f;
+        }
+        file.write_all(&header).map_err(|e| e.to_string())?;
+        let block = build_flac_comment_block(comment);
+        file.write_all(&block).map_err(|e| e.to_string())?;
+    } else {
+        file.write_all(sink.as_slice()).map_err(|e| e.to_string())?;
+    }
 
     let mut framebuf = FrameBuf::with_size(channels, block_size)
         .map_err(|e| format!("FLAC frame buffer error: {e:?}"))?;
@@ -18730,6 +19374,75 @@ fn render_plan_to_flac(
     Ok(())
 }
 
+fn build_wav_info_chunk(comment: &str) -> Vec<u8> {
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"ICMT");
+    let mut text = comment.as_bytes().to_vec();
+    text.push(0);
+    let text_len = text.len() as u32;
+    info.extend_from_slice(&text_len.to_le_bytes());
+    info.extend_from_slice(&text);
+    if text_len % 2 == 1 {
+        info.push(0);
+    }
+    let list_size = info.len() as u32;
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"LIST");
+    chunk.extend_from_slice(&list_size.to_le_bytes());
+    chunk.extend_from_slice(&info);
+    chunk
+}
+
+fn append_wav_comment(path: &str, comment: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    if file_len < 12 {
+        return Err("Invalid WAV file".to_string());
+    }
+    let chunk = build_wav_info_chunk(comment);
+    let new_len = file_len.saturating_add(chunk.len() as u64);
+    if new_len > u32::MAX as u64 + 8 {
+        return Err("WAV too large for metadata".to_string());
+    }
+    let riff_size = (new_len - 8) as u32;
+    file.seek(SeekFrom::Start(4))
+        .map_err(|e| e.to_string())?;
+    file.write_all(&riff_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|e| e.to_string())?;
+    file.write_all(&chunk).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn build_flac_comment_block(comment: &str) -> Vec<u8> {
+    let vendor = "LingStation";
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    payload.extend_from_slice(vendor.as_bytes());
+    let comment_entry = format!("COMMENT={}", comment);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&(comment_entry.len() as u32).to_le_bytes());
+    payload.extend_from_slice(comment_entry.as_bytes());
+
+    let len = payload.len();
+    let mut block = Vec::with_capacity(4 + len);
+    block.push(0x84);
+    block.push(((len >> 16) & 0xff) as u8);
+    block.push(((len >> 8) & 0xff) as u8);
+    block.push((len & 0xff) as u8);
+    block.extend_from_slice(&payload);
+    block
+}
+
 thread_local! {
     static MIX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
     static FX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
@@ -18747,7 +19460,7 @@ fn mix_track_hosts(
     track_audio: &[TrackAudioState],
     track_mix: &Arc<Mutex<Vec<TrackMixState>>>,
     audio_clips: &Arc<Mutex<Vec<AudioClipRender>>>,
-    audio_cache: &Arc<Mutex<HashMap<String, Arc<AudioClipData>>>>,
+    audio_cache: &Arc<Mutex<AudioClipCache>>,
     smart_disable_plugins: bool,
     smart_suspend_tracks: bool,
 ) -> bool {
@@ -18792,7 +19505,7 @@ fn mix_track_hosts(
                     Ok(cache) => cache,
                     Err(_) => continue,
                 };
-                cache.get(&clip.path).cloned()
+                cache.get(&clip.path)
             };
             let Some(data) = data else {
                 continue;
@@ -18801,298 +19514,295 @@ fn mix_track_hosts(
         }
     }
 
-    let mut per_track_buffers: Vec<Vec<f32>> = vec![vec![0.0; output.len()]; track_count];
-    let processed_any = Arc::new(AtomicBool::new(false));
+    let mut processed_any = false;
 
     // Process tracks on the calling thread to avoid VST3 thread-affinity issues.
-    per_track_buffers
-        .iter_mut()
-        .enumerate()
-        .for_each(|(index, temp)| {
-            let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
-                muted: false,
-                solo: false,
-                level: 1.0,
-            });
-            let state = match track_audio.get(index) {
-                Some(state) => state,
-                None => return,
-            };
-            if mix.muted || (any_solo && !mix.solo) {
-                state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                return;
-            }
-
-            let notes = match state.clip_notes.lock() {
-                Ok(guard) => guard.clone(),
-                Err(_) => Vec::new(),
-            };
-            let has_notes = !notes.is_empty();
-            let has_audio = track_has_audio.get(index).copied().unwrap_or(false);
-            let learned_map = state
-                .learned_cc
-                .lock()
-                .ok()
-                .map(|map| map.clone())
-                .unwrap_or_default();
-            let automation = state
-                .automation_lanes
-                .lock()
-                .ok()
-                .map(|lanes| lanes.clone())
-                .unwrap_or_default();
-            let bypass = state
-                .effect_bypass
-                .lock()
-                .ok()
-                .map(|b| b.clone())
-                .unwrap_or_default();
-            let queued_len = state
-                .midi_events
-                .lock()
-                .ok()
-                .map(|q| q.len())
-                .unwrap_or(0);
-            let should_suspend = smart_suspend_tracks
-                && !has_notes
-                && !has_audio
-                && queued_len == 0
-                && automation.is_empty();
-            if should_suspend {
-                let blocks = state.silent_blocks.fetch_add(1, Ordering::Relaxed) + 1;
-                if blocks >= 4 {
-                    state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                    state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                    state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                    return;
-                }
-            } else {
-                state.silent_blocks.store(0, Ordering::Relaxed);
-            }
-
-            temp.fill(0.0);
-            let mut track_processed = false;
-            let mut remaining_params: Vec<PendingParamChange> = Vec::new();
-            let mut filtered_events: Vec<vst3::MidiEvent> = Vec::new();
-            if let Some(host) = state.host.as_ref() {
-                let mut events =
-                    collect_block_events(&notes, block_start, block_end, samples_per_beat);
-                if panic_notes {
-                    for channel in 0u8..16 {
-                        events.push(vst3::MidiEvent::control_change(channel, 120, 0));
-                        events.push(vst3::MidiEvent::control_change(channel, 123, 0));
-                    }
-                    for channel in 0u8..16 {
-                        events.extend(
-                            (0u8..=127)
-                                .map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
-                        );
-                    }
-                    if frames > 1 {
-                        for event in events.iter_mut() {
-                            if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
-                                if *sample_offset == 0 {
-                                    *sample_offset = 1;
-                                }
-                            }
-                        }
-                    }
-                }
-                if loop_wrapped {
-                    events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
-                }
-                if let Ok(mut queued) = state.midi_events.lock() {
-                    events.extend(queued.drain(..));
-                }
-                let has_note_on = events
-                    .iter()
-                    .any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
-                let pending_params = state
-                    .pending_param_changes
-                    .lock()
-                    .ok()
-                    .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                for pending in &pending_params {
-                    match pending.target {
-                        PendingParamTarget::Instrument => {
-                            host.push_param_change(pending.param_id, pending.value);
-                        }
-                        PendingParamTarget::Effect(_) => {
-                            remaining_params.push(*pending);
-                        }
-                    }
-                }
-                for lane in &automation {
-                    if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                        if lane.target == AutomationTarget::Instrument {
-                            host.push_param_change(lane.param_id, value as f64);
-                        }
-                    }
-                }
-                let mut filtered = Vec::with_capacity(events.len());
-                for event in events {
-                    match event {
-                        vst3::MidiEvent::ControlChange {
-                            channel,
-                            controller,
-                            value,
-                        } => {
-                            if controller >= 120 {
-                                filtered.push(event);
-                                continue;
-                            }
-                            if let Some(param_id) = learned_map.get(&(channel, controller)) {
-                                let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
-                                host.push_param_change(*param_id, norm);
-                            } else {
-                                filtered.push(event);
-                            }
-                        }
-                        _ => filtered.push(event),
-                    }
-                }
-                filtered_events = filtered;
-                if host.process_f32(temp, channels, &filtered_events).is_ok() {
-                    track_processed = true;
-                }
-                if panic_notes && !has_note_on {
-                    temp.fill(0.0);
-                }
-            }
-
-            if let Some(clips) = per_track_clips.get(index) {
-                for (clip, data) in clips {
-                    let clip_end = clip.start_samples + clip.length_samples;
-                    if block_end <= clip.start_samples || block_start >= clip_end {
-                        continue;
-                    }
-                    let src_channels = data.channels.max(1);
-                    let src_frames = data.samples.len() / src_channels;
-                    if src_frames == 0 {
-                        continue;
-                    }
-                    let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
-                    let time_mul = clip.time_mul.max(0.01) as f64;
-                    let start_in_block = block_start.max(clip.start_samples) - block_start;
-                    let end_in_block = block_end.min(clip_end) - block_start;
-                    for i in start_in_block..end_in_block {
-                        let clip_pos = i + block_start - clip.start_samples;
-                        let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                            .max(0.0);
-                        let src_pos = if src_frames > 0 {
-                            let len = src_frames as f64;
-                            pos % len
-                        } else {
-                            pos
-                        };
-                        let base = src_pos.floor() as usize;
-                        let frac = (src_pos - base as f64) as f32;
-                        let next = (base + 1).min(src_frames.saturating_sub(1));
-                        for ch in 0..channels {
-                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                            let idx0 = base * src_channels + src_ch;
-                            let idx1 = next * src_channels + src_ch;
-                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                            let sample = s0 + (s1 - s0) * frac;
-                            let out_index = i as usize * channels + ch;
-                            if out_index < temp.len() {
-                                temp[out_index] += sample * clip.gain;
-                            }
-                        }
-                    }
-                    track_processed = true;
-                }
-            }
-
-            if !state.effect_hosts.is_empty() {
-                let temp_len = temp.len();
-                let mut scratch: Vec<f32> = vec![0.0; temp_len];
-                let mut use_temp = true;
-                let mut current: &mut [f32] = temp;
-                let mut scratch_slice: &mut [f32] = &mut scratch;
-                let skip_fx = smart_disable_plugins && !has_notes && !has_audio;
-                for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
-                    if skip_fx || bypass.get(fx_index).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    scratch_slice.fill(0.0);
-                    let mut still_pending: Vec<PendingParamChange> = Vec::new();
-                    for pending in remaining_params.drain(..) {
-                        match pending.target {
-                            PendingParamTarget::Effect(target_index) if target_index == fx_index => {
-                                fx_host.push_param_change(pending.param_id, pending.value);
-                            }
-                            _ => still_pending.push(pending),
-                        }
-                    }
-                    remaining_params = still_pending;
-                    for lane in &automation {
-                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                            if lane.target == AutomationTarget::Effect(fx_index) {
-                                fx_host.push_param_change(lane.param_id, value as f64);
-                            }
-                        }
-                    }
-                    if fx_host
-                        .process_f32_with_input(current, scratch_slice, channels, &filtered_events)
-                        .is_ok()
-                    {
-                        std::mem::swap(&mut current, &mut scratch_slice);
-                        use_temp = !use_temp;
-                    }
-                }
-                if !remaining_params.is_empty() {
-                    if let Ok(mut pending) = state.pending_param_changes.lock() {
-                        pending.extend(remaining_params);
-                    }
-                }
-                if !use_temp {
-                    temp.copy_from_slice(&scratch);
-                }
-            }
-
-            let mut peak_l = 0.0f32;
-            let mut peak_r = 0.0f32;
-            if channels >= 2 {
-                for frame in temp.chunks_exact(channels) {
-                    peak_l = peak_l.max(frame[0].abs());
-                    peak_r = peak_r.max(frame[1].abs());
-                }
-            } else {
-                for sample in temp.iter() {
-                    let v = sample.abs();
-                    peak_l = peak_l.max(v);
-                    peak_r = peak_r.max(v);
-                }
-            }
-            state.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
-            state.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
-            state.peak_bits.store(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
-
-            if track_processed {
-                processed_any.store(true, Ordering::Relaxed);
-            }
-        });
-
-    for (index, buffer) in per_track_buffers.iter().enumerate() {
+    for index in 0..track_count {
         let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
             muted: false,
             solo: false,
             level: 1.0,
         });
+        let state = match track_audio.get(index) {
+            Some(state) => state,
+            None => continue,
+        };
         if mix.muted || (any_solo && !mix.solo) {
+            state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+            state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+            state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             continue;
         }
-        for (out, sample) in output.iter_mut().zip(buffer.iter()) {
-            *out += *sample * mix.level;
+
+        let notes = match state.clip_notes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        };
+        let has_notes = !notes.is_empty();
+        let has_audio = track_has_audio.get(index).copied().unwrap_or(false);
+        let learned_map = state
+            .learned_cc
+            .lock()
+            .ok()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        let automation = state
+            .automation_lanes
+            .lock()
+            .ok()
+            .map(|lanes| lanes.clone())
+            .unwrap_or_default();
+        let bypass = state
+            .effect_bypass
+            .lock()
+            .ok()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        let queued_len = state
+            .midi_events
+            .lock()
+            .ok()
+            .map(|q| q.len())
+            .unwrap_or(0);
+        let should_suspend = smart_suspend_tracks
+            && !has_notes
+            && !has_audio
+            && queued_len == 0
+            && automation.is_empty();
+        if should_suspend {
+            let blocks = state.silent_blocks.fetch_add(1, Ordering::Relaxed) + 1;
+            if blocks >= 4 {
+                state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                continue;
+            }
+        } else {
+            state.silent_blocks.store(0, Ordering::Relaxed);
         }
+
+        MIX_TEMP.with(|mix_cell| {
+            FX_TEMP.with(|fx_cell| {
+                let mut temp = mix_cell.borrow_mut();
+                if temp.len() != output.len() {
+                    temp.resize(output.len(), 0.0);
+                }
+                temp.fill(0.0);
+
+                let mut track_processed = false;
+                let mut remaining_params: Vec<PendingParamChange> = Vec::new();
+                let mut filtered_events: Vec<vst3::MidiEvent> = Vec::new();
+                if let Some(host) = state.host.as_ref() {
+                    let mut events =
+                        collect_block_events(&notes, block_start, block_end, samples_per_beat);
+                    if panic_notes {
+                        for channel in 0u8..16 {
+                            events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+                            events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+                        }
+                        for channel in 0u8..16 {
+                            events.extend(
+                                (0u8..=127)
+                                    .map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
+                            );
+                        }
+                        if frames > 1 {
+                            for event in events.iter_mut() {
+                                if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
+                                    if *sample_offset == 0 {
+                                        *sample_offset = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if loop_wrapped {
+                        events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
+                    }
+                    if let Ok(mut queued) = state.midi_events.lock() {
+                        events.extend(queued.drain(..));
+                    }
+                    let has_note_on = events
+                        .iter()
+                        .any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
+                    let pending_params = state
+                        .pending_param_changes
+                        .lock()
+                        .ok()
+                        .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for pending in &pending_params {
+                        match pending.target {
+                            PendingParamTarget::Instrument => {
+                                host.push_param_change(pending.param_id, pending.value);
+                            }
+                            PendingParamTarget::Effect(_) => {
+                                remaining_params.push(*pending);
+                            }
+                        }
+                    }
+                    for lane in &automation {
+                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                            if lane.target == AutomationTarget::Instrument {
+                                host.push_param_change(lane.param_id, value as f64);
+                            }
+                        }
+                    }
+                    let mut filtered = Vec::with_capacity(events.len());
+                    for event in events {
+                        match event {
+                            vst3::MidiEvent::ControlChange {
+                                channel,
+                                controller,
+                                value,
+                            } => {
+                                if controller >= 120 {
+                                    filtered.push(event);
+                                    continue;
+                                }
+                                if let Some(param_id) = learned_map.get(&(channel, controller)) {
+                                    let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
+                                    host.push_param_change(*param_id, norm);
+                                } else {
+                                    filtered.push(event);
+                                }
+                            }
+                            _ => filtered.push(event),
+                        }
+                    }
+                    filtered_events = filtered;
+                    if host.process_f32(&mut temp, channels, &filtered_events).is_ok() {
+                        track_processed = true;
+                    }
+                    if panic_notes && !has_note_on {
+                        temp.fill(0.0);
+                    }
+                }
+
+                if let Some(clips) = per_track_clips.get(index) {
+                    for (clip, data) in clips {
+                        let clip_end = clip.start_samples + clip.length_samples;
+                        if block_end <= clip.start_samples || block_start >= clip_end {
+                            continue;
+                        }
+                        let src_channels = data.channels.max(1);
+                        let src_frames = data.samples.len() / src_channels;
+                        if src_frames == 0 {
+                            continue;
+                        }
+                        let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
+                        let time_mul = clip.time_mul.max(0.01) as f64;
+                        let start_in_block = block_start.max(clip.start_samples) - block_start;
+                        let end_in_block = block_end.min(clip_end) - block_start;
+                        for i in start_in_block..end_in_block {
+                            let clip_pos = i + block_start - clip.start_samples;
+                            let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                .max(0.0);
+                            let src_pos = if src_frames > 0 {
+                                let len = src_frames as f64;
+                                pos % len
+                            } else {
+                                pos
+                            };
+                            let base = src_pos.floor() as usize;
+                            let frac = (src_pos - base as f64) as f32;
+                            let next = (base + 1).min(src_frames.saturating_sub(1));
+                            for ch in 0..channels {
+                                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                                let idx0 = base * src_channels + src_ch;
+                                let idx1 = next * src_channels + src_ch;
+                                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                                let sample = s0 + (s1 - s0) * frac;
+                                let out_index = i as usize * channels + ch;
+                                if out_index < temp.len() {
+                                    temp[out_index] += sample * clip.gain;
+                                }
+                            }
+                        }
+                        track_processed = true;
+                    }
+                }
+
+                if !state.effect_hosts.is_empty() {
+                    let mut scratch = fx_cell.borrow_mut();
+                    if scratch.len() != temp.len() {
+                        scratch.resize(temp.len(), 0.0);
+                    }
+                    let mut use_temp = true;
+                    let mut current: &mut [f32] = &mut temp;
+                    let mut scratch_slice: &mut [f32] = &mut scratch;
+                    let skip_fx = smart_disable_plugins && !has_notes && !has_audio;
+                    for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
+                        if skip_fx || bypass.get(fx_index).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        scratch_slice.fill(0.0);
+                        let mut still_pending: Vec<PendingParamChange> = Vec::new();
+                        for pending in remaining_params.drain(..) {
+                            match pending.target {
+                                PendingParamTarget::Effect(target_index) if target_index == fx_index => {
+                                    fx_host.push_param_change(pending.param_id, pending.value);
+                                }
+                                _ => still_pending.push(pending),
+                            }
+                        }
+                        remaining_params = still_pending;
+                        for lane in &automation {
+                            if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                                if lane.target == AutomationTarget::Effect(fx_index) {
+                                    fx_host.push_param_change(lane.param_id, value as f64);
+                                }
+                            }
+                        }
+                        if fx_host
+                            .process_f32_with_input(current, scratch_slice, channels, &filtered_events)
+                            .is_ok()
+                        {
+                            std::mem::swap(&mut current, &mut scratch_slice);
+                            use_temp = !use_temp;
+                        }
+                    }
+                    if !remaining_params.is_empty() {
+                        if let Ok(mut pending) = state.pending_param_changes.lock() {
+                            pending.extend(remaining_params);
+                        }
+                    }
+                    if !use_temp {
+                        temp.copy_from_slice(&scratch);
+                    }
+                }
+
+                let mut peak_l = 0.0f32;
+                let mut peak_r = 0.0f32;
+                if channels >= 2 {
+                    for frame in temp.chunks_exact(channels) {
+                        peak_l = peak_l.max(frame[0].abs());
+                        peak_r = peak_r.max(frame[1].abs());
+                    }
+                } else {
+                    for sample in temp.iter() {
+                        let v = sample.abs();
+                        peak_l = peak_l.max(v);
+                        peak_r = peak_r.max(v);
+                    }
+                }
+                state.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
+                state.peak_r_bits.store(peak_r.to_bits(), Ordering::Relaxed);
+                state.peak_bits.store(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
+
+                if track_processed {
+                    processed_any = true;
+                }
+
+                for (out, sample) in output.iter_mut().zip(temp.iter()) {
+                    *out += *sample * mix.level;
+                }
+            })
+        });
     }
 
-    processed_any.load(Ordering::Relaxed)
+    processed_any
 }
 
 fn apply_fade_in_if_needed(samples: &mut [f32], channels: usize, flag: &AtomicBool) {
