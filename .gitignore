@@ -1,3 +1,5 @@
 target
 **/target
 Cargo.lock
+synths/PlantSynth/PlantSynth.vst3/samples/
+synths/PlantSynth/PlantSynth.vst3/sample_kits/
