@@ -1,0 +1,21 @@
+{
+  "name": "House Kit",
+  "slots": [
+    { "label": "Kick", "path": "samples/kick/House - Kick 01.wav", "pitch": 0.0, "gain": 0.9, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.04, "decay": 0.35, "sustain": 0.0, "release": 0.1 },
+    { "label": "Snare", "path": "samples/snare/House - Snare 01.wav", "pitch": 0.0, "gain": 0.9, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.03, "decay": 0.3, "sustain": 0.0, "release": 0.1 },
+    { "label": "Hat Closed", "path": "samples/hat_closed/House - Hat Closed 01.wav", "pitch": 0.0, "gain": 0.75, "pan": 0.45, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.2, "sustain": 0.0, "release": 0.08 },
+    { "label": "Hat Open", "path": "samples/hat_open/House - Hat Open 01.wav", "pitch": 0.0, "gain": 0.8, "pan": 0.55, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.45, "sustain": 0.0, "release": 0.12 },
+    { "label": "Tom", "path": "samples/toms/Ambient - Toms 01.wav", "pitch": 0.0, "gain": 0.85, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.03, "decay": 0.35, "sustain": 0.0, "release": 0.1 },
+    { "label": "Crash", "path": "samples/crash/House - Crash 01.wav", "pitch": 0.0, "gain": 0.8, "pan": 0.6, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.6, "sustain": 0.0, "release": 0.2 },
+    { "label": "Rimshot", "path": "samples/rimshot/House - Rimshot 01.wav", "pitch": 0.0, "gain": 0.75, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.2, "sustain": 0.0, "release": 0.08 },
+    { "label": "Conga", "path": "samples/conga/House - Conga 01.wav", "pitch": 0.0, "gain": 0.8, "pan": 0.4, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.03, "decay": 0.35, "sustain": 0.0, "release": 0.12 },
+    { "label": "Cowbell", "path": "samples/cowbell/House - Cowbell 01.wav", "pitch": 0.0, "gain": 0.75, "pan": 0.6, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.25, "sustain": 0.0, "release": 0.1 },
+    { "label": "Maracas", "path": "samples/maracas/House - Maracas 01.wav", "pitch": 0.0, "gain": 0.7, "pan": 0.55, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.01, "decay": 0.2, "sustain": 0.0, "release": 0.08 },
+    { "label": "Tambourine", "path": "samples/tambourine/House - Tambourine 01.wav", "pitch": 0.0, "gain": 0.7, "pan": 0.45, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.01, "decay": 0.2, "sustain": 0.0, "release": 0.08 },
+    { "label": "Crash 2", "path": "samples/crash/House - Crash 02.wav", "pitch": 0.0, "gain": 0.8, "pan": 0.4, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.6, "sustain": 0.0, "release": 0.2 },
+    { "label": "Snare 2", "path": "samples/snare/House - Snare 02.wav", "pitch": 0.0, "gain": 0.9, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.03, "decay": 0.3, "sustain": 0.0, "release": 0.1 },
+    { "label": "Hat Closed 2", "path": "samples/hat_closed/House - Hat Closed 02.wav", "pitch": 0.0, "gain": 0.75, "pan": 0.45, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.2, "sustain": 0.0, "release": 0.08 },
+    { "label": "Hat Open 2", "path": "samples/hat_open/House - Hat Open 02.wav", "pitch": 0.0, "gain": 0.8, "pan": 0.55, "velocity": 0.9, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.02, "decay": 0.45, "sustain": 0.0, "release": 0.12 },
+    { "label": "Kick 2", "path": "samples/kick/House - Kick 02.wav", "pitch": 0.0, "gain": 0.9, "pan": 0.5, "velocity": 0.85, "tone_low": 0.0, "tone_mid": 0.0, "tone_high": 0.0, "attack": 0.04, "decay": 0.35, "sustain": 0.0, "release": 0.1 }
+  ]
+}
