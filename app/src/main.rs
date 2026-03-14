@@ -1307,9 +1307,14 @@ struct DawApp {
     audio_preview_loop: bool,
     audio_preview_clip_id: Option<usize>,
     audio_stats: Arc<AudioRuntimeStats>,
+    ui_frame_last_ms: f32,
+    ui_frame_max_ms: f32,
+    ui_arranger_last_ms: f32,
+    ui_arranger_max_ms: f32,
     buffer_override: Option<u32>,
     adaptive_restart_requested: Arc<AtomicBool>,
     adaptive_buffer_size: Arc<AtomicU32>,
+    adaptive_restart_pending: bool,
     last_overrun: Arc<AtomicBool>,
     piano_drag: Option<PianoDragState>,
     piano_scale_drag: Option<PianoScaleDragState>,
@@ -1930,9 +1935,14 @@ impl Default for DawApp {
             audio_preview_loop: false,
             audio_preview_clip_id: None,
             audio_stats: Arc::new(AudioRuntimeStats::new()),
+            ui_frame_last_ms: 0.0,
+            ui_frame_max_ms: 0.0,
+            ui_arranger_last_ms: 0.0,
+            ui_arranger_max_ms: 0.0,
             buffer_override: None,
             adaptive_restart_requested: Arc::new(AtomicBool::new(false)),
             adaptive_buffer_size: Arc::new(AtomicU32::new(0)),
+            adaptive_restart_pending: false,
             last_overrun: Arc::new(AtomicBool::new(false)),
             piano_drag: None,
             piano_scale_drag: None,
@@ -1992,6 +2002,7 @@ impl Default for DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.project_dirty {
                 self.pending_exit = true;
@@ -2050,12 +2061,13 @@ impl eframe::App for DawApp {
                 };
                 self.buffer_override = Some(base);
                 if self.audio_running {
-                    self.stop_audio_and_midi_internal(false);
-                    if let Err(err) = self.start_audio_and_midi_internal(false) {
-                        self.status = format!("Audio restart failed: {err}");
-                    } else {
-                        self.status = format!("Audio buffer increased to {effective} samples");
-                    }
+                    self.adaptive_restart_pending = true;
+                    self.status = format!(
+                        "Audio buffer increase pending (stop to apply)"
+                    );
+                } else {
+                    self.adaptive_restart_pending = false;
+                    self.status = format!("Audio buffer set to {effective} samples");
                 }
             }
         }
@@ -2096,9 +2108,23 @@ impl eframe::App for DawApp {
             self.project_info_panel(ctx);
         }
         match self.main_tab {
-            MainTab::Arranger => self.center_arranger(ctx),
-            MainTab::Parameters => self.center_parameters(ctx),
-            MainTab::PianoRoll => self.center_piano_roll(ctx),
+            MainTab::Arranger => {
+                let arranger_start = std::time::Instant::now();
+                self.center_arranger(ctx);
+                let arranger_ms = arranger_start.elapsed().as_secs_f32() * 1000.0;
+                self.ui_arranger_last_ms = arranger_ms;
+                if arranger_ms > self.ui_arranger_max_ms {
+                    self.ui_arranger_max_ms = arranger_ms;
+                }
+            }
+            MainTab::Parameters => {
+                self.ui_arranger_last_ms = 0.0;
+                self.center_parameters(ctx);
+            }
+            MainTab::PianoRoll => {
+                self.ui_arranger_last_ms = 0.0;
+                self.center_piano_roll(ctx);
+            }
         }
         self.plugin_ui_window(ctx, frame);
         self.modals(ctx);
@@ -2350,6 +2376,11 @@ impl eframe::App for DawApp {
                 open = false;
             }
             self.show_render_dialog = open;
+        }
+        let frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        self.ui_frame_last_ms = frame_ms;
+        if frame_ms > self.ui_frame_max_ms {
+            self.ui_frame_max_ms = frame_ms;
         }
     }
 }
@@ -5198,6 +5229,18 @@ impl DawApp {
                     ui.label(format!(
                         "Audio blocks {blocks} | overruns {overruns} | last {last_ms:.2} ms | max {max_ms:.2} ms"
                     ));
+                    ui.label(format!(
+                        "UI frame {0:.2} ms | max {1:.2} ms",
+                        self.ui_frame_last_ms,
+                        self.ui_frame_max_ms
+                    ));
+                    if matches!(self.main_tab, MainTab::Arranger) {
+                        ui.label(format!(
+                            "Arranger {0:.2} ms | max {1:.2} ms",
+                            self.ui_arranger_last_ms,
+                            self.ui_arranger_max_ms
+                        ));
+                    }
                     if let Ok(cache) = self.audio_clip_cache.lock() {
                         let mb = cache.size_bytes() as f32 / (1024.0 * 1024.0);
                         ui.label(format!(
@@ -15889,6 +15932,10 @@ impl DawApp {
         }
 
         self.audio_running = true;
+        if self.adaptive_restart_pending {
+            self.adaptive_restart_pending = false;
+            self.status = format!("Audio buffer applied");
+        }
         Ok(())
     }
 
