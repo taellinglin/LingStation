@@ -3,10 +3,15 @@ use eframe::egui;
 use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
 use engine::timeline::PianoRollNote;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE;
 use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use midir::{Ignore, MidiInput, MidiInputConnection};
+use rand::RngCore;
+use reqwest::blocking::Client;
 use rodio::{Decoder, OutputStream, Sink, Source};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +31,9 @@ mod clap_host;
 mod vst3;
 
 const BASE_UI_FONT_SIZE: f32 = 9.0;
+const LICENSE_API_BASE: &str = "https://linglin.art";
+const LICENSE_PUBLIC_KEY_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJQEieMJP2VOEI8yM7BOpelBIUvC2AOUDm85k0OjtYNT";
+const LICENSE_PRODUCT_CODE: &str = "LingStation";
 
 fn main() -> eframe::Result<()> {
     install_crash_logger();
@@ -165,6 +173,20 @@ fn install_crash_logger() {
     }));
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum AudioStretchMode {
+    Stretch,
+    StretchFormant,
+    StretchNeutral,
+    Speed,
+}
+
+impl Default for AudioStretchMode {
+    fn default() -> Self {
+        Self::Stretch
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Clip {
     id: usize,
@@ -190,6 +212,8 @@ struct Clip {
     audio_gain: f32,
     #[serde(default)]
     audio_pitch_semitones: f32,
+    #[serde(default)]
+    audio_stretch_mode: AudioStretchMode,
     #[serde(default)]
     audio_time_mul: f32,
 }
@@ -284,6 +308,16 @@ struct SettingsState {
     #[serde(default)]
     theme: String,
     #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    device_salt: String,
+    #[serde(default)]
+    auth_token: String,
+    #[serde(default)]
+    registered_to: String,
+    #[serde(default)]
+    license_file: String,
+    #[serde(default)]
     triple_buffer: bool,
     #[serde(default)]
     safe_underruns: bool,
@@ -319,6 +353,11 @@ impl Default for SettingsState {
             interpolation: "linear".to_string(),
             midi_input: String::new(),
             theme: "Black".to_string(),
+            device_id: String::new(),
+            device_salt: String::new(),
+            auth_token: String::new(),
+            registered_to: String::new(),
+            license_file: String::new(),
             triple_buffer: false,
             safe_underruns: true,
             adaptive_buffer: true,
@@ -553,6 +592,17 @@ impl PluginHostHandle {
                 .ok()
                 .map(|mut host| (host.get_state_bytes(), Vec::new()))
                 .unwrap_or_default(),
+        }
+    }
+
+    fn clap_blocks_params(&self) -> bool {
+        match self {
+            PluginHostHandle::Clap(host) => host
+                .lock()
+                .ok()
+                .map(|host| host.param_changes_blocked())
+                .unwrap_or(false),
+            _ => false,
         }
     }
 
@@ -916,6 +966,24 @@ impl Default for MasterCompState {
     }
 }
 
+struct LicenseJob {
+    finished: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<LicenseJobResult>>>,
+}
+
+struct LicenseJobResult {
+    status: Result<String, String>,
+    token: Option<String>,
+    license_file: Option<String>,
+    registered_to: Option<String>,
+}
+
+struct LicensePayloadInfo {
+    registered_to: Option<String>,
+    license_type: Option<String>,
+    max_activations: Option<u64>,
+}
+
 struct DawApp {
     project_name: String,
     project_path: String,
@@ -951,12 +1019,19 @@ struct DawApp {
     selected_track_index: Arc<AtomicUsize>,
     midi_learn: Arc<Mutex<Option<(usize, u32)>>>,
     rename_buffer: String,
+    rename_clip_buffer: String,
+    rename_clip_target: Option<(usize, usize)>,
     show_rename_track: bool,
+    show_rename_clip: bool,
     project_name_buffer: String,
     show_rename_project: bool,
     show_settings: bool,
     show_project_info: bool,
     show_metadata: bool,
+    show_help_about: bool,
+    show_help_license: bool,
+    show_help_shortcuts: bool,
+    show_help_general: bool,
     show_sidebar: bool,
     show_mixer: bool,
     show_transport: bool,
@@ -978,6 +1053,12 @@ struct DawApp {
     import_path: String,
     export_path: String,
     status: String,
+    license_identifier: String,
+    license_password: String,
+    license_serial: String,
+    license_device_label: String,
+    license_status: String,
+    license_job: Option<LicenseJob>,
     last_ui_param_change: Option<(u32, f32)>,
     preset_name_buffer: String,
     startup_stream: Option<OutputStream>,
@@ -1042,6 +1123,7 @@ struct DawApp {
     last_overrun: Arc<AtomicBool>,
     piano_drag: Option<PianoDragState>,
     piano_scale_drag: Option<PianoScaleDragState>,
+    piano_zoom_drag: Option<PianoZoomDragState>,
     piano_tool: PianoTool,
     arranger_snap_beats: f32,
     piano_selected: HashSet<usize>,
@@ -1050,6 +1132,7 @@ struct DawApp {
     piano_cc_drag: Option<usize>,
     piano_roll_rect: Option<egui::Rect>,
     piano_roll_panel_height: f32,
+    piano_focus_beats: Option<f32>,
     selected_clips: HashSet<usize>,
     plugin_ui: Option<PluginUiHost>,
     plugin_ui_hidden: bool,
@@ -1059,6 +1142,7 @@ struct DawApp {
     last_viewport_rect: Option<egui::Rect>,
     pending_startup_maximize: bool,
     seen_nonzero_viewport: bool,
+    pending_viewport_focus: bool,
     fs_expanded: HashSet<String>,
     fs_selected: Option<String>,
     browser_expanded: HashSet<String>,
@@ -1087,6 +1171,7 @@ struct PluginUiHost {
     host: PluginHostHandle,
     target: PluginUiTarget,
     close_requested: Arc<AtomicBool>,
+    floating: bool,
 }
 
 struct CallbackGuard {
@@ -1238,6 +1323,12 @@ struct PianoScaleDragState {
     selected_notes: Vec<(usize, f32, u8, f32)>,
 }
 
+struct PianoZoomDragState {
+    start_pos: egui::Pos2,
+    start_zoom_x: f32,
+    start_zoom_y: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsSource {
     Project,
@@ -1314,13 +1405,14 @@ impl Default for DawApp {
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
                 audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
             },
-            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
-            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_time_mul: 1.0 },
+            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
+            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
+            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
+            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
+            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
         ];
 
         let tracks = vec![
@@ -1528,12 +1620,19 @@ impl Default for DawApp {
             )),
             midi_learn: Arc::new(Mutex::new(None)),
             rename_buffer: String::new(),
+            rename_clip_buffer: String::new(),
+            rename_clip_target: None,
             show_rename_track: false,
+            show_rename_clip: false,
             project_name_buffer: String::new(),
             show_rename_project: false,
             show_settings: false,
             show_project_info: false,
             show_metadata: false,
+            show_help_about: false,
+            show_help_license: false,
+            show_help_shortcuts: false,
+            show_help_general: false,
             show_sidebar: true,
             show_mixer: true,
             show_transport: true,
@@ -1555,6 +1654,12 @@ impl Default for DawApp {
             import_path: "project.mid".to_string(),
             export_path: "export.mid".to_string(),
             status: "Ready".to_string(),
+            license_identifier: String::new(),
+            license_password: String::new(),
+            license_serial: String::new(),
+            license_device_label: "Main PC".to_string(),
+            license_status: "Unregistered".to_string(),
+            license_job: None,
             last_ui_param_change: None,
             preset_name_buffer: String::new(),
             startup_stream: None,
@@ -1633,6 +1738,7 @@ impl Default for DawApp {
             last_overrun: Arc::new(AtomicBool::new(false)),
             piano_drag: None,
             piano_scale_drag: None,
+            piano_zoom_drag: None,
             piano_tool: PianoTool::Pencil,
             arranger_snap_beats: 1.0,
             piano_selected: HashSet::new(),
@@ -1641,6 +1747,7 @@ impl Default for DawApp {
             piano_cc_drag: None,
             piano_roll_rect: None,
             piano_roll_panel_height: 0.0,
+            piano_focus_beats: None,
             selected_clips: {
                 let mut set = HashSet::new();
                 if let Some(clip_id) = initial_selected_clip {
@@ -1656,6 +1763,7 @@ impl Default for DawApp {
             last_viewport_rect: None,
             pending_startup_maximize: true,
             seen_nonzero_viewport: false,
+            pending_viewport_focus: false,
             fs_expanded: HashSet::new(),
             fs_selected: None,
             browser_expanded: HashSet::new(),
@@ -1672,6 +1780,8 @@ impl Default for DawApp {
             gm_presets_generated: false,
         };
         app.load_settings_or_default();
+        app.ensure_device_id();
+        app.refresh_license_status();
         if app.settings.play_startup_sound {
             if let Err(err) = app.play_startup_sound() {
                 app.status = format!("Startup sound failed: {err}");
@@ -1692,6 +1802,7 @@ impl eframe::App for DawApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        self.poll_license_job();
         let viewport = ctx.input(|i| i.viewport().clone());
         let viewport_has_size = viewport
             .outer_rect
@@ -1714,6 +1825,11 @@ impl eframe::App for DawApp {
         }
         if self.last_viewport_rect != viewport.outer_rect {
             self.last_viewport_rect = viewport.outer_rect;
+            ctx.request_repaint();
+        }
+        if self.pending_viewport_focus {
+            self.pending_viewport_focus = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.request_repaint();
         }
         self.apply_theme(ctx);
@@ -2264,10 +2380,14 @@ impl DawApp {
                 if self.is_recording {
                     let _ = self.end_recording();
                 } else {
-                    self.stop_audio_and_midi();
+                    self.pause_audio_and_midi();
+                    self.status = "Paused".to_string();
                 }
             } else {
-                let _ = self.start_audio_and_midi();
+                self.seek_playhead(self.playhead_beats);
+                if let Err(err) = self.start_audio_and_midi_internal(false) {
+                    self.status = format!("Play failed: {err}");
+                }
             }
         }
         if input.key_pressed(egui::Key::R) {
@@ -3467,6 +3587,34 @@ impl DawApp {
         track.param_values = params.iter().map(|p| p.default_value as f32).collect();
     }
 
+    fn refresh_clap_params_if_needed(&mut self) {
+        let Some(index) = self.selected_track else {
+            return;
+        };
+        let Some(PluginHostHandle::Clap(host)) = self.selected_track_host() else {
+            return;
+        };
+        let params = if let Ok(mut host) = host.try_lock() {
+            let flags = host.take_param_rescan();
+            if flags == 0 {
+                return;
+            }
+            host.enumerate_params()
+        } else {
+            return;
+        };
+        if params.is_empty() {
+            return;
+        }
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.params = params.iter().map(|p| p.name.clone()).collect();
+            track.param_ids = params.iter().map(|p| p.id).collect();
+            if track.param_values.len() != params.len() {
+                track.param_values = params.iter().map(|p| p.default_value as f32).collect();
+            }
+        }
+    }
+
     fn tint(color: egui::Color32, amount: f32) -> egui::Color32 {
         let r = (color.r() as f32 * amount).min(255.0) as u8;
         let g = (color.g() as f32 * amount).min(255.0) as u8;
@@ -3600,6 +3748,16 @@ impl DawApp {
         }
     }
 
+    fn audio_playback_time_mul(clip: &Clip) -> f32 {
+        let base = clip.audio_time_mul.max(0.01);
+        if clip.audio_stretch_mode == AudioStretchMode::Speed {
+            let ratio = 2.0f32.powf(clip.audio_pitch_semitones / 12.0);
+            (base / ratio).max(0.01)
+        } else {
+            base
+        }
+    }
+
     fn audio_source_beats(&self, clip: &Clip) -> Option<f32> {
         let tempo = self.tempo_bpm.max(1.0);
         self.get_waveform_seconds_for_clip(clip)
@@ -3611,7 +3769,7 @@ impl DawApp {
         if clip.is_midi {
             return Self::midi_loop_len_for_clip(clip);
         }
-        let time_mul = clip.audio_time_mul.max(0.01);
+        let time_mul = Self::audio_playback_time_mul(clip);
         let source_beats = self.audio_source_beats(clip)?;
         let loop_len = source_beats * time_mul;
         if loop_len > 0.0 {
@@ -3635,7 +3793,7 @@ impl DawApp {
         if let Some(waveform) = waveform {
             let count = waveform.len().max(1);
             let step = rect.width() / count as f32;
-            let time_mul = clip.audio_time_mul.max(0.01);
+            let time_mul = Self::audio_playback_time_mul(clip);
             let clip_len = clip.length_beats.max(0.001);
             let source_beats = self
                 .get_waveform_seconds_for_clip(clip)
@@ -4060,7 +4218,7 @@ impl DawApp {
                     length_samples,
                     offset_samples,
                     gain: clip.audio_gain,
-                    time_mul: clip.audio_time_mul.max(0.01),
+                    time_mul: Self::audio_playback_time_mul(clip),
                 });
             }
         }
@@ -4091,14 +4249,15 @@ impl DawApp {
                 let start_samples = self.beats_to_samples(clip.start_beats, sample_rate);
                 let length_samples = self.beats_to_samples(clip.length_beats, sample_rate).max(1);
                 let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
+                let render_track_index = if track_filter.is_some() { 0 } else { track_index };
                 renders.push(AudioClipRender {
                     path: path_str.clone(),
-                    track_index,
+                    track_index: render_track_index,
                     start_samples,
                     length_samples,
                     offset_samples,
                     gain: clip.audio_gain,
-                    time_mul: clip.audio_time_mul.max(0.01),
+                    time_mul: Self::audio_playback_time_mul(clip),
                 });
                 if !cache.contains_key(&path_str) {
                     if let Some(data) = Self::load_audio_clip_data(&path) {
@@ -4579,11 +4738,48 @@ impl DawApp {
                                 egui::Image::new(egui::include_image!("../../icons/help-circle.svg"))
                                     .fit_to_exact_size(icon_size)
                                     .tint(help_color),
-                                menu_text("About LingStation"),
+                                menu_text("About"),
                             ))
                             .clicked()
                         {
-                        self.status = "About".to_string();
+                        self.show_help_about = true;
+                        ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/key.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(help_color),
+                                menu_text("License"),
+                            ))
+                            .clicked()
+                        {
+                        self.show_help_license = true;
+                        ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/command.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(help_color),
+                                menu_text("Shortcuts"),
+                            ))
+                            .clicked()
+                        {
+                        self.show_help_shortcuts = true;
+                        ui.close_menu();
+                        }
+                        if ui
+                            .add(egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/book-open.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(help_color),
+                                menu_text("Help"),
+                            ))
+                            .clicked()
+                        {
+                        self.show_help_general = true;
+                        ui.close_menu();
                         }
                     });
                 });
@@ -4743,6 +4939,7 @@ impl DawApp {
                 } else {
                     self.destroy_plugin_ui();
                 }
+                self.pending_viewport_focus = true;
                 ctx.request_repaint();
                 return;
             }
@@ -4750,7 +4947,7 @@ impl DawApp {
         let should_close_hidden = self
             .plugin_ui
             .as_ref()
-            .map(|ui_host| !is_window_visible(ui_host.hwnd))
+            .map(|ui_host| !ui_host.floating && !is_window_visible(ui_host.hwnd))
             .unwrap_or(false)
             && self.show_plugin_ui
             && !self.plugin_ui_hidden;
@@ -4805,16 +5002,20 @@ impl DawApp {
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
             if !is_window_alive(ui_host.hwnd) {
-                self.destroy_plugin_ui();
+                self.plugin_ui = None;
+                self.plugin_ui_target = None;
                 self.show_plugin_ui = false;
                 self.plugin_ui_hidden = false;
+                self.pending_viewport_focus = true;
                 ctx.request_repaint();
                 return;
             }
             if ui_host.child_hwnd != ui_host.hwnd && !is_window_alive(ui_host.child_hwnd) {
-                self.destroy_plugin_ui();
+                self.plugin_ui = None;
+                self.plugin_ui_target = None;
                 self.show_plugin_ui = false;
                 self.plugin_ui_hidden = false;
+                self.pending_viewport_focus = true;
                 ctx.request_repaint();
                 return;
             }
@@ -4838,6 +5039,9 @@ impl DawApp {
                 PluginUiEditor::Clap => {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Ok(mut host) = host.lock() {
+                            if host.take_gui_request_hide() {
+                                host.hide_gui();
+                            }
                             if let Some((gw, gh)) = host.take_gui_resize() {
                                 move_plugin_child_window(
                                     ui_host.child_hwnd,
@@ -4848,7 +5052,9 @@ impl DawApp {
                                 );
                                 resize_plugin_top_window(ui_host.hwnd, gw.max(200), gh.max(120));
                             }
-                            host.show_gui();
+                            if host.take_gui_request_show() || !host.gui_is_open() {
+                                host.show_gui();
+                            }
                         }
                     }
                 }
@@ -5028,6 +5234,7 @@ impl DawApp {
                     host: host.clone(),
                     target,
                     close_requested,
+                    floating: false,
                 });
             }
             PluginHostHandle::Clap(clap_host) => {
@@ -5089,6 +5296,7 @@ impl DawApp {
                     host: host.clone(),
                     target,
                     close_requested,
+                    floating: false,
                 });
             }
         }
@@ -5621,7 +5829,7 @@ impl DawApp {
 
     fn mixer_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("mixer_panel")
-            .default_width(300.0)
+            .default_width(200.0)
             .min_width(200.0)
             .max_width(350.0)
             .resizable(true)
@@ -5866,6 +6074,7 @@ impl DawApp {
             let mut action: Option<MixerAction> = None;
             let mut selected_track = self.selected_track;
             let mut mix_dirty = false;
+            let mut pending_exclusive_solo: Option<usize> = None;
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -6005,7 +6214,15 @@ impl DawApp {
                                     mix_dirty = true;
                                 }
                                 if solo_clicked {
-                                    track.solo = !track.solo;
+                                    let multi_solo = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                                    if track.solo {
+                                        track.solo = false;
+                                    } else if multi_solo {
+                                        track.solo = true;
+                                    } else {
+                                        track.solo = true;
+                                        pending_exclusive_solo = Some(index);
+                                    }
                                     mix_dirty = true;
                                 }
                                 let level_response = ui.add_sized(
@@ -6540,7 +6757,11 @@ impl DawApp {
             let box_select_active = ctx.input(|i| i.key_down(egui::Key::B) || i.modifiers.ctrl);
             if over_arranger && !self.piano_roll_hovered {
                 let input = ctx.input(|i| i.clone());
-                if input.modifiers.ctrl {
+                let mmb_down = input.pointer.button_down(egui::PointerButton::Middle);
+                if mmb_down {
+                    self.arranger_pan += input.pointer.delta();
+                    response.clone().on_hover_cursor(egui::CursorIcon::Move);
+                } else if input.modifiers.ctrl {
                     let zoom = input.zoom_delta();
                     if (zoom - 1.0).abs() > f32::EPSILON {
                         self.arranger_zoom = (self.arranger_zoom * zoom).clamp(0.05, 4.0);
@@ -6923,12 +7144,25 @@ impl DawApp {
                 }
             }
 
+            #[derive(Clone, Copy)]
+            enum TrackContextAction {
+                CloneOnly(usize),
+                DuplicateWithClips(usize),
+                Delete(usize),
+                MoveUp(usize),
+                MoveDown(usize),
+                ToggleSolo(usize),
+                ToggleMute(usize),
+            }
+
             let mut pending_select: Option<(usize, usize, bool)> = None;
             let mut pending_multi_select: Option<Vec<(usize, usize)>> = None;
             let mut pending_delete: Option<usize> = None;
+            let mut pending_clip_rename: Option<(usize, usize)> = None;
             let mut pending_drag_start: Option<ClipDragState> = None;
             let mut pending_track_select: Option<usize> = None;
             let mut pending_track_move: Option<(usize, usize)> = None;
+            let mut pending_track_action: Option<TrackContextAction> = None;
             let mut pending_stamp_copy: Option<(Clip, usize, usize, f32, f32, f32)> = None;
             let mut over_clip = false;
             let mut switch_to_move = false;
@@ -7047,11 +7281,12 @@ impl DawApp {
                                 }
                                 block_start = block_end;
                             }
-                            clip_painter.rect_stroke(
-                                clip_rect,
-                                0.0,
-                                egui::Stroke::new(1.0, Self::tint(base, 0.7)),
-                            );
+                            let clip_stroke = if selected {
+                                egui::Stroke::new(2.0, Self::tint(base, 1.0))
+                            } else {
+                                egui::Stroke::new(1.0, Self::tint(base, 0.7))
+                            };
+                            clip_painter.rect_stroke(clip_rect, 0.0, clip_stroke);
                             if let Some(loop_len) = self.clip_loop_len_beats(clip) {
                                 if loop_len > 0.0 && clip.length_beats > loop_len + 0.0001 {
                                     let mut marker = clip.start_beats + loop_len;
@@ -7073,13 +7308,15 @@ impl DawApp {
                                     }
                                 }
                             }
+                            let handle_w = 12.0;
                             let name = if clip.name.trim().is_empty() {
                                 if clip.is_midi { "MIDI" } else { "Audio" }
                             } else {
                                 clip.name.as_str()
                             };
                             let header_text = ui.fonts(|f| {
-                                let font = egui::FontId::proportional(BASE_UI_FONT_SIZE);
+                                let font =
+                                    egui::FontId::proportional((BASE_UI_FONT_SIZE - 1.0).max(6.0));
                                 let max_width = (header_rect.width() - 10.0).max(4.0);
                                 let mut text = name.to_string();
                                 while text.len() > 1
@@ -7104,11 +7341,11 @@ impl DawApp {
                                 egui::pos2(header_rect.left() + 4.0, header_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 &header_text,
-                                egui::FontId::proportional(BASE_UI_FONT_SIZE),
+                                egui::FontId::proportional((BASE_UI_FONT_SIZE - 1.0).max(6.0)),
                                 egui::Color32::WHITE,
                             );
                             if clip.is_midi {
-                                let preview_rect = body_rect.shrink2(egui::vec2(6.0, 6.0));
+                                let preview_rect = body_rect.shrink2(egui::vec2(2.0, 2.0));
                                 self.draw_midi_preview(
                                     &clip_painter,
                                     preview_rect,
@@ -7131,7 +7368,6 @@ impl DawApp {
                                 );
                             }
 
-                            let handle_w = 12.0;
                             let trim_h = 10.0;
                             let header_left = egui::Rect::from_min_size(
                                 egui::pos2(header_rect.left(), header_rect.top()),
@@ -7141,6 +7377,10 @@ impl DawApp {
                                 egui::pos2(header_rect.right() - handle_w, header_rect.top()),
                                 egui::vec2(handle_w, header_rect.height()),
                             );
+                            let header_label_rect = egui::Rect::from_min_max(
+                                egui::pos2(header_left.right(), header_rect.top()),
+                                egui::pos2(header_right.left(), header_rect.bottom()),
+                            );
                             let trim_left = egui::Rect::from_min_size(
                                 egui::pos2(body_rect.left(), clip_rect.bottom() - trim_h),
                                 egui::vec2(handle_w, trim_h),
@@ -7149,19 +7389,10 @@ impl DawApp {
                                 egui::pos2(body_rect.right() - handle_w, clip_rect.bottom() - trim_h),
                                 egui::vec2(handle_w, trim_h),
                             );
-                            clip_painter.rect_filled(
-                                trim_left,
-                                0.0,
-                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 80),
-                            );
-                            clip_painter.rect_filled(
-                                trim_right,
-                                0.0,
-                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 80),
-                            );
 
                             let header_left_id = egui::Id::new(format!("clip_header_left_{}", clip.id));
                             let header_right_id = egui::Id::new(format!("clip_header_right_{}", clip.id));
+                            let header_label_id = egui::Id::new(format!("clip_header_label_{}", clip.id));
                             let trim_left_id = egui::Id::new(format!("clip_trim_left_{}", clip.id));
                             let trim_right_id = egui::Id::new(format!("clip_trim_right_{}", clip.id));
                             let header_visible = header_rect.top() >= timeline_bottom;
@@ -7170,6 +7401,9 @@ impl DawApp {
                             });
                             let header_right_resp = header_visible.then(|| {
                                 ui.interact(header_right, header_right_id, egui::Sense::click_and_drag())
+                            });
+                            let header_label_resp = header_visible.then(|| {
+                                ui.interact(header_label_rect, header_label_id, egui::Sense::click())
                             });
                             let trim_left_resp = header_visible.then(|| {
                                 ui.interact(trim_left, trim_left_id, egui::Sense::click_and_drag())
@@ -7199,6 +7433,11 @@ impl DawApp {
                             }
                             if clip_response.double_clicked() {
                                 pending_select = Some((clip.id, track_index, false));
+                                if let Some(pos) = clip_response.interact_pointer_pos() {
+                                    let beat_at_click = (pos.x - row_left) / beat_width;
+                                    let local = (beat_at_click - clip.start_beats).max(0.0);
+                                    self.piano_focus_beats = Some(local);
+                                }
                                 self.main_tab = MainTab::PianoRoll;
                             }
                             let clip_header_clicked = header_left_resp
@@ -7207,6 +7446,9 @@ impl DawApp {
                                 || header_right_resp
                                     .as_ref()
                                     .map_or(false, |resp| resp.clicked());
+                            if header_label_resp.as_ref().map_or(false, |resp| resp.clicked()) && selected {
+                                pending_clip_rename = Some((track_index, clip.id));
+                            }
                             if !header_clicked
                                 && self.arranger_tool != ArrangerTool::Draw
                                 && (clip_response.clicked() || clip_header_clicked)
@@ -7706,6 +7948,7 @@ impl DawApp {
                                 audio_offset_beats: 0.0,
                                 audio_gain: 1.0,
                                 audio_pitch_semitones: 0.0,
+                                audio_stretch_mode: AudioStretchMode::Stretch,
                                 audio_time_mul: 1.0,
                             });
                             self.selected_track = Some(track_index);
@@ -7898,21 +8141,18 @@ impl DawApp {
                 if label_click_rect.top() >= grid_top {
                     let label_id = egui::Id::new(format!("arranger_tracklist_{}", track_index));
                     let label_response =
-                        ui.interact(label_click_rect, label_id, egui::Sense::click());
+                        ui.interact(label_click_rect, label_id, egui::Sense::click_and_drag());
                     if label_response.clicked()
                         && !toggle_response.as_ref().map_or(false, |resp| resp.clicked())
                     {
                         pending_track_select = Some(track_index);
                     }
-                    let drag_id = egui::Id::new(format!("arranger_track_drag_{}", track_index));
-                    let drag_response =
-                        ui.interact(label_click_rect, drag_id, egui::Sense::click_and_drag());
-                    if drag_response.drag_started() {
+                    if label_response.drag_started() {
                         self.track_drag = Some(TrackDragState { source_index: track_index });
                     }
-                    if drag_response.drag_stopped() {
+                    if label_response.drag_stopped() {
                         if let Some(drag) = self.track_drag.take() {
-                            let pos = drag_response
+                            let pos = label_response
                                 .interact_pointer_pos()
                                 .or_else(|| response.interact_pointer_pos())
                                 .or_else(|| ctx.input(|i| i.pointer.interact_pos()));
@@ -7923,6 +8163,39 @@ impl DawApp {
                             }
                         }
                     }
+                    label_response.context_menu(|ui| {
+                        if ui.button("Clone Track Only").clicked() {
+                            pending_track_action = Some(TrackContextAction::CloneOnly(track_index));
+                            ui.close_menu();
+                        }
+                        if ui.button("Duplicate Track With Clips").clicked() {
+                            pending_track_action =
+                                Some(TrackContextAction::DuplicateWithClips(track_index));
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete Track").clicked() {
+                            pending_track_action = Some(TrackContextAction::Delete(track_index));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Move Up").clicked() {
+                            pending_track_action = Some(TrackContextAction::MoveUp(track_index));
+                            ui.close_menu();
+                        }
+                        if ui.button("Move Down").clicked() {
+                            pending_track_action = Some(TrackContextAction::MoveDown(track_index));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Solo").clicked() {
+                            pending_track_action = Some(TrackContextAction::ToggleSolo(track_index));
+                            ui.close_menu();
+                        }
+                        if ui.button("Mute").clicked() {
+                            pending_track_action = Some(TrackContextAction::ToggleMute(track_index));
+                            ui.close_menu();
+                        }
+                    });
                 }
                 let name_rect = egui::Rect::from_min_max(
                     egui::pos2(
@@ -8066,6 +8339,9 @@ impl DawApp {
                 self.refresh_params_for_selected_track(false);
                 self.piano_selected.clear();
             }
+            if let Some((track_index, clip_id)) = pending_clip_rename {
+                self.begin_rename_clip(track_index, clip_id);
+            }
             if switch_to_move {
                 self.arranger_tool = ArrangerTool::Move;
             }
@@ -8076,6 +8352,57 @@ impl DawApp {
                 if self.selected_clip == Some(clip_id) {
                     self.selected_clip = None;
                 }
+            }
+
+            let mut track_mix_dirty = false;
+            if let Some(action) = pending_track_action {
+                match action {
+                    TrackContextAction::CloneOnly(track_index) => {
+                        self.selected_track = Some(track_index);
+                        self.clone_selected_track();
+                    }
+                    TrackContextAction::DuplicateWithClips(track_index) => {
+                        self.selected_track = Some(track_index);
+                        self.duplicate_selected_track();
+                    }
+                    TrackContextAction::Delete(track_index) => {
+                        self.selected_track = Some(track_index);
+                        self.remove_selected_track();
+                    }
+                    TrackContextAction::MoveUp(track_index) => {
+                        if track_index > 0 {
+                            pending_track_move = Some((track_index, track_index - 1));
+                        }
+                    }
+                    TrackContextAction::MoveDown(track_index) => {
+                        let last = self.tracks.len().saturating_sub(1);
+                        if track_index < last {
+                            pending_track_move = Some((track_index, track_index + 1));
+                        }
+                    }
+                    TrackContextAction::ToggleSolo(track_index) => {
+                        if let Some(track) = self.tracks.get_mut(track_index) {
+                            if track.solo {
+                                track.solo = false;
+                            } else {
+                                for (other_index, other) in self.tracks.iter_mut().enumerate() {
+                                    other.solo = other_index == track_index;
+                                }
+                            }
+                            track_mix_dirty = true;
+                        }
+                    }
+                    TrackContextAction::ToggleMute(track_index) => {
+                        if let Some(track) = self.tracks.get_mut(track_index) {
+                            track.muted = !track.muted;
+                            track_mix_dirty = true;
+                        }
+                    }
+                }
+            }
+
+            if track_mix_dirty {
+                self.sync_track_mix();
             }
 
             if let Some((from, to)) = pending_track_move {
@@ -8299,47 +8626,156 @@ impl DawApp {
             .unwrap_or(false);
 
         if show_roll {
-            ui.horizontal(|ui| {
-                ui.heading(if is_audio_clip { "Audio Clip" } else { "Piano Roll" });
-                if let Some(clip_id) = self.selected_clip {
-                    ui.label(format!("Clip {}", clip_id));
-                } else {
-                    ui.label("No clip selected");
-                }
-            });
-            if !is_audio_clip {
-                ui.horizontal(|ui| {
-                    ui.label("Tools");
-                    let tool_size = egui::vec2(90.0, 22.0);
-                    let icon_size = egui::vec2(14.0, 14.0);
-                    let button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 220);
-                    let button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 220);
-                    let icon_tint = egui::Color32::from_gray(220);
-                    let mut tool_button = |tool: PianoTool, icon: egui::ImageSource<'static>, label: &str| {
-                        let selected = self.piano_tool == tool;
-                        let button = egui::Button::image_and_text(
-                            egui::Image::new(icon).fit_to_exact_size(icon_size).tint(icon_tint),
-                            label,
-                        )
-                        .min_size(tool_size)
-                        .fill(if selected { button_on } else { button_bg });
-                        if ui.add(button).clicked() {
-                            self.piano_tool = tool;
+            egui::SidePanel::left("piano_tools")
+                .default_width(220.0)
+                .resizable(true)
+                .show_inside(ui, |ui| {
+                    ui.heading(if is_audio_clip { "Audio Clip" } else { "Piano Roll" });
+                    if let Some(clip_id) = self.selected_clip {
+                        ui.label(format!("Clip {}", clip_id));
+                    } else {
+                        ui.label("No clip selected");
+                    }
+                    if let Some((ti, ci)) = selected_clip_info {
+                        if let Some(clip) =
+                            self.tracks.get_mut(ti).and_then(|track| track.clips.get_mut(ci))
+                        {
+                            ui.add_space(4.0);
+                            let mut name_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.label("Name");
+                                name_changed =
+                                    ui.text_edit_singleline(&mut clip.name).changed();
+                            });
+                            if name_changed {
+                                self.mark_dirty();
+                            }
                         }
-                    };
-                    tool_button(
-                        PianoTool::Pencil,
-                        egui::include_image!("../../icons/pen-tool.svg"),
-                        "Draw",
-                    );
-                    tool_button(
-                        PianoTool::Select,
-                        egui::include_image!("../../icons/mouse-pointer.svg"),
-                        "Select",
-                    );
+                    }
+                    if !is_audio_clip {
+                        ui.add_space(6.0);
+                        let lengths = [
+                            (1.0 / 32.0, "1/32"),
+                            (1.0 / 16.0, "1/16"),
+                            (1.0 / 8.0, "1/8"),
+                            (1.0 / 4.0, "1/4"),
+                            (1.0 / 2.0, "1/2"),
+                            (1.0, "1"),
+                        ];
+                        let note_label = lengths
+                            .iter()
+                            .find(|(value, _)| (self.piano_note_len - *value).abs() < f32::EPSILON)
+                            .map(|(_, label)| *label)
+                            .unwrap_or("1/4");
+                        let snap_label = lengths
+                            .iter()
+                            .find(|(value, _)| (self.piano_snap - *value).abs() < f32::EPSILON)
+                            .map(|(_, label)| *label)
+                            .unwrap_or("1/4");
+
+                        ui.horizontal(|ui| {
+                            ui.label("Tools:");
+                        });
+                        let tool_size = egui::vec2(86.0, 22.0);
+                        let icon_size = egui::vec2(14.0, 14.0);
+                        let button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 220);
+                        let button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 220);
+                        let icon_tint = egui::Color32::from_gray(220);
+                        ui.horizontal(|ui| {
+                            let draw_selected = self.piano_tool == PianoTool::Pencil;
+                            let draw_button = egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/pen-tool.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(icon_tint),
+                                "Draw",
+                            )
+                            .min_size(tool_size)
+                            .fill(if draw_selected { button_on } else { button_bg });
+                            if ui.add(draw_button).clicked() {
+                                self.piano_tool = PianoTool::Pencil;
+                            }
+
+                            let select_selected = self.piano_tool == PianoTool::Select;
+                            let select_button = egui::Button::image_and_text(
+                                egui::Image::new(egui::include_image!("../../icons/mouse-pointer.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .tint(icon_tint),
+                                "Select",
+                            )
+                            .min_size(tool_size)
+                            .fill(if select_selected { button_on } else { button_bg });
+                            if ui.add(select_button).clicked() {
+                                self.piano_tool = PianoTool::Select;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Note:");
+                            egui::ComboBox::from_id_source("piano_note_len")
+                                .selected_text(note_label)
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in lengths {
+                                        ui.selectable_value(&mut self.piano_note_len, value, label);
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Snap:");
+                            egui::ComboBox::from_id_source("piano_snap")
+                                .selected_text(snap_label)
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in lengths {
+                                        ui.selectable_value(&mut self.piano_snap, value, label);
+                                    }
+                                });
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Lane:");
+                            egui::ComboBox::from_id_source("piano_lane_mode")
+                                .selected_text(match self.piano_lane_mode {
+                                    PianoLaneMode::Velocity => "Velocity",
+                                    PianoLaneMode::Pan => "Pan",
+                                    PianoLaneMode::Cutoff => "Cutoff",
+                                    PianoLaneMode::Resonance => "Resonance",
+                                    PianoLaneMode::MidiCc => "MIDI CC",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.piano_lane_mode,
+                                        PianoLaneMode::Velocity,
+                                        "Velocity",
+                                    );
+                                    ui.selectable_value(&mut self.piano_lane_mode, PianoLaneMode::Pan, "Pan");
+                                    ui.selectable_value(
+                                        &mut self.piano_lane_mode,
+                                        PianoLaneMode::Cutoff,
+                                        "Cutoff",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.piano_lane_mode,
+                                        PianoLaneMode::Resonance,
+                                        "Resonance",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.piano_lane_mode,
+                                        PianoLaneMode::MidiCc,
+                                        "MIDI CC",
+                                    );
+                                });
+                        });
+                        if self.piano_lane_mode == PianoLaneMode::MidiCc {
+                            ui.horizontal(|ui| {
+                                ui.label("CC");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.piano_cc)
+                                        .clamp_range(0..=127)
+                                        .speed(1.0),
+                                );
+                            });
+                        }
+                    }
                 });
-            }
-            ui.add_space(4.0);
         }
 
         if show_params && !show_roll {
@@ -8364,90 +8800,145 @@ impl DawApp {
                                 .and_then(|t| t.clips.get(ci))
                                 .and_then(|clip| self.resolve_clip_audio_path(clip))
                                 .map(|path| path.to_path_buf());
-                            if let Some(clip) =
-                                self.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci))
-                            {
-                                ui.label("Clip Properties");
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Gain");
-                                    Self::colored_slider(ui, &mut clip.audio_gain, 0.0..=2.0, track_color);
-                                });
-                                if ui
-                                    .add(egui::Button::new("Normalize"))
-                                    .on_hover_text("Normalize clip gain to -1 dB peak")
-                                    .clicked()
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                if let Some(clip) =
+                                    self.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci))
                                 {
-                                    match clip_path.as_ref() {
-                                        Some(path) => {
-                                            if let Err(err) = Self::normalize_audio_clip_with_path(clip, path) {
-                                                self.status = format!("Normalize failed: {err}");
+                                    ui.label("Clip Properties");
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Gain");
+                                        Self::colored_slider(
+                                            ui,
+                                            &mut clip.audio_gain,
+                                            0.0..=2.0,
+                                            track_color,
+                                        );
+                                    });
+                                    if ui
+                                        .add(egui::Button::new("Normalize"))
+                                        .on_hover_text("Normalize clip gain to -1 dB peak")
+                                        .clicked()
+                                    {
+                                        match clip_path.as_ref() {
+                                            Some(path) => {
+                                                if let Err(err) =
+                                                    Self::normalize_audio_clip_with_path(clip, path)
+                                                {
+                                                    self.status = format!("Normalize failed: {err}");
+                                                }
+                                            }
+                                            None => {
+                                                self.status =
+                                                    "Normalize failed: Clip has no audio file".to_string();
                                             }
                                         }
-                                        None => {
-                                            self.status = "Normalize failed: Clip has no audio file".to_string();
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label("Stretch");
+                                        let selected = match clip.audio_stretch_mode {
+                                            AudioStretchMode::Stretch => "Stretch",
+                                            AudioStretchMode::StretchFormant => "Stretch (Formant)",
+                                            AudioStretchMode::StretchNeutral => "Stretch (Neutral)",
+                                            AudioStretchMode::Speed => "Speed (Resample)",
+                                        };
+                                        egui::ComboBox::from_id_source(
+                                            ("audio_stretch_mode_params", clip.id),
+                                        )
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut clip.audio_stretch_mode,
+                                                AudioStretchMode::Stretch,
+                                                "Stretch",
+                                            );
+                                            ui.selectable_value(
+                                                &mut clip.audio_stretch_mode,
+                                                AudioStretchMode::StretchFormant,
+                                                "Stretch (Formant)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut clip.audio_stretch_mode,
+                                                AudioStretchMode::StretchNeutral,
+                                                "Stretch (Neutral)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut clip.audio_stretch_mode,
+                                                AudioStretchMode::Speed,
+                                                "Speed (Resample)",
+                                            );
+                                        });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Pitch");
+                                        let pitch_enabled =
+                                            clip.audio_stretch_mode == AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(pitch_enabled, |ui| {
+                                            Self::colored_slider(
+                                                ui,
+                                                &mut clip.audio_pitch_semitones,
+                                                -24.0..=24.0,
+                                                track_color,
+                                            );
+                                        });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Time Mul");
+                                        Self::colored_slider(
+                                            ui,
+                                            &mut clip.audio_time_mul,
+                                            0.25..=4.0,
+                                            track_color,
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Offset");
+                                        ui.add(
+                                            egui::DragValue::new(&mut clip.audio_offset_beats)
+                                                .speed(0.1),
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+                                    if ui
+                                        .add(egui::Button::image(
+                                            egui::Image::new(egui::include_image!(
+                                                "../../icons/refresh-cw.svg"
+                                            ))
+                                            .fit_to_exact_size(egui::vec2(12.0, 12.0)),
+                                        ))
+                                        .on_hover_text("Fit To Tempo")
+                                        .clicked()
+                                    {
+                                        if let Some(source) = clip.audio_source_beats {
+                                            if source > 0.0 && clip.length_beats > 0.0 {
+                                                clip.audio_time_mul = source / clip.length_beats;
+                                            }
                                         }
                                     }
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("Pitch");
-                                    Self::colored_slider(
-                                        ui,
-                                        &mut clip.audio_pitch_semitones,
-                                        -24.0..=24.0,
-                                        track_color,
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Time Mul");
-                                    Self::colored_slider(
-                                        ui,
-                                        &mut clip.audio_time_mul,
-                                        0.25..=4.0,
-                                        track_color,
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Offset");
-                                    ui.add(
-                                        egui::DragValue::new(&mut clip.audio_offset_beats).speed(0.1),
-                                    );
-                                });
-                                ui.add_space(6.0);
-                                if ui
-                                    .add(egui::Button::image(
-                                        egui::Image::new(egui::include_image!("../../icons/refresh-cw.svg"))
+                                    if ui
+                                        .add(egui::Button::image(
+                                            egui::Image::new(egui::include_image!(
+                                                "../../icons/rotate-ccw.svg"
+                                            ))
                                             .fit_to_exact_size(egui::vec2(12.0, 12.0)),
-                                    ))
-                                    .on_hover_text("Fit To Tempo")
-                                    .clicked()
-                                {
-                                    if let Some(source) = clip.audio_source_beats {
-                                        if source > 0.0 && clip.length_beats > 0.0 {
-                                            clip.audio_time_mul = source / clip.length_beats;
-                                        }
+                                        ))
+                                        .on_hover_text("Reset Audio Props")
+                                        .clicked()
+                                    {
+                                        clip.audio_gain = 1.0;
+                                        clip.audio_pitch_semitones = 0.0;
+                                        clip.audio_stretch_mode = AudioStretchMode::Stretch;
+                                        clip.audio_time_mul = 1.0;
+                                        clip.audio_offset_beats = 0.0;
                                     }
                                 }
-                                if ui
-                                    .add(egui::Button::image(
-                                        egui::Image::new(egui::include_image!("../../icons/rotate-ccw.svg"))
-                                            .fit_to_exact_size(egui::vec2(12.0, 12.0)),
-                                    ))
-                                    .on_hover_text("Reset Audio Props")
-                                    .clicked()
-                                {
-                                    clip.audio_gain = 1.0;
-                                    clip.audio_pitch_semitones = 0.0;
-                                    clip.audio_time_mul = 1.0;
-                                    clip.audio_offset_beats = 0.0;
-                                }
-                            }
-                            self.draw_effect_params_panel(
-                                ui,
-                                ti,
-                                track_color,
-                                &mut pending_automation_record,
-                            );
+                                self.draw_effect_params_panel(
+                                    ui,
+                                    ti,
+                                    track_color,
+                                    &mut pending_automation_record,
+                                );
+                            });
                         }
                     } else {
                         let track = selected_track_index.and_then(|i| self.tracks.get(i));
@@ -8513,6 +9004,7 @@ impl DawApp {
                         });
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.refresh_clap_params_if_needed();
                             self.ensure_live_params();
                             let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
                                 if let Ok(mut host) = host.try_lock() {
@@ -8726,6 +9218,16 @@ impl DawApp {
                                             if let Some(state) =
                                                 selected_track_index.and_then(|i| self.track_audio.get(i))
                                             {
+                                                let blocked = state
+                                                    .host
+                                                    .as_ref()
+                                                    .map(|host| host.clap_blocks_params())
+                                                    .unwrap_or(false);
+                                                if blocked {
+                                                    self.status =
+                                                        "Vital CLAP: DAW param changes disabled".to_string();
+                                                    continue;
+                                                }
                                                 if let Some(PluginHostHandle::Vst3(host)) =
                                                     state.host.as_ref()
                                                 {
@@ -8850,6 +9352,16 @@ impl DawApp {
                                         .on_hover_text("Randomize Params")
                                         .clicked()
                                     {
+                                    let blocked = selected_track_index
+                                        .and_then(|i| self.track_audio.get(i))
+                                        .and_then(|state| state.host.as_ref())
+                                        .map(|host| host.clap_blocks_params())
+                                        .unwrap_or(false);
+                                    if blocked {
+                                        self.status =
+                                            "Vital CLAP: DAW param changes disabled".to_string();
+                                        return;
+                                    }
                                     let seed = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_nanos() as u64)
@@ -8981,135 +9493,11 @@ impl DawApp {
             }
             return;
         }
-        if !is_audio_clip {
-            let note_button_size = egui::vec2(22.0, 22.0);
-            let note_icon_size = egui::vec2(18.0, 18.0);
-            let note_icon_tint = egui::Color32::from_gray(230);
-            let note_button_bg = egui::Color32::from_rgba_premultiplied(18, 20, 24, 200);
-            let note_button_on = egui::Color32::from_rgba_premultiplied(46, 94, 130, 230);
-            ui.horizontal(|ui| {
-                ui.label("Note Length");
-                ui.add_space(4.0);
-                let lengths = [
-                    (1.0 / 32.0, "1/32"),
-                    (1.0 / 16.0, "1/16"),
-                    (1.0 / 8.0, "1/8"),
-                    (1.0 / 4.0, "1/4"),
-                    (1.0 / 2.0, "1/2"),
-                    (1.0, "1"),
-                ];
-                for (value, label) in lengths {
-                    let selected = (self.piano_note_len - value).abs() < f32::EPSILON;
-                    let icon = egui::Image::new(Self::note_icon_source(value))
-                        .fit_to_exact_size(note_icon_size)
-                        .tint(note_icon_tint);
-                    let button = egui::Button::image(icon)
-                        .min_size(note_button_size)
-                        .fill(if selected { note_button_on } else { note_button_bg });
-                    let response = ui
-                        .add_sized(note_button_size, button)
-                        .on_hover_text(label);
-                    if response.clicked() {
-                        self.piano_note_len = value;
-                    }
-                    if selected {
-                        ui.painter().rect_stroke(
-                            response.rect,
-                            4.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(140, 190, 255)),
-                        );
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                let grid_icon = egui::Image::new(egui::include_image!("../../icons/grid.svg"))
-                    .fit_to_exact_size(note_icon_size);
-                ui.add(grid_icon);
-                ui.label("Snap");
-                ui.add_space(4.0);
-                let snaps = [
-                    (1.0 / 32.0, "1/32"),
-                    (1.0 / 16.0, "1/16"),
-                    (1.0 / 8.0, "1/8"),
-                    (1.0 / 4.0, "1/4"),
-                    (1.0 / 2.0, "1/2"),
-                    (1.0, "1"),
-                ];
-                for (value, label) in snaps {
-                    let selected = (self.piano_snap - value).abs() < f32::EPSILON;
-                    let icon = egui::Image::new(Self::note_icon_source(value))
-                        .fit_to_exact_size(note_icon_size)
-                        .tint(note_icon_tint);
-                    let button = egui::Button::image(icon)
-                        .min_size(note_button_size)
-                        .fill(if selected { note_button_on } else { note_button_bg });
-                    let response = ui
-                        .add_sized(note_button_size, button)
-                        .on_hover_text(label);
-                    if response.clicked() {
-                        self.piano_snap = value;
-                    }
-                    if selected {
-                        ui.painter().rect_stroke(
-                            response.rect,
-                            4.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(140, 190, 255)),
-                        );
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Lane");
-                egui::ComboBox::from_id_source("piano_lane_mode")
-                    .selected_text(match self.piano_lane_mode {
-                        PianoLaneMode::Velocity => "Velocity",
-                        PianoLaneMode::Pan => "Pan",
-                        PianoLaneMode::Cutoff => "Cutoff",
-                        PianoLaneMode::Resonance => "Resonance",
-                        PianoLaneMode::MidiCc => "MIDI CC",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.piano_lane_mode,
-                            PianoLaneMode::Velocity,
-                            "Velocity",
-                        );
-                        ui.selectable_value(&mut self.piano_lane_mode, PianoLaneMode::Pan, "Pan");
-                        ui.selectable_value(
-                            &mut self.piano_lane_mode,
-                            PianoLaneMode::Cutoff,
-                            "Cutoff",
-                        );
-                        ui.selectable_value(
-                            &mut self.piano_lane_mode,
-                            PianoLaneMode::Resonance,
-                            "Resonance",
-                        );
-                        ui.selectable_value(
-                            &mut self.piano_lane_mode,
-                            PianoLaneMode::MidiCc,
-                            "MIDI CC",
-                        );
-                    });
-                if self.piano_lane_mode == PianoLaneMode::MidiCc {
-                    ui.label("CC");
-                    ui.add(
-                        egui::DragValue::new(&mut self.piano_cc)
-                            .clamp_range(0..=127)
-                            .speed(1.0),
-                    );
-                }
-            });
-        }
-        ui.add_space(4.0);
-
-                egui::SidePanel::left("piano_params")
-                    .default_width(220.0)
-                    .resizable(true)
-                    .show_inside(ui, |ui| {
-                        if !show_params {
-                            return;
-                        }
+        if show_params {
+            egui::SidePanel::left("piano_params")
+                .default_width(220.0)
+                .resizable(true)
+                .show_inside(ui, |ui| {
                         ui.heading(if is_audio_clip { "Audio" } else { "Parameters" });
                         ui.separator();
                         let track_color = self.selected_track.map(|i| self.track_color(i));
@@ -9123,13 +9511,50 @@ impl DawApp {
                                         Self::colored_slider(ui, &mut clip.audio_gain, 0.0..=2.0, track_color);
                                     });
                                     ui.horizontal(|ui| {
+                                        ui.label("Stretch");
+                                        let selected = match clip.audio_stretch_mode {
+                                            AudioStretchMode::Stretch => "Stretch",
+                                            AudioStretchMode::StretchFormant => "Stretch (Formant)",
+                                            AudioStretchMode::StretchNeutral => "Stretch (Neutral)",
+                                            AudioStretchMode::Speed => "Speed (Resample)",
+                                        };
+                                        egui::ComboBox::from_id_source(("audio_stretch_mode_piano", clip.id))
+                                            .selected_text(selected)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut clip.audio_stretch_mode,
+                                                    AudioStretchMode::Stretch,
+                                                    "Stretch",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut clip.audio_stretch_mode,
+                                                    AudioStretchMode::StretchFormant,
+                                                    "Stretch (Formant)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut clip.audio_stretch_mode,
+                                                    AudioStretchMode::StretchNeutral,
+                                                    "Stretch (Neutral)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut clip.audio_stretch_mode,
+                                                    AudioStretchMode::Speed,
+                                                    "Speed (Resample)",
+                                                );
+                                            });
+                                    });
+                                    ui.horizontal(|ui| {
                                         ui.label("Pitch");
-                                        Self::colored_slider(
-                                            ui,
-                                            &mut clip.audio_pitch_semitones,
-                                            -24.0..=24.0,
-                                            track_color,
-                                        );
+                                        let pitch_enabled =
+                                            clip.audio_stretch_mode == AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(pitch_enabled, |ui| {
+                                            Self::colored_slider(
+                                                ui,
+                                                &mut clip.audio_pitch_semitones,
+                                                -24.0..=24.0,
+                                                track_color,
+                                            );
+                                        });
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Time Mul");
@@ -9169,6 +9594,7 @@ impl DawApp {
                                     {
                                         clip.audio_gain = 1.0;
                                         clip.audio_pitch_semitones = 0.0;
+                                        clip.audio_stretch_mode = AudioStretchMode::Stretch;
                                         clip.audio_time_mul = 1.0;
                                         clip.audio_offset_beats = 0.0;
                                     }
@@ -9235,6 +9661,7 @@ impl DawApp {
                             });
                             ui.add_space(6.0);
                             egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.refresh_clap_params_if_needed();
                                 self.ensure_live_params();
                                 let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
                                     if let Ok(mut host) = host.try_lock() {
@@ -9586,6 +10013,7 @@ impl DawApp {
                             });
                         }
                     });
+                }
 
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     if !show_roll {
@@ -9744,20 +10172,42 @@ impl DawApp {
                         egui::pos2(roll_rect.right(), lane_rect.bottom().max(roll_rect.bottom())),
                     );
                     self.piano_roll_rect = Some(piano_rect);
+                    let zoom_min_x = 0.4;
+                    let zoom_max_x = 6.0;
+                    let zoom_min_y = 0.4;
+                    let zoom_max_y = 4.0;
                     if roll_or_header_hovered {
                         let input = ctx.input(|i| i.clone());
-                        if input.modifiers.ctrl {
+                        let mmb_down = input.pointer.button_down(egui::PointerButton::Middle);
+                        if mmb_down {
+                            self.piano_pan += input.pointer.delta();
+                            roll_response.clone().on_hover_cursor(egui::CursorIcon::Move);
+                        } else if input.modifiers.ctrl {
+                            let pointer_x = pointer_pos
+                                .or(pointer_interact)
+                                .map(|pos| pos.x)
+                                .unwrap_or(roll_rect.left());
+                            let local_x = pointer_x - roll_rect.left();
+                            let before_zoom = self.piano_zoom_x;
                             let zoom = input.zoom_delta();
                             if (zoom - 1.0).abs() > f32::EPSILON {
-                                self.piano_zoom_x = (self.piano_zoom_x * zoom).clamp(0.3, 6.0);
+                                self.piano_zoom_x =
+                                    (self.piano_zoom_x * zoom).clamp(zoom_min_x, zoom_max_x);
                             } else {
                                 let mut delta = input.smooth_scroll_delta;
                                 if delta == egui::Vec2::ZERO {
                                     delta = input.raw_scroll_delta;
                                 }
                                 let zoom_delta = (delta.x + delta.y) * 0.001;
-                                self.piano_zoom_x = (self.piano_zoom_x + zoom_delta).clamp(0.3, 6.0);
+                                self.piano_zoom_x =
+                                    (self.piano_zoom_x + zoom_delta).clamp(zoom_min_x, zoom_max_x);
                             }
+                            let scale = if before_zoom > 0.0 {
+                                self.piano_zoom_x / before_zoom
+                            } else {
+                                1.0
+                            };
+                            self.piano_pan.x = (self.piano_pan.x - local_x) * scale + local_x;
                         } else if input.modifiers.shift {
                             let mut delta = input.smooth_scroll_delta;
                             if delta == egui::Vec2::ZERO {
@@ -9793,6 +10243,52 @@ impl DawApp {
                     painter.rect_filled(keyboard_rect, 0.0, egui::Color32::from_rgb(10, 12, 14));
                     let beat_width = 24.0 * self.piano_zoom_x;
                     let note_height = 10.0 * self.piano_zoom_y;
+                    if let Some(focus) = self.piano_focus_beats.take() {
+                        let center_x = roll_rect.width() * 0.5;
+                        self.piano_pan.x = center_x - focus * beat_width;
+                    }
+                    let handle_size = 14.0;
+                    let handle_rect = egui::Rect::from_min_size(
+                        egui::pos2(roll_rect.right() - handle_size - 4.0, roll_rect.top() + 4.0),
+                        egui::vec2(handle_size, handle_size),
+                    );
+                    let handle_id = egui::Id::new("piano_zoom_handle");
+                    let handle_resp =
+                        ui.interact(handle_rect, handle_id, egui::Sense::click_and_drag());
+                    painter.rect_filled(handle_rect, 2.0, egui::Color32::from_rgb(26, 30, 36));
+                    painter.rect_stroke(
+                        handle_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 90, 120)),
+                    );
+                    if handle_resp.hovered() {
+                        roll_response.clone().on_hover_cursor(egui::CursorIcon::ResizeRow);
+                    }
+                    if handle_resp.drag_started() {
+                        if let Some(pos) = handle_resp.interact_pointer_pos().or(pointer_interact) {
+                            self.piano_zoom_drag = Some(PianoZoomDragState {
+                                start_pos: pos,
+                                start_zoom_x: self.piano_zoom_x,
+                                start_zoom_y: self.piano_zoom_y,
+                            });
+                        }
+                    }
+                    if handle_resp.dragged() {
+                        if let Some(drag) = &self.piano_zoom_drag {
+                            if let Some(pos) = handle_resp.interact_pointer_pos().or(pointer_interact) {
+                                let delta = pos - drag.start_pos;
+                                let scale_x = (1.0 + delta.x * 0.005).max(0.05);
+                                let scale_y = (1.0 + delta.y * 0.005).max(0.05);
+                                self.piano_zoom_x =
+                                    (drag.start_zoom_x * scale_x).clamp(zoom_min_x, zoom_max_x);
+                                self.piano_zoom_y =
+                                    (drag.start_zoom_y * scale_y).clamp(zoom_min_y, zoom_max_y);
+                            }
+                        }
+                    }
+                    if handle_resp.drag_stopped() {
+                        self.piano_zoom_drag = None;
+                    }
                     let clip_offset = selected_clip_info
                         .and_then(|(ti, ci)| self.tracks.get(ti).and_then(|t| t.clips.get(ci)))
                         .filter(|clip| clip.is_midi)
@@ -9810,6 +10306,26 @@ impl DawApp {
                                 beat_width,
                             );
                             self.seek_playhead(local + clip_offset);
+                        }
+                    }
+                    let snap_grid = self.piano_snap.max(0.03125);
+                    if snap_grid < 1.0 {
+                        let minor_step = beat_width * snap_grid;
+                        if minor_step >= 6.0 {
+                            let mut minor_x = roll_rect.left() + self.piano_pan.x;
+                            while minor_x <= roll_rect.right() {
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(minor_x, roll_rect.top()),
+                                        egui::pos2(minor_x, roll_rect.bottom()),
+                                    ],
+                                    egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_premultiplied(14, 16, 20, 120),
+                                    ),
+                                );
+                                minor_x += minor_step;
+                            }
                         }
                     }
                     let mut x = roll_rect.left() + self.piano_pan.x;
@@ -9944,6 +10460,7 @@ impl DawApp {
                         .interact_pointer_pos()
                         .or_else(|| roll_response.hover_pos());
                     let mut hovered_note: Option<(usize, egui::Rect)> = None;
+                    let mut hovered_note_edge = false;
                     if let Some(clip_id) = self.selected_clip {
                         if let Some((track_index, clip_index)) = self.find_clip_indices_by_id(clip_id) {
                             if let Some(clip) =
@@ -9960,11 +10477,58 @@ impl DawApp {
                                             egui::pos2(x, y - note_height),
                                             egui::vec2(w, note_height),
                                         );
-                                        let base = if index % 2 == 0 {
-                                            egui::Color32::from_rgb(88, 210, 180)
+                                        let roygbiv = [
+                                            egui::Color32::from_rgb(230, 70, 60),
+                                            egui::Color32::from_rgb(240, 140, 60),
+                                            egui::Color32::from_rgb(235, 210, 80),
+                                            egui::Color32::from_rgb(90, 210, 120),
+                                            egui::Color32::from_rgb(80, 170, 220),
+                                            egui::Color32::from_rgb(90, 120, 230),
+                                            egui::Color32::from_rgb(160, 90, 220),
+                                            egui::Color32::from_rgb(210, 70, 200),
+                                        ];
+                                        let durations = [
+                                            1.0 / 32.0,
+                                            1.0 / 24.0,
+                                            1.0 / 16.0,
+                                            3.0 / 32.0,
+                                            1.0 / 12.0,
+                                            1.0 / 8.0,
+                                            3.0 / 16.0,
+                                            1.0 / 6.0,
+                                            1.0 / 4.0,
+                                            3.0 / 8.0,
+                                            1.0 / 3.0,
+                                            1.0 / 2.0,
+                                            3.0 / 4.0,
+                                            2.0 / 3.0,
+                                            1.0,
+                                            1.5,
+                                            4.0 / 3.0,
+                                            2.0,
+                                            3.0,
+                                            8.0 / 3.0,
+                                            4.0,
+                                        ];
+                                        let len = note.length_beats.max(1.0 / 32.0).min(4.0);
+                                        let mut nearest = 0usize;
+                                        let mut best = f32::MAX;
+                                        for (idx, value) in durations.iter().enumerate() {
+                                            let delta = (len - value).abs();
+                                            if delta < best {
+                                                best = delta;
+                                                nearest = idx;
+                                            }
+                                        }
+                                        let t = if durations.len() > 1 {
+                                            nearest as f32 / (durations.len() - 1) as f32
                                         } else {
-                                            egui::Color32::from_rgb(120, 130, 240)
+                                            0.0
                                         };
+                                        let color_idx = (t * (roygbiv.len() - 1) as f32)
+                                            .round()
+                                            .clamp(0.0, (roygbiv.len() - 1) as f32) as usize;
+                                        let base = roygbiv[color_idx];
                                         let vel = (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
                                         let alpha = (vel * 200.0 + 30.0).clamp(40.0, 230.0) as u8;
                                         let pan = note.pan.clamp(-1.0, 1.0);
@@ -9976,6 +10540,29 @@ impl DawApp {
                                         let b = (base.b() as u16 + pan_blue as u16).min(255) as u8;
                                         let color = egui::Color32::from_rgba_premultiplied(r, g, b, alpha);
                                         painter.rect_filled(note_rect, 0.0, color);
+                                        if self.show_hitboxes {
+                                            let edge_pad = 8.0;
+                                            let edge_rect = egui::Rect::from_min_max(
+                                                egui::pos2(note_rect.right() - edge_pad, note_rect.top()),
+                                                egui::pos2(note_rect.right() + edge_pad, note_rect.bottom()),
+                                            );
+                                            painter.rect_stroke(
+                                                note_rect,
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_rgba_premultiplied(80, 200, 255, 180),
+                                                ),
+                                            );
+                                            painter.rect_stroke(
+                                                edge_rect,
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_rgba_premultiplied(255, 120, 80, 200),
+                                                ),
+                                            );
+                                        }
                                         if self.piano_selected.contains(&index) {
                                             painter.rect_stroke(
                                                 note_rect,
@@ -9984,8 +10571,19 @@ impl DawApp {
                                             );
                                         }
                                         if let Some(pos) = pointer_pos {
-                                            if pos.x >= roll_rect.left() && note_rect.contains(pos) {
-                                                hovered_note = Some((index, note_rect));
+                                            if pos.x >= roll_rect.left() {
+                                                let edge_pad = 8.0;
+                                                let edge_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(note_rect.right() - edge_pad, note_rect.top()),
+                                                    egui::pos2(note_rect.right() + edge_pad, note_rect.bottom()),
+                                                );
+                                                if edge_rect.contains(pos) {
+                                                    hovered_note_edge = true;
+                                                    hovered_note = Some((index, note_rect));
+                                                } else if note_rect.contains(pos) {
+                                                    hovered_note_edge = false;
+                                                    hovered_note = Some((index, note_rect));
+                                                }
                                             }
                                         }
                                     }
@@ -10039,7 +10637,8 @@ impl DawApp {
                     let mut marquee_rect: Option<egui::Rect> = None;
                     let mut scale_handle_active = self.piano_scale_drag.is_some();
                     let mut scale_handle_stopped = false;
-                    if shift && !self.piano_selected.is_empty() {
+                    let mut scale_handle_hot = false;
+                    if alt && !self.piano_selected.is_empty() {
                         if let Some(clip_id) = self.selected_clip {
                             if let Some((track_index, clip_index)) =
                                 self.find_clip_indices_by_id(clip_id)
@@ -10072,6 +10671,21 @@ impl DawApp {
                                         }
                                     }
                                     if min_start.is_finite() && max_end > min_start {
+                                        let bounds_left = roll_rect.left()
+                                            + self.piano_pan.x
+                                            + (min_start - clip_offset) * beat_width;
+                                        let bounds_right = roll_rect.left()
+                                            + self.piano_pan.x
+                                            + (max_end - clip_offset) * beat_width;
+                                        let bounds_rect = egui::Rect::from_min_max(
+                                            egui::pos2(bounds_left, min_y),
+                                            egui::pos2(bounds_right, max_y),
+                                        );
+                                        painter.rect_stroke(
+                                            bounds_rect,
+                                            2.0,
+                                            egui::Stroke::new(1.4, egui::Color32::from_rgb(235, 240, 245)),
+                                        );
                                         let handle_x = roll_rect.left()
                                             + self.piano_pan.x
                                             + (max_end - clip_offset) * beat_width;
@@ -10090,15 +10704,22 @@ impl DawApp {
                                             5.0,
                                             egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 60, 90)),
                                         );
-                                        let handle_hover = pointer_pos
+                                        let handle_id = egui::Id::new("piano_scale_handle");
+                                        let handle_resp =
+                                            ui.interact(handle_rect, handle_id, egui::Sense::click_and_drag());
+                                        let handle_hover = pointer_interact
+                                            .or(pointer_pos)
                                             .map(|pos| handle_rect.contains(pos))
                                             .unwrap_or(false);
-                                        if handle_hover {
+                                        scale_handle_hot = handle_hover || handle_resp.hovered();
+                                        if scale_handle_hot {
                                             roll_response
                                                 .clone()
                                                 .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
                                         }
-                                        if handle_hover && roll_response.drag_started() {
+                                        if handle_resp.drag_started()
+                                            || (handle_hover && roll_response.drag_started())
+                                        {
                                             self.push_undo_state();
                                             self.piano_scale_drag = Some(PianoScaleDragState {
                                                 track_index,
@@ -10108,10 +10729,10 @@ impl DawApp {
                                             });
                                             scale_handle_active = true;
                                         }
-                                        if handle_hover && roll_response.dragged() {
+                                        if handle_resp.dragged() || (handle_hover && roll_response.dragged()) {
                                             scale_handle_active = true;
                                         }
-                                        if handle_hover && roll_response.drag_stopped() {
+                                        if handle_resp.drag_stopped() || (handle_hover && roll_response.drag_stopped()) {
                                             scale_handle_stopped = true;
                                         }
                                     }
@@ -10129,7 +10750,10 @@ impl DawApp {
                     }
                     if let Some(start) = self.piano_marquee_start {
                         if roll_response.dragged() {
-                            if let Some(pos) = roll_response.interact_pointer_pos() {
+                            if let Some(pos) = roll_response
+                                .interact_pointer_pos()
+                                .or(pointer_interact)
+                            {
                                 marquee_rect = Some(egui::Rect::from_two_pos(start, pos));
                             }
                         }
@@ -10191,7 +10815,10 @@ impl DawApp {
                                 self.piano_selected.clear();
                             }
                         }
-                    } else if !box_select_active && roll_response.clicked_by(egui::PointerButton::Primary) {
+                    } else if !box_select_active
+                        && self.piano_tool == PianoTool::Pencil
+                        && roll_response.clicked_by(egui::PointerButton::Primary)
+                    {
                         if let Some(pos) = roll_response.interact_pointer_pos() {
                             if pos.x < roll_rect.left() {
                                 return;
@@ -10272,8 +10899,12 @@ impl DawApp {
                         }
                     }
 
-                    if roll_response.drag_started() && !ctrl && !scale_handle_active {
-                        if let Some((note_index, note_rect)) = hovered_note {
+                    if (roll_response.drag_started() || (pointer_clicked && hovered_note_edge))
+                        && !ctrl
+                        && !scale_handle_active
+                        && !scale_handle_hot
+                    {
+                        if let Some((note_index, _note_rect)) = hovered_note {
                             if let Some(pos) = roll_response.interact_pointer_pos() {
                                 if pos.x < roll_rect.left() {
                                     return;
@@ -10282,11 +10913,9 @@ impl DawApp {
                                     self.piano_selected.clear();
                                     self.piano_selected.insert(note_index);
                                 }
-                                let right_edge = note_rect.right();
-                                let edge_pad = 8.0;
                                 let kind = if shift {
                                     PianoDragKind::Move
-                                } else if (right_edge - pos.x).abs() <= edge_pad {
+                                } else if hovered_note_edge {
                                     PianoDragKind::Resize
                                 } else {
                                     PianoDragKind::Move
@@ -10377,9 +11006,17 @@ impl DawApp {
                         }
                     }
 
-                    if (roll_response.dragged() || scale_handle_active) && !ctrl {
+                    if (roll_response.dragged()
+                        || scale_handle_active
+                        || (self.piano_drag.is_some() && pointer_down))
+                        && !ctrl
+                    {
                         if let Some(scale_drag) = &self.piano_scale_drag {
-                            if let Some(pos) = roll_response.interact_pointer_pos() {
+                            let drag_pos = ctx
+                                .input(|i| i.pointer.interact_pos())
+                                .or_else(|| roll_response.interact_pointer_pos())
+                                .or_else(|| roll_response.hover_pos());
+                            if let Some(pos) = drag_pos {
                                 if pos.x < roll_rect.left() {
                                     return;
                                 }
@@ -10611,6 +11248,14 @@ impl DawApp {
                                                     let value =
                                                         (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
                                                     let h = lane_rect.height() * value;
+                                                    let pan = note.pan.clamp(-1.0, 1.0);
+                                                    let tint = pan.abs();
+                                                    let tint_r = if pan > 0.0 { 80.0 * tint } else { 0.0 };
+                                                    let tint_b = if pan < 0.0 { 80.0 * tint } else { 0.0 };
+                                                    let alpha = (value * 200.0 + 30.0).clamp(30.0, 230.0) as u8;
+                                                    let r = (30.0 + tint_r).clamp(0.0, 255.0) as u8;
+                                                    let g = (140.0 + value * 100.0).clamp(0.0, 255.0) as u8;
+                                                    let b = (30.0 + tint_b).clamp(0.0, 255.0) as u8;
                                                     let x = roll_rect.left()
                                                         + self.piano_pan.x
                                                         + (note.start_beats - clip_offset) * beat_width;
@@ -10622,7 +11267,7 @@ impl DawApp {
                                                     lane_painter.rect_filled(
                                                         bar_rect,
                                                         0.0,
-                                                        egui::Color32::from_rgba_premultiplied(180, 200, 220, 200),
+                                                        egui::Color32::from_rgba_premultiplied(r, g, b, alpha),
                                                     );
                                                 }
                                             }
@@ -10640,14 +11285,16 @@ impl DawApp {
                                                 for note in &clip.midi_notes {
                                                     let pan = note.pan.clamp(-1.0, 1.0);
                                                     let h = lane_rect.height() * 0.5 * pan.abs();
+                                                    let vel = (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
+                                                    let alpha = (vel * 200.0 + 30.0).clamp(30.0, 230.0) as u8;
                                                     let x = roll_rect.left()
                                                         + self.piano_pan.x
                                                         + (note.start_beats - clip_offset) * beat_width;
                                                     let w = (note.length_beats * beat_width).max(6.0);
                                                     let (y, color) = if pan >= 0.0 {
-                                                        (center_y - h, egui::Color32::from_rgb(210, 80, 80))
+                                                        (center_y - h, egui::Color32::from_rgba_premultiplied(210, 80, 80, alpha))
                                                     } else {
-                                                        (center_y, egui::Color32::from_rgb(80, 120, 210))
+                                                        (center_y, egui::Color32::from_rgba_premultiplied(80, 120, 210, alpha))
                                                     };
                                                     let bar_rect = egui::Rect::from_min_size(
                                                         egui::pos2(x, y),
@@ -10831,38 +11478,58 @@ impl DawApp {
                                                                 .get_mut(track_index)
                                                                 .and_then(|t| t.clips.get_mut(clip_index))
                                                             {
-                                                                if let Some(note_index) = clip
-                                                                    .midi_notes
-                                                                    .iter()
-                                                                    .position(|note| {
-                                                                        beat >= note.start_beats
-                                                                            && beat <= note.start_beats + note.length_beats
-                                                                    })
-                                                                {
+                                                                let mut targets: Vec<usize> = Vec::new();
+                                                                if !self.piano_selected.is_empty() {
+                                                                    for index in self.piano_selected.iter().copied() {
+                                                                        if let Some(note) = clip.midi_notes.get(index) {
+                                                                            if beat >= note.start_beats
+                                                                                && beat <= note.start_beats + note.length_beats
+                                                                            {
+                                                                                targets.push(index);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                if targets.is_empty() {
+                                                                    if let Some(note_index) = clip
+                                                                        .midi_notes
+                                                                        .iter()
+                                                                        .position(|note| {
+                                                                            beat >= note.start_beats
+                                                                                && beat <= note.start_beats + note.length_beats
+                                                                        })
+                                                                    {
+                                                                        targets.push(note_index);
+                                                                    }
+                                                                }
+                                                                if !targets.is_empty() {
                                                                     let value = (lane_rect.bottom() - pos.y)
                                                                         / lane_rect.height();
                                                                     let value = value.clamp(0.0, 1.0);
-                                                                    if let Some(note) = clip.midi_notes.get_mut(note_index) {
-                                                                        match self.piano_lane_mode {
-                                                                            PianoLaneMode::Velocity => {
-                                                                                note.velocity =
-                                                                                    (value * 127.0).round() as u8;
+                                                                    let pan = (lane_rect.center().y - pos.y)
+                                                                        / (lane_rect.height() * 0.5);
+                                                                    let pan = pan.clamp(-1.0, 1.0);
+                                                                    for note_index in targets {
+                                                                        if let Some(note) = clip.midi_notes.get_mut(note_index) {
+                                                                            match self.piano_lane_mode {
+                                                                                PianoLaneMode::Velocity => {
+                                                                                    note.velocity =
+                                                                                        (value * 127.0).round() as u8;
+                                                                                }
+                                                                                PianoLaneMode::Pan => {
+                                                                                    note.pan = pan;
+                                                                                }
+                                                                                PianoLaneMode::Cutoff => {
+                                                                                    note.cutoff = value;
+                                                                                }
+                                                                                PianoLaneMode::Resonance => {
+                                                                                    note.resonance = value;
+                                                                                }
+                                                                                PianoLaneMode::MidiCc => {}
                                                                             }
-                                                                            PianoLaneMode::Pan => {
-                                                                                let pan = (lane_rect.center().y - pos.y)
-                                                                                    / (lane_rect.height() * 0.5);
-                                                                                note.pan = pan.clamp(-1.0, 1.0);
-                                                                            }
-                                                                            PianoLaneMode::Cutoff => {
-                                                                                note.cutoff = value;
-                                                                            }
-                                                                            PianoLaneMode::Resonance => {
-                                                                                note.resonance = value;
-                                                                            }
-                                                                            PianoLaneMode::MidiCc => {}
                                                                         }
-                                                                        self.sync_track_audio_notes(track_index);
                                                                     }
+                                                                    self.sync_track_audio_notes(track_index);
                                                                 }
                                                             }
                                                         }
@@ -11194,6 +11861,10 @@ impl DawApp {
 
             if let Some(candidate) = chosen {
                 if let Some(target) = self.plugin_target {
+                    if self.plugin_ui.is_some() {
+                        self.show_plugin_ui = false;
+                        self.destroy_plugin_ui();
+                    }
                     match target {
                         PluginTarget::Instrument(index) => {
                             self.replace_instrument(index, candidate.path, candidate.clap_id);
@@ -11318,7 +11989,7 @@ impl DawApp {
                                     }
                                 }
                             });
-                        let percussion_options = ["None", "Catsynth"]; 
+                        let percussion_options = ["None", "Catsynth", "PlantSynth"]; 
                         egui::ComboBox::from_label("Percussion Plugin")
                             .selected_text(state.percussion_plugin.clone())
                             .show_ui(ui, |ui| {
@@ -11408,6 +12079,44 @@ impl DawApp {
             self.show_rename_track = open;
         }
 
+        if self.show_rename_clip {
+            let mut open = self.show_rename_clip;
+            let mut close_requested = false;
+            egui::Window::new("Rename Clip")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Clip Name");
+                    ui.text_edit_singleline(&mut self.rename_clip_buffer);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::image(
+                                egui::Image::new(egui::include_image!("../../icons/check.svg"))
+                                    .fit_to_exact_size(egui::vec2(12.0, 12.0)),
+                            ))
+                            .on_hover_text("Apply")
+                            .clicked()
+                        {
+                            self.apply_rename_clip();
+                            close_requested = true;
+                        }
+                        if ui
+                            .add(egui::Button::image(
+                                egui::Image::new(egui::include_image!("../../icons/x.svg"))
+                                    .fit_to_exact_size(egui::vec2(12.0, 12.0)),
+                            ))
+                            .on_hover_text("Cancel")
+                            .clicked()
+                        {
+                            close_requested = true;
+                        }
+                    });
+                });
+            if close_requested {
+                open = false;
+            }
+            self.show_rename_clip = open;
+        }
+
         if self.show_rename_project {
             let mut open = self.show_rename_project;
             let mut close_requested = false;
@@ -11478,6 +12187,182 @@ impl DawApp {
                     ui.text_edit_multiline(&mut self.metadata_comment);
                 });
             self.show_metadata = open;
+        }
+
+        if self.show_help_about {
+            let mut open = self.show_help_about;
+            egui::Window::new("About")
+                .open(&mut open)
+                .default_size(egui::vec2(420.0, 260.0))
+                .show(ctx, |ui| {
+                    self.draw_animated_title(ui, ctx);
+                    ui.add_space(6.0);
+                    ui.label("A warm, focused DAW for fast music making.");
+                    ui.label("Special thanks to Sanny and Ling Lin for the spark and support.");
+                    ui.add_space(6.0);
+                    ui.separator();
+                    let version = env!("CARGO_PKG_VERSION");
+                    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+                    ui.label(format!("Version: {version}"));
+                    ui.label(format!("Build: {profile}"));
+                    ui.label(format!("Engine: {}", env!("CARGO_PKG_NAME")));
+                    ui.separator();
+                    ui.label("LingStation");
+                    ui.label("Copyright (c) 2026");
+                    ctx.request_repaint();
+                });
+            self.show_help_about = open;
+        }
+
+        if self.show_help_general {
+            let mut open = self.show_help_general;
+            egui::Window::new("Help")
+                .open(&mut open)
+                .default_size(egui::vec2(520.0, 380.0))
+                .show(ctx, |ui| {
+                    ui.heading("Getting Started");
+                    ui.separator();
+                    ui.label("1. Create a track and choose a synth.");
+                    ui.label("2. Add MIDI clips in Arranger or Piano Roll.");
+                    ui.label("3. Use Mixer for levels, mute, and solo.");
+                    ui.label("4. Render from File -> Render to WAV/OGG/FLAC.");
+                    ui.add_space(8.0);
+                    ui.heading("Common Tasks");
+                    ui.separator();
+                    ui.label("- Drag clips to move or copy.");
+                    ui.label("- Use the Parameters tab for instrument/effects.");
+                    ui.label("- Use Loop Song to loop the current range.");
+                    ui.add_space(8.0);
+                    ui.heading("Support");
+                    ui.separator();
+                    ui.label("Check the License page for registration and activation.");
+                });
+            self.show_help_general = open;
+        }
+
+        if self.show_help_shortcuts {
+            let mut open = self.show_help_shortcuts;
+            egui::Window::new("Shortcuts")
+                .open(&mut open)
+                .default_size(egui::vec2(520.0, 380.0))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (category, entries) in Self::shortcuts_by_category() {
+                            ui.heading(category);
+                            ui.separator();
+                            for (keys, action) in entries {
+                                ui.horizontal(|ui| {
+                                    ui.label(keys);
+                                    ui.label(action);
+                                });
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+                });
+            self.show_help_shortcuts = open;
+        }
+
+        if self.show_help_license {
+            let mut open = self.show_help_license;
+            egui::Window::new("License")
+                .open(&mut open)
+                .default_size(egui::vec2(560.0, 520.0))
+                .show(ctx, |ui| {
+                    ui.label(format!("Status: {}", self.license_status));
+                    let registered = if self.settings.registered_to.is_empty() {
+                        "Unregistered".to_string()
+                    } else {
+                        format!("Registered to: {}", self.settings.registered_to)
+                    };
+                    ui.label(registered);
+                    ui.separator();
+
+                    ui.heading("Account Login");
+                    ui.label("Sign in to access your licenses.");
+                    ui.horizontal(|ui| {
+                        ui.label("Identifier");
+                        ui.text_edit_singleline(&mut self.license_identifier);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(egui::TextEdit::singleline(&mut self.license_password).password(true));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Device Label");
+                        ui.text_edit_singleline(&mut self.license_device_label);
+                    });
+                    ui.horizontal(|ui| {
+                        let login_clicked = ui.button("Login").clicked();
+                        if login_clicked {
+                            self.start_license_login();
+                        }
+                        let clear_clicked = ui.button("Clear Token").clicked();
+                        if clear_clicked {
+                            self.settings.auth_token.clear();
+                            let _ = self.save_settings();
+                            self.status = "Token cleared".to_string();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.heading("License Actions");
+                    ui.horizontal(|ui| {
+                        ui.label("Serial");
+                        ui.text_edit_singleline(&mut self.license_serial);
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Claim Serial").clicked() {
+                            self.start_license_claim();
+                        }
+                        if ui.button("Activate Device").clicked() {
+                            self.start_license_activate();
+                        }
+                        if ui.button("Download File").clicked() {
+                            self.start_license_fetch_file();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Import License File").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                if let Ok(text) = fs::read_to_string(&path) {
+                                    self.settings.license_file = text;
+                                    let _ = self.save_settings();
+                                    self.refresh_license_status();
+                                    self.status = "License file imported".to_string();
+                                } else {
+                                    self.status = "License file read failed".to_string();
+                                }
+                            }
+                        }
+                        if ui.button("Verify License").clicked() {
+                            self.refresh_license_status();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(format!("Device ID: {}", self.settings.device_id));
+                    if self.settings.auth_token.is_empty() {
+                        ui.label("Auth: not signed in");
+                    } else {
+                        ui.label("Auth: signed in");
+                    }
+                    if LICENSE_PUBLIC_KEY_B64.trim().is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), "Public key missing");
+                    }
+
+                    ui.add_space(8.0);
+                    ui.heading("Bundled Synths");
+                    ui.separator();
+                    for (name, info) in Self::bundled_synths() {
+                        ui.horizontal(|ui| {
+                            ui.label(name);
+                            ui.label(info);
+                        });
+                    }
+                });
+            self.show_help_license = open;
         }
     }
 
@@ -11551,6 +12436,7 @@ impl DawApp {
             pump_plugin_messages(hwnd);
         }
         self.plugin_ui_hidden = false;
+        self.pending_viewport_focus = true;
         if self.audio_running {
             self.stop_audio_and_midi();
         }
@@ -11688,6 +12574,18 @@ impl DawApp {
         }
     }
 
+    fn begin_rename_clip(&mut self, track_index: usize, clip_id: usize) {
+        let name = self
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.iter().find(|c| c.id == clip_id))
+            .map(|clip| clip.name.clone())
+            .unwrap_or_else(|| "Clip".to_string());
+        self.rename_clip_buffer = name;
+        self.rename_clip_target = Some((track_index, clip_id));
+        self.show_rename_clip = true;
+    }
+
     fn apply_rename(&mut self) {
         if let Some(index) = self.selected_track {
             if let Some(track) = self.tracks.get_mut(index) {
@@ -11697,6 +12595,23 @@ impl DawApp {
                     self.mark_dirty();
                     self.status = "Track renamed".to_string();
                 }
+            }
+        }
+    }
+
+    fn apply_rename_clip(&mut self) {
+        let Some((track_index, clip_id)) = self.rename_clip_target else {
+            return;
+        };
+        let name = self.rename_clip_buffer.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            if let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) {
+                clip.name = name.to_string();
+                self.mark_dirty();
+                self.status = "Clip renamed".to_string();
             }
         }
     }
@@ -12247,6 +13162,7 @@ impl DawApp {
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
                 audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
             });
         }
@@ -12455,6 +13371,7 @@ impl DawApp {
                         audio_offset_beats: 0.0,
                         audio_gain: 1.0,
                         audio_pitch_semitones: 0.0,
+                        audio_stretch_mode: AudioStretchMode::Stretch,
                         audio_time_mul: 1.0,
                     });
                     next_clip_id = next_clip_id.saturating_add(1);
@@ -12523,6 +13440,7 @@ impl DawApp {
                             audio_offset_beats: 0.0,
                             audio_gain: 1.0,
                             audio_pitch_semitones: 0.0,
+                            audio_stretch_mode: AudioStretchMode::Stretch,
                             audio_time_mul: 1.0,
                         });
                         next_clip_id = next_clip_id.saturating_add(1);
@@ -12574,6 +13492,7 @@ impl DawApp {
                     audio_offset_beats: 0.0,
                     audio_gain: 1.0,
                     audio_pitch_semitones: 0.0,
+                    audio_stretch_mode: AudioStretchMode::Stretch,
                     audio_time_mul: 1.0,
                 });
                 next_clip_id = next_clip_id.saturating_add(1);
@@ -12749,6 +13668,7 @@ impl DawApp {
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
                 audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
             };
             next_id += 1;
@@ -13653,6 +14573,7 @@ impl DawApp {
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
                 audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
             });
         }
@@ -13695,6 +14616,7 @@ impl DawApp {
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
                 audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
             });
             self.sync_track_audio_notes(track_index);
@@ -14668,6 +15590,576 @@ impl DawApp {
             }
         }
         self.settings = SettingsState::default();
+    }
+
+    fn ensure_device_id(&mut self) {
+        if !self.settings.device_id.is_empty() {
+            return;
+        }
+        if self.settings.device_salt.is_empty() {
+            self.settings.device_salt = Self::generate_device_salt();
+        }
+        let fingerprint = Self::device_fingerprint();
+        self.settings.device_id = Self::hash_device_id(&fingerprint, &self.settings.device_salt);
+        let _ = self.save_settings();
+    }
+
+    fn generate_device_salt() -> String {
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        BASE64_URL_SAFE.encode(bytes)
+    }
+
+    fn device_fingerprint() -> String {
+        let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let cpu = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+        format!("{host}|{user}|{cpu}")
+    }
+
+    fn hash_device_id(fingerprint: &str, salt: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(fingerprint.as_bytes());
+        hasher.update(b"|");
+        hasher.update(salt.as_bytes());
+        let digest = hasher.finalize();
+        digest.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn poll_license_job(&mut self) {
+        let Some(job) = self.license_job.as_ref() else {
+            return;
+        };
+        if !job.finished.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut result_opt = None;
+        if let Ok(mut guard) = job.result.lock() {
+            result_opt = guard.take();
+        }
+        if let Some(result) = result_opt {
+            match result.status {
+                Ok(message) => self.status = message,
+                Err(message) => self.status = message,
+            }
+            if let Some(token) = result.token {
+                self.settings.auth_token = token;
+                let _ = self.save_settings();
+            }
+            if let Some(license_file) = result.license_file {
+                self.settings.license_file = license_file;
+                let _ = self.save_settings();
+                self.refresh_license_status();
+            }
+            if let Some(registered_to) = result.registered_to {
+                self.settings.registered_to = registered_to;
+                let _ = self.save_settings();
+            }
+        }
+        self.license_job = None;
+    }
+
+    fn refresh_license_status(&mut self) {
+        if self.settings.license_file.trim().is_empty() {
+            self.license_status = "Unregistered".to_string();
+            return;
+        }
+        match Self::verify_license_file(&self.settings.license_file) {
+            Ok(info) => {
+                let mut status = "Registered".to_string();
+                if let Some(license_type) = info.license_type {
+                    status = format!("Registered ({license_type})");
+                }
+                self.license_status = status;
+                if let Some(name) = info.registered_to {
+                    self.settings.registered_to = name;
+                    let _ = self.save_settings();
+                }
+            }
+            Err(err) => {
+                self.license_status = format!("License error: {err}");
+            }
+        }
+    }
+
+    fn start_license_job<F>(&mut self, job: F)
+    where
+        F: FnOnce() -> LicenseJobResult + Send + 'static,
+    {
+        if self.license_job.is_some() {
+            self.status = "License request already running".to_string();
+            return;
+        }
+        let finished = Arc::new(AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        let finished_clone = finished.clone();
+        let result_clone = result.clone();
+        std::thread::spawn(move || {
+            let outcome = job();
+            if let Ok(mut guard) = result_clone.lock() {
+                *guard = Some(outcome);
+            }
+            finished_clone.store(true, Ordering::Relaxed);
+        });
+        self.license_job = Some(LicenseJob { finished, result });
+    }
+
+    fn verify_license_file(file_data: &str) -> Result<LicensePayloadInfo, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(file_data).map_err(|e| format!("License JSON error: {e}"))?;
+        let payload = value
+            .get("payload")
+            .ok_or_else(|| "License missing payload".to_string())?;
+        let signature = value
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "License missing signature".to_string())?;
+        let canonical = Self::canonical_json(payload);
+        let sig_bytes = BASE64_URL_SAFE
+            .decode(signature.as_bytes())
+            .map_err(|e| format!("Signature decode error: {e}"))?;
+        let key_bytes = Self::decode_public_key(LICENSE_PUBLIC_KEY_B64)?;
+        let verify_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| format!("Public key error: {e}"))?;
+        let signature = Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("Signature error: {e}"))?;
+        verify_key
+            .verify(canonical.as_bytes(), &signature)
+            .map_err(|_| "License signature invalid".to_string())?;
+
+        let status = Self::get_value_string(payload, &["status"])
+            .ok_or_else(|| "License missing status".to_string())?;
+        if status.to_ascii_lowercase() != "active" {
+            return Err(format!("License inactive ({status})"));
+        }
+        let product = Self::get_value_string(payload, &["product", "code"])
+            .or_else(|| Self::get_value_string(payload, &["product_code"]));
+        if let Some(product) = product.as_ref() {
+            if product != LICENSE_PRODUCT_CODE {
+                return Err(format!("Product mismatch ({product})"));
+            }
+        }
+
+        Ok(LicensePayloadInfo {
+            registered_to: Self::get_value_string(payload, &["account", "username"])
+                .or_else(|| Self::get_value_string(payload, &["account", "email"]))
+                .or_else(|| Self::get_value_string(payload, &["user", "username"]))
+                .or_else(|| Self::get_value_string(payload, &["user", "email"]))
+                .or_else(|| Self::get_value_string(payload, &["registered_to"])),
+            license_type: Self::get_value_string(payload, &["license_type"]),
+            max_activations: Self::get_value_u64(payload, &["limits", "max_activations"]),
+        })
+    }
+
+    fn decode_public_key(key_text: &str) -> Result<[u8; 32], String> {
+        let cleaned = key_text
+            .replace("-----BEGIN PUBLIC KEY-----", "")
+            .replace("-----END PUBLIC KEY-----", "")
+            .replace('\n', "")
+            .replace('\r', "")
+            .trim()
+            .to_string();
+        let raw = BASE64
+            .decode(cleaned.as_bytes())
+            .map_err(|e| format!("Public key decode error: {e}"))?;
+        if raw.len() == 32 {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&raw);
+            return Ok(bytes);
+        }
+        Err("Public key must be 32 bytes".to_string())
+    }
+
+    fn canonical_json(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "null".to_string(),
+            serde_json::Value::Bool(v) => v.to_string(),
+            serde_json::Value::Number(v) => v.to_string(),
+            serde_json::Value::String(v) => serde_json::to_string(v).unwrap_or_default(),
+            serde_json::Value::Array(items) => {
+                let parts: Vec<String> = items.iter().map(Self::canonical_json).collect();
+                format!("[{}]", parts.join(","))
+            }
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut parts = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let key_json = serde_json::to_string(key).unwrap_or_default();
+                    let value_json = Self::canonical_json(&map[key]);
+                    parts.push(format!("{key_json}:{value_json}"));
+                }
+                format!("{{{}}}", parts.join(","))
+            }
+        }
+    }
+
+    fn get_value_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+        let mut current = value;
+        for key in path {
+            current = current.get(*key)?;
+        }
+        current.as_str().map(|s| s.to_string())
+    }
+
+    fn get_value_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+        let mut current = value;
+        for key in path {
+            current = current.get(*key)?;
+        }
+        current.as_u64()
+    }
+
+    fn license_api_url(path: &str) -> String {
+        format!("{LICENSE_API_BASE}{path}")
+    }
+
+    fn build_license_client() -> Result<Client, String> {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))
+    }
+
+    fn start_license_login(&mut self) {
+        let identifier = self.license_identifier.trim().to_string();
+        let password = self.license_password.clone();
+        let label = self.license_device_label.trim().to_string();
+        if identifier.is_empty() || password.is_empty() {
+            self.status = "Enter identifier + password".to_string();
+            return;
+        }
+        self.start_license_job(move || {
+            let client = match Self::build_license_client() {
+                Ok(client) => client,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(err),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let url = Self::license_api_url("/api/auth/token");
+            let response = client
+                .post(url)
+                .json(&serde_json::json!({
+                    "identifier": identifier,
+                    "password": password,
+                    "label": label,
+                }))
+                .send();
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(format!("Login failed: {err}")),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let status_code = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status_code.is_success() {
+                return LicenseJobResult {
+                    status: Err(format!("Login failed ({status_code}): {text}")),
+                    token: None,
+                    license_file: None,
+                    registered_to: None,
+                };
+            }
+            let token = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("access_token").and_then(|t| t.as_str()).map(|t| t.to_string()));
+            if let Some(token) = token {
+                LicenseJobResult {
+                    status: Ok("Login OK".to_string()),
+                    token: Some(token),
+                    license_file: None,
+                    registered_to: None,
+                }
+            } else {
+                LicenseJobResult {
+                    status: Err("Login response missing access_token".to_string()),
+                    token: None,
+                    license_file: None,
+                    registered_to: None,
+                }
+            }
+        });
+    }
+
+    fn start_license_claim(&mut self) {
+        let serial = self.license_serial.trim().to_string();
+        let token = self.settings.auth_token.clone();
+        if serial.is_empty() {
+            self.status = "Enter serial".to_string();
+            return;
+        }
+        self.start_license_job(move || {
+            let client = match Self::build_license_client() {
+                Ok(client) => client,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(err),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let url = Self::license_api_url("/api/licenses/claim");
+            let mut request = client.post(url).json(&serde_json::json!({ "serial": serial }));
+            if !token.is_empty() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(format!("Claim failed: {err}")),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let status_code = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status_code.is_success() {
+                return LicenseJobResult {
+                    status: Err(format!("Claim failed ({status_code}): {text}")),
+                    token: None,
+                    license_file: None,
+                    registered_to: None,
+                };
+            }
+            let license_file = Self::license_file_from_response(&text);
+            let registered_to = license_file
+                .as_deref()
+                .and_then(|data| Self::verify_license_file(data).ok())
+                .and_then(|info| info.registered_to);
+            LicenseJobResult {
+                status: Ok("License claimed".to_string()),
+                token: None,
+                license_file,
+                registered_to,
+            }
+        });
+    }
+
+    fn start_license_activate(&mut self) {
+        let serial = self.license_serial.trim().to_string();
+        let device_id = self.settings.device_id.clone();
+        let device_label = self.license_device_label.trim().to_string();
+        let token = self.settings.auth_token.clone();
+        if serial.is_empty() {
+            self.status = "Enter serial".to_string();
+            return;
+        }
+        if device_id.is_empty() {
+            self.status = "Device id missing".to_string();
+            return;
+        }
+        self.start_license_job(move || {
+            let client = match Self::build_license_client() {
+                Ok(client) => client,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(err),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let url = Self::license_api_url("/api/licenses/activate");
+            let mut request = client.post(url).json(&serde_json::json!({
+                "serial": serial,
+                "device_id": device_id,
+                "device_label": device_label,
+            }));
+            if !token.is_empty() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(format!("Activate failed: {err}")),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let status_code = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status_code.is_success() {
+                return LicenseJobResult {
+                    status: Err(format!("Activate failed ({status_code}): {text}")),
+                    token: None,
+                    license_file: None,
+                    registered_to: None,
+                };
+            }
+            let license_file = Self::license_file_from_response(&text);
+            let registered_to = license_file
+                .as_deref()
+                .and_then(|data| Self::verify_license_file(data).ok())
+                .and_then(|info| info.registered_to);
+            LicenseJobResult {
+                status: Ok("Device activated".to_string()),
+                token: None,
+                license_file,
+                registered_to,
+            }
+        });
+    }
+
+    fn start_license_fetch_file(&mut self) {
+        let serial = self.license_serial.trim().to_string();
+        let token = self.settings.auth_token.clone();
+        if serial.is_empty() {
+            self.status = "Enter serial".to_string();
+            return;
+        }
+        self.start_license_job(move || {
+            let client = match Self::build_license_client() {
+                Ok(client) => client,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(err),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let url = Self::license_api_url(&format!("/api/licenses/{serial}/file"));
+            let mut request = client.get(url);
+            if !token.is_empty() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(err) => {
+                    return LicenseJobResult {
+                        status: Err(format!("Download failed: {err}")),
+                        token: None,
+                        license_file: None,
+                        registered_to: None,
+                    };
+                }
+            };
+            let status_code = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status_code.is_success() {
+                return LicenseJobResult {
+                    status: Err(format!("Download failed ({status_code}): {text}")),
+                    token: None,
+                    license_file: None,
+                    registered_to: None,
+                };
+            }
+            let license_file = Self::license_file_from_response(&text);
+            let registered_to = license_file
+                .as_deref()
+                .and_then(|data| Self::verify_license_file(data).ok())
+                .and_then(|info| info.registered_to);
+            LicenseJobResult {
+                status: Ok("License file downloaded".to_string()),
+                token: None,
+                license_file,
+                registered_to,
+            }
+        });
+    }
+
+    fn license_file_from_response(body: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        if let Some(license) = value.get("license_file") {
+            if let Some(text) = license.as_str() {
+                return Some(text.to_string());
+            }
+            if license.get("payload").is_some() && license.get("signature").is_some() {
+                return serde_json::to_string(license).ok();
+            }
+        }
+        if value.get("payload").is_some() && value.get("signature").is_some() {
+            return serde_json::to_string(&value).ok();
+        }
+        None
+    }
+
+    fn draw_animated_title(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let text = "Lingstation";
+        let font = egui::FontId::proportional(28.0);
+        let color = egui::Color32::from_rgb(220, 240, 255);
+        let time = ctx.input(|i| i.time) as f32;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let mut cursor_x = rect.left();
+        for (index, ch) in text.chars().enumerate() {
+            let wobble = (time * 2.4 + index as f32 * 0.5).sin() * 2.0;
+            let pos = egui::pos2(cursor_x, rect.center().y + wobble);
+            painter.text(pos, egui::Align2::LEFT_CENTER, ch, font.clone(), color);
+            let galley = ui.fonts(|f| f.layout_no_wrap(ch.to_string(), font.clone(), color));
+            cursor_x += galley.size().x + 1.0;
+        }
+    }
+
+    fn shortcuts_by_category() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        vec![
+            (
+                "Transport",
+                vec![
+                    ("Space", "Play/Pause"),
+                    ("R", "Record"),
+                ],
+            ),
+            (
+                "File",
+                vec![
+                    ("Ctrl+S", "Save"),
+                    ("Ctrl+Shift+S", "Save As"),
+                    ("Ctrl+O", "Open"),
+                    ("Ctrl+N", "New Project"),
+                    ("Ctrl+E", "Render"),
+                ],
+            ),
+            (
+                "Edit",
+                vec![
+                    ("Ctrl+Z", "Undo"),
+                    ("Ctrl+Y", "Redo"),
+                    ("Delete/Backspace", "Delete selected clip"),
+                ],
+            ),
+            (
+                "View",
+                vec![("Ctrl+,", "Settings")],
+            ),
+            (
+                "Track",
+                vec![("Ctrl+D", "Duplicate selected track")],
+            ),
+        ]
+    }
+
+    fn bundled_synths() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("CatSynth", "KVR info pending"),
+            ("DogSynth", "KVR info pending"),
+            ("FishSynth", "KVR info pending"),
+            ("LingSynth", "KVR info pending"),
+            ("MiceSynth", "KVR info pending"),
+            ("PlantSynth", "KVR info pending"),
+            ("SannySynth", "KVR info pending"),
+        ]
     }
 
     fn list_output_devices(&self) -> Vec<String> {
@@ -16104,6 +17596,10 @@ fn render_plan_to_wav(
     let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks {
+            if !track.active {
+                track_hosts.push((track, None, Vec::new()));
+                continue;
+            }
             let host = if let Some(path) = track.instrument_path.as_ref() {
                 load_render_host(
                     path,
@@ -16193,6 +17689,102 @@ fn render_plan_to_wav(
     render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
     render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
 
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
     let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -16202,7 +17794,7 @@ fn render_plan_to_wav(
         let mut output = vec![0.0f32; frames * channels as usize];
         let mut temp = vec![0.0f32; frames * channels as usize];
         let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        for (track, host, fx_hosts) in track_hosts.iter_mut() {
+        for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
             }
@@ -16243,6 +17835,56 @@ fn render_plan_to_wav(
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
+            if let Some(clips) = per_track_clips.get(track_index) {
+                for (clip, data) in clips {
+                    let clip_end = clip.start_samples + clip.length_samples;
+                    if block_end <= clip.start_samples || block_start >= clip_end {
+                        continue;
+                    }
+                    let src_channels = data.channels.max(1);
+                    let src_frames = data.samples.len() / src_channels;
+                    if src_frames == 0 {
+                        continue;
+                    }
+                    let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
+                    let time_mul = clip.time_mul.max(0.01) as f64;
+                    let start_in_block = block_start.max(clip.start_samples) - block_start;
+                    let end_in_block = block_end.min(clip_end) - block_start;
+                    for i in start_in_block..end_in_block {
+                        let clip_pos = i + block_start - clip.start_samples;
+                        let pos =
+                            ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                .max(0.0);
+                        let len = src_frames as f64;
+                        let src_pos = if len > 0.0 {
+                            if plan.render_tail_mode == RenderTailMode::Wrap {
+                                pos % len
+                            } else if pos >= len {
+                                continue;
+                            } else {
+                                pos
+                            }
+                        } else {
+                            pos
+                        };
+                        let base = src_pos.floor() as usize;
+                        let frac = (src_pos - base as f64) as f32;
+                        let next = (base + 1).min(src_frames.saturating_sub(1));
+                        for ch in 0..channels as usize {
+                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                            let idx0 = base * src_channels + src_ch;
+                            let idx1 = next * src_channels + src_ch;
+                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                            let sample = s0 + (s1 - s0) * frac;
+                            let out_index = i as usize * channels as usize + ch;
+                            if out_index < temp.len() {
+                                temp[out_index] += sample * clip.gain;
+                            }
+                        }
+                    }
+                }
+            }
             let mut current = &mut temp;
             let mut scratch = &mut fx_temp;
             for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
@@ -16270,58 +17912,6 @@ fn render_plan_to_wav(
             let level = track.level.clamp(0.0, 1.0);
             for (out, sample) in output.iter_mut().zip(current.iter()) {
                 *out += *sample * level;
-            }
-        }
-        if !plan.audio_clips.is_empty() {
-            for clip in plan.audio_clips.iter() {
-                let clip_end = clip.start_samples + clip.length_samples;
-                if block_end <= clip.start_samples || block_start >= clip_end {
-                    continue;
-                }
-                let Some(data) = plan.audio_cache.get(&clip.path) else {
-                    continue;
-                };
-                let src_channels = data.channels.max(1);
-                let src_frames = data.samples.len() / src_channels;
-                if src_frames == 0 {
-                    continue;
-                }
-                let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
-                let time_mul = clip.time_mul.max(0.01) as f64;
-                let start_in_block = block_start.max(clip.start_samples) - block_start;
-                let end_in_block = block_end.min(clip_end) - block_start;
-                for i in start_in_block..end_in_block {
-                    let clip_pos = i + block_start - clip.start_samples;
-                    let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                        .max(0.0);
-                    let len = src_frames as f64;
-                    let src_pos = if len > 0.0 {
-                        if plan.render_tail_mode == RenderTailMode::Wrap {
-                            pos % len
-                        } else if pos >= len {
-                            continue;
-                        } else {
-                            pos
-                        }
-                    } else {
-                        pos
-                    };
-                    let base = src_pos.floor() as usize;
-                    let frac = (src_pos - base as f64) as f32;
-                    let next = (base + 1).min(src_frames.saturating_sub(1));
-                    for ch in 0..channels as usize {
-                        let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                        let idx0 = base * src_channels + src_ch;
-                        let idx1 = next * src_channels + src_ch;
-                        let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                        let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                        let sample = s0 + (s1 - s0) * frac;
-                        let out_index = i as usize * channels as usize + ch;
-                        if out_index < output.len() {
-                            output[out_index] += sample * clip.gain;
-                        }
-                    }
-                }
             }
         }
         apply_master_processing(
@@ -16463,6 +18053,10 @@ where
     let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks.iter().cloned() {
+            if !track.active {
+                track_hosts.push((track, None, Vec::new()));
+                continue;
+            }
             let host = if let Some(path) = track.instrument_path.as_ref() {
                 load_render_host(
                     path,
@@ -16551,6 +18145,18 @@ where
     render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
     render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
 
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
     let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -16560,7 +18166,7 @@ where
         let mut output = vec![0.0f32; frames * channels as usize];
         let mut temp = vec![0.0f32; frames * channels as usize];
         let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        for (track, host, fx_hosts) in track_hosts.iter_mut() {
+        for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
             }
@@ -16601,6 +18207,56 @@ where
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
+            if let Some(clips) = per_track_clips.get(track_index) {
+                for (clip, data) in clips {
+                    let clip_end = clip.start_samples + clip.length_samples;
+                    if block_end <= clip.start_samples || block_start >= clip_end {
+                        continue;
+                    }
+                    let src_channels = data.channels.max(1);
+                    let src_frames = data.samples.len() / src_channels;
+                    if src_frames == 0 {
+                        continue;
+                    }
+                    let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
+                    let time_mul = clip.time_mul.max(0.01) as f64;
+                    let start_in_block = block_start.max(clip.start_samples) - block_start;
+                    let end_in_block = block_end.min(clip_end) - block_start;
+                    for i in start_in_block..end_in_block {
+                        let clip_pos = i + block_start - clip.start_samples;
+                        let pos =
+                            ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                .max(0.0);
+                        let len = src_frames as f64;
+                        let src_pos = if len > 0.0 {
+                            if plan.render_tail_mode == RenderTailMode::Wrap {
+                                pos % len
+                            } else if pos >= len {
+                                continue;
+                            } else {
+                                pos
+                            }
+                        } else {
+                            pos
+                        };
+                        let base = src_pos.floor() as usize;
+                        let frac = (src_pos - base as f64) as f32;
+                        let next = (base + 1).min(src_frames.saturating_sub(1));
+                        for ch in 0..channels as usize {
+                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                            let idx0 = base * src_channels + src_ch;
+                            let idx1 = next * src_channels + src_ch;
+                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                            let sample = s0 + (s1 - s0) * frac;
+                            let out_index = i as usize * channels as usize + ch;
+                            if out_index < temp.len() {
+                                temp[out_index] += sample * clip.gain;
+                            }
+                        }
+                    }
+                }
+            }
             let mut current = &mut temp;
             let mut scratch = &mut fx_temp;
             for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
@@ -16628,58 +18284,6 @@ where
             let level = track.level.clamp(0.0, 1.0);
             for (out, sample) in output.iter_mut().zip(current.iter()) {
                 *out += *sample * level;
-            }
-        }
-        if !plan.audio_clips.is_empty() {
-            for clip in plan.audio_clips.iter() {
-                let clip_end = clip.start_samples + clip.length_samples;
-                if block_end <= clip.start_samples || block_start >= clip_end {
-                    continue;
-                }
-                let Some(data) = plan.audio_cache.get(&clip.path) else {
-                    continue;
-                };
-                let src_channels = data.channels.max(1);
-                let src_frames = data.samples.len() / src_channels;
-                if src_frames == 0 {
-                    continue;
-                }
-                let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
-                let time_mul = clip.time_mul.max(0.01) as f64;
-                let start_in_block = block_start.max(clip.start_samples) - block_start;
-                let end_in_block = block_end.min(clip_end) - block_start;
-                for i in start_in_block..end_in_block {
-                    let clip_pos = i + block_start - clip.start_samples;
-                    let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                        .max(0.0);
-                    let len = src_frames as f64;
-                    let src_pos = if len > 0.0 {
-                        if plan.render_tail_mode == RenderTailMode::Wrap {
-                            pos % len
-                        } else if pos >= len {
-                            continue;
-                        } else {
-                            pos
-                        }
-                    } else {
-                        pos
-                    };
-                    let base = src_pos.floor() as usize;
-                    let frac = (src_pos - base as f64) as f32;
-                    let next = (base + 1).min(src_frames.saturating_sub(1));
-                    for ch in 0..channels as usize {
-                        let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                        let idx0 = base * src_channels + src_ch;
-                        let idx1 = next * src_channels + src_ch;
-                        let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                        let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                        let sample = s0 + (s1 - s0) * frac;
-                        let out_index = i as usize * channels as usize + ch;
-                        if out_index < output.len() {
-                            output[out_index] += sample * clip.gain;
-                        }
-                    }
-                }
             }
         }
         apply_master_processing(
@@ -16717,6 +18321,10 @@ fn render_plan_to_f32(
     let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
     if !plan.tracks.is_empty() {
         for track in plan.tracks {
+            if !track.active {
+                track_hosts.push((track, None, Vec::new()));
+                continue;
+            }
             let host = if let Some(path) = track.instrument_path.as_ref() {
                 load_render_host(
                     path,
@@ -16805,6 +18413,18 @@ fn render_plan_to_f32(
     render_send_midi_stop(&mut track_hosts, channels as usize, plan.block_size);
     render_warmup_hosts(&mut track_hosts, channels as usize, plan.block_size, 2);
 
+    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
+        vec![Vec::new(); track_hosts.len()];
+    for clip in plan.audio_clips.iter() {
+        if clip.track_index >= per_track_clips.len() {
+            continue;
+        }
+        let Some(data) = plan.audio_cache.get(&clip.path) else {
+            continue;
+        };
+        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
+    }
+
     let mut output_all = Vec::with_capacity(total_samples * channels as usize);
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -16814,7 +18434,7 @@ fn render_plan_to_f32(
         let mut output = vec![0.0f32; frames * channels as usize];
         let mut temp = vec![0.0f32; frames * channels as usize];
         let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        for (track, host, fx_hosts) in track_hosts.iter_mut() {
+        for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
             }
@@ -16839,6 +18459,56 @@ fn render_plan_to_f32(
             let events = collect_block_events(&track.notes, block_start, block_end, samples_per_beat);
             if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
+            }
+            if let Some(clips) = per_track_clips.get(track_index) {
+                for (clip, data) in clips {
+                    let clip_end = clip.start_samples + clip.length_samples;
+                    if block_end <= clip.start_samples || block_start >= clip_end {
+                        continue;
+                    }
+                    let src_channels = data.channels.max(1);
+                    let src_frames = data.samples.len() / src_channels;
+                    if src_frames == 0 {
+                        continue;
+                    }
+                    let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
+                    let time_mul = clip.time_mul.max(0.01) as f64;
+                    let start_in_block = block_start.max(clip.start_samples) - block_start;
+                    let end_in_block = block_end.min(clip_end) - block_start;
+                    for i in start_in_block..end_in_block {
+                        let clip_pos = i + block_start - clip.start_samples;
+                        let pos =
+                            ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                .max(0.0);
+                        let len = src_frames as f64;
+                        let src_pos = if len > 0.0 {
+                            if plan.render_tail_mode == RenderTailMode::Wrap {
+                                pos % len
+                            } else if pos >= len {
+                                continue;
+                            } else {
+                                pos
+                            }
+                        } else {
+                            pos
+                        };
+                        let base = src_pos.floor() as usize;
+                        let frac = (src_pos - base as f64) as f32;
+                        let next = (base + 1).min(src_frames.saturating_sub(1));
+                        for ch in 0..channels as usize {
+                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                            let idx0 = base * src_channels + src_ch;
+                            let idx1 = next * src_channels + src_ch;
+                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                            let sample = s0 + (s1 - s0) * frac;
+                            let out_index = i as usize * channels as usize + ch;
+                            if out_index < temp.len() {
+                                temp[out_index] += sample * clip.gain;
+                            }
+                        }
+                    }
+                }
             }
             let mut current = &mut temp;
             let mut scratch = &mut fx_temp;
@@ -16867,58 +18537,6 @@ fn render_plan_to_f32(
             let level = track.level.clamp(0.0, 1.0);
             for (out, sample) in output.iter_mut().zip(current.iter()) {
                 *out += *sample * level;
-            }
-        }
-        if !plan.audio_clips.is_empty() {
-            for clip in plan.audio_clips.iter() {
-                let clip_end = clip.start_samples + clip.length_samples;
-                if block_end <= clip.start_samples || block_start >= clip_end {
-                    continue;
-                }
-                let Some(data) = plan.audio_cache.get(&clip.path) else {
-                    continue;
-                };
-                let src_channels = data.channels.max(1);
-                let src_frames = data.samples.len() / src_channels;
-                if src_frames == 0 {
-                    continue;
-                }
-                let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
-                let time_mul = clip.time_mul.max(0.01) as f64;
-                let start_in_block = block_start.max(clip.start_samples) - block_start;
-                let end_in_block = block_end.min(clip_end) - block_start;
-                for i in start_in_block..end_in_block {
-                    let clip_pos = i + block_start - clip.start_samples;
-                    let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                        .max(0.0);
-                    let len = src_frames as f64;
-                    let src_pos = if len > 0.0 {
-                        if plan.render_tail_mode == RenderTailMode::Wrap {
-                            pos % len
-                        } else if pos >= len {
-                            continue;
-                        } else {
-                            pos
-                        }
-                    } else {
-                        pos
-                    };
-                    let base = src_pos.floor() as usize;
-                    let frac = (src_pos - base as f64) as f32;
-                    let next = (base + 1).min(src_frames.saturating_sub(1));
-                    for ch in 0..channels as usize {
-                        let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                        let idx0 = base * src_channels + src_ch;
-                        let idx1 = next * src_channels + src_ch;
-                        let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                        let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                        let sample = s0 + (s1 - s0) * frac;
-                        let out_index = i as usize * channels as usize + ch;
-                        if out_index < output.len() {
-                            output[out_index] += sample * clip.gain;
-                        }
-                    }
-                }
             }
         }
         output_all.extend_from_slice(&output);

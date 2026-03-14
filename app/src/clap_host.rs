@@ -13,7 +13,7 @@ use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY
 use clap_sys::plugin::clap_plugin_descriptor;
 use libloading::Library;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::vst3::MidiEvent as VstMidiEvent;
@@ -45,6 +45,7 @@ struct ClapHostShared {
     gui_request_show: AtomicBool,
     gui_request_hide: AtomicBool,
     gui_closed: AtomicBool,
+    param_rescan_flags: AtomicU32,
 }
 
 impl<'a> SharedHandler<'a> for ClapHostShared {
@@ -122,6 +123,10 @@ impl HostParamsImplMainThread for ClapHostMainThread<'_> {
         if let Ok(mut pending) = self.rescan_flags.lock() {
             pending.push(flags);
         }
+        let bits = flags.bits();
+        self.shared
+            .param_rescan_flags
+            .fetch_or(bits, Ordering::SeqCst);
     }
 
     fn clear(&mut self, _param_id: ClapId, _flags: ParamClearFlags) {}
@@ -164,6 +169,8 @@ pub struct ClapHost {
     state_ext: Option<PluginState>,
     gui_ext: Option<PluginGui>,
     latency_ext: Option<PluginLatency>,
+    plugin_id: String,
+    block_param_changes: bool,
     input_channels: usize,
     output_channels: usize,
     input_buffers: Vec<Vec<f32>>,
@@ -196,6 +203,7 @@ impl ClapHost {
             .map_err(|e| e.to_string())?;
         let module_path = resolve_clap_binary(path)?;
         let entry = unsafe { PluginEntry::load(&module_path) }.map_err(|e| e.to_string())?;
+        let plugin_id_str = plugin_id.to_string();
         let plugin_id = CString::new(plugin_id).map_err(|e| e.to_string())?;
 
         let mut instance = PluginInstance::<ClapHostHandlers>::new(
@@ -235,6 +243,8 @@ impl ClapHost {
             state_ext,
             gui_ext,
             latency_ext,
+            plugin_id: plugin_id_str.clone(),
+            block_param_changes: Self::is_vital_id(&plugin_id_str),
             input_channels,
             output_channels,
             input_buffers: Vec::new(),
@@ -273,7 +283,18 @@ impl ClapHost {
     }
 
     pub fn push_param_change(&mut self, param_id: u32, value: f64) {
+        if self.block_param_changes {
+            return;
+        }
+        if !value.is_finite() {
+            return;
+        }
+        let value = value.clamp(0.0, 1.0);
         self.pending_params.push((param_id, value));
+    }
+
+    pub fn param_changes_blocked(&self) -> bool {
+        self.block_param_changes
     }
 
     pub fn process_f32(
@@ -448,14 +469,37 @@ impl ClapHost {
         Some((size.width as i32, size.height as i32))
     }
 
+    pub fn take_gui_request_show(&self) -> bool {
+        self.instance
+            .access_shared_handler(|h| h.gui_request_show.swap(false, Ordering::SeqCst))
+    }
+
+    pub fn take_gui_request_hide(&self) -> bool {
+        self.instance
+            .access_shared_handler(|h| h.gui_request_hide.swap(false, Ordering::SeqCst))
+    }
+
+    pub fn gui_is_open(&self) -> bool {
+        self.gui_open
+    }
+
     pub fn take_gui_closed(&mut self) -> bool {
         self.instance.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst))
+    }
+
+    pub fn take_param_rescan(&self) -> u32 {
+        self.instance
+            .access_shared_handler(|h| h.param_rescan_flags.swap(0, Ordering::SeqCst))
     }
 
     pub fn prepare_for_drop(&mut self) {
         let _ = self.audio_processor.ensure_processing_stopped();
         let _ = self.instance.try_deactivate();
         self.destroy_gui();
+    }
+
+    fn is_vital_id(id: &str) -> bool {
+        id.to_ascii_lowercase().contains("vital")
     }
 
     fn process_internal(
