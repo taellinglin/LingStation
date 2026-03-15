@@ -81,7 +81,14 @@ jobs:
           else
             EXT=Linux
           fi
-          cp "target/release/${BIN_NAME}" "dist/LingStation-v${VERSION}-${EXT}"
+          DEST_DIR="dist/LingStation-v${VERSION}-${EXT}"
+          mkdir -p "$DEST_DIR"
+          cp "target/release/${BIN_NAME}" "$DEST_DIR/LingStation"
+          cp -R "synths" "$DEST_DIR/"
+          cp -R "samples" "$DEST_DIR/"
+          cp -R "sample_kits" "$DEST_DIR/"
+          cp -R "templates" "$DEST_DIR/"
+          cp -R "examples" "$DEST_DIR/"
           tar -czf "dist/LingStation-v${VERSION}-${EXT}.tar.gz" -C dist \
             "LingStation-v${VERSION}-${EXT}"
 
@@ -91,9 +98,15 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $binName = "lingstation-app.exe"
-          $dest = "dist\LingStation-v$env:VERSION-Windows.exe"
-          Copy-Item -Path "target\release\$binName" -Destination $dest
-          Compress-Archive -Path $dest -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
+          $destDir = "dist\LingStation-v$env:VERSION-Windows"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          Copy-Item -Path "target\release\$binName" -Destination (Join-Path $destDir "LingStation.exe")
+          Copy-Item -Path "synths" -Destination (Join-Path $destDir "synths") -Recurse
+          Copy-Item -Path "samples" -Destination (Join-Path $destDir "samples") -Recurse
+          Copy-Item -Path "sample_kits" -Destination (Join-Path $destDir "sample_kits") -Recurse
+          Copy-Item -Path "templates" -Destination (Join-Path $destDir "templates") -Recurse
+          Copy-Item -Path "examples" -Destination (Join-Path $destDir "examples") -Recurse
+          Compress-Archive -Path $destDir -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
       - name: Delete existing release assets
         run: echo "release handled in separate job"
