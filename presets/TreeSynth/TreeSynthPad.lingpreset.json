@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "name": "TreeSynthPad.lingpreset",
+  "plugin": "TreeSynth",
+  "param_names": [],
+  "param_ids": [],
+  "param_values": [],
+  "component_state": "",
+  "controller_state": "",
+  "treesynth": {
+    "folder": "TreeSynthPad.lingpreset_samples",
+    "samples": [
+      {
+        "path": "TreeSynthPad.lingpreset_samples/190836__phrakturedaudio__kfa21_100bpm.wav",
+        "name": "190836__phrakturedaudio__kfa21_100bpm.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          56,
+          111,
+          234
+        ]
+      },
+      {
+        "path": "TreeSynthPad.lingpreset_samples/396793__ghostsyndicate__gs_free1_85_atmo_gm.wav",
+        "name": "396793__ghostsyndicate__gs_free1_85_atmo_gm.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          70,
+          70,
+          156
+        ]
+      },
+      {
+        "path": "TreeSynthPad.lingpreset_samples/484634__loop_cult__lcc_124_synth_01_d_carbnpad.wav",
+        "name": "484634__loop_cult__lcc_124_synth_01_d_carbnpad.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          254,
+          133,
+          85
+        ]
+      },
+      {
+        "path": "TreeSynthPad.lingpreset_samples/674403__gregorquendel__sci-fi-soundscape-drone-pad-harmonic-005-designed-atmospheres.mp3",
+        "name": "674403__gregorquendel__sci-fi-soundscape-drone-pad-harmonic-005-designed-atmospheres.mp3",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          157,
+          153,
+          31
+        ]
+      }
+    ],
+    "mode": "Morph",
+    "morph": 0.58,
+    "reorder": 0.0,
+    "gain": 0.45,
+    "attack": 0.005,
+    "decay": 0.12,
+    "sustain": 0.75,
+    "release": 0.25,
+    "vibrato_rate": 1.0,
+    "vibrato_depth": 0.0,
+    "tremolo_rate": 0.7,
+    "tremolo_depth": 0.0,
+    "reverb_mix": 0.1,
+    "pitch_bend_range": 2.0,
+    "portamento_ms": 0.0,
+    "legato": false
+  }
+}

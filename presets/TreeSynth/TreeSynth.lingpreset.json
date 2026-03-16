@@ -1,0 +1,213 @@
+{
+  "version": 1,
+  "name": "TreeSynth.lingpreset",
+  "plugin": "TreeSynth",
+  "param_names": [],
+  "param_ids": [],
+  "param_values": [],
+  "component_state": "",
+  "controller_state": "",
+  "treesynth": {
+    "folder": "TreeSynth.lingpreset_samples",
+    "samples": [
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #1.wav",
+        "name": "NyxStrument - Marker #1.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          251,
+          34,
+          219
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #10.wav",
+        "name": "NyxStrument - Marker #10.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          111,
+          204,
+          189
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #11.wav",
+        "name": "NyxStrument - Marker #11.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          103,
+          70,
+          42
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #12.wav",
+        "name": "NyxStrument - Marker #12.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          67,
+          136,
+          243
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #13.wav",
+        "name": "NyxStrument - Marker #13.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          118,
+          44,
+          160
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #2.wav",
+        "name": "NyxStrument - Marker #2.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          63,
+          22,
+          146
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #3.wav",
+        "name": "NyxStrument - Marker #3.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          191,
+          189,
+          229
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #4.wav",
+        "name": "NyxStrument - Marker #4.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          22,
+          104,
+          164
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #5.wav",
+        "name": "NyxStrument - Marker #5.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          19,
+          219,
+          7
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #6.wav",
+        "name": "NyxStrument - Marker #6.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          53,
+          253,
+          94
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #7.wav",
+        "name": "NyxStrument - Marker #7.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          164,
+          63,
+          33
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #8.wav",
+        "name": "NyxStrument - Marker #8.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          15,
+          127,
+          32
+        ]
+      },
+      {
+        "path": "TreeSynth.lingpreset_samples/NyxStrument - Marker #9.wav",
+        "name": "NyxStrument - Marker #9.wav",
+        "root_note": 60,
+        "gain": 1.0,
+        "pan": 0.0,
+        "start": 0.0,
+        "end": 1.0,
+        "color": [
+          220,
+          219,
+          115
+        ]
+      }
+    ],
+    "mode": "Layer",
+    "morph": 0.96,
+    "reorder": 0.0,
+    "gain": 1.0,
+    "attack": 0.0,
+    "decay": 0.7,
+    "sustain": 0.4,
+    "release": 1.8,
+    "vibrato_rate": 2.0,
+    "vibrato_depth": 0.4,
+    "tremolo_rate": 5.0,
+    "tremolo_depth": 0.0,
+    "reverb_mix": 0.1,
+    "pitch_bend_range": 2.0,
+    "portamento_ms": 0.0,
+    "legato": false
+  }
+}

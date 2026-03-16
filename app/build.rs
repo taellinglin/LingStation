@@ -3,6 +3,7 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let sdk_path = manifest_dir.join("..").join("vst3sdk");
+    println!("cargo:rustc-check-cfg=cfg(has_rubberband)");
     println!("cargo:rustc-env=VST3_SDK_PATH={}", sdk_path.display());
 
     #[cfg(windows)]
@@ -54,6 +55,7 @@ fn main() {
         if let Some(dir) = found {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib=static=rubberband-library");
+            println!("cargo:rustc-cfg=has_rubberband");
         } else {
             println!("cargo:warning=Rubber Band static library not found. Build third_party\\rubberband\\otherbuilds\\rubberband-library.vcxproj for x64.");
         }

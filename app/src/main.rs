@@ -10,6 +10,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 use rand::RngCore;
 use reqwest::blocking::Client;
 use rodio::{Decoder, OutputStream, Sink, Source};
+use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::backtrace::Backtrace;
@@ -21,16 +22,17 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
     Arc, Mutex,
 };
+use std::thread;
 
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 
 mod clap_host;
 mod vst3;
 
-const BASE_UI_FONT_SIZE: f32 = 9.0;
+const BASE_UI_FONT_SIZE: f32 = 12.0;
 const LICENSE_API_BASE: &str = "https://linglin.art";
 const LICENSE_PUBLIC_KEY_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJQEieMJP2VOEI8yM7BOpelBIUvC2AOUDm85k0OjtYNT";
 const LICENSE_PRODUCT_CODE: &str = "LingStation";
@@ -90,6 +92,33 @@ fn run_cli_render(args: &[String]) -> Result<(), String> {
     wait_for_render_job(&mut app)
 }
 
+fn init_windows_com() {
+    #[cfg(windows)]
+    {
+        vst3::init_windows_com_for_thread();
+    }
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    None
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+    let mut fonts = FontDefinitions::default();
+    // フォントファイルを読み込む
+    if let Ok(font_bytes) = std::fs::read("./font.ttf") {
+        fonts.font_data.insert(
+            "custom_font".to_owned(),
+            FontData::from_owned(font_bytes),
+        );
+        // プロポーショナル/モノスペース両方に割り当て
+        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "custom_font".to_owned());
+        fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "custom_font".to_owned());
+        ctx.set_fonts(fonts);
+    }
+}
+
 fn wait_for_render_job(app: &mut DawApp) -> Result<(), String> {
     loop {
         let Some(job) = app.render_job.as_ref() else {
@@ -99,113 +128,17 @@ fn wait_for_render_job(app: &mut DawApp) -> Result<(), String> {
             let result = job
                 .result
                 .lock()
-                .map_err(|_| "Render result lock failed".to_string())?
-                .take()
-                .unwrap_or_else(|| Err("Render finished without status".to_string()));
+                .ok()
+                .and_then(|mut guard| guard.take())
+                .unwrap_or_else(|| Ok("Render complete".to_string()));
             app.render_job = None;
             return result.map(|_| ());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
-
-fn load_app_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../../icon.png");
-    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let (width, height) = image.dimensions();
-    Some(egui::IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
-    })
-}
-
-fn configure_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    {
-        let data = include_bytes!("../../font.ttf");
-        fonts
-            .font_data
-            .insert("custom".to_string(), egui::FontData::from_static(data));
-        fonts
-            .families
-            .insert(egui::FontFamily::Proportional, vec!["custom".to_string()]);
-        fonts
-            .families
-            .insert(egui::FontFamily::Monospace, vec!["custom".to_string()]);
-        ctx.set_fonts(fonts);
-    }
-    let mut style = (*ctx.style()).clone();
-    for font_id in style.text_styles.values_mut() {
-        font_id.size = BASE_UI_FONT_SIZE;
-    }
-    ctx.set_style(style);
-    ctx.set_pixels_per_point(1.5);
-    ctx.tessellation_options_mut(|t| {
-        t.feathering = false;
-    });
-}
-
 #[cfg(windows)]
-fn init_windows_com() {
-    use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-    use windows_sys::Win32::System::Ole::OleInitialize;
-    unsafe {
-        CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
-        OleInitialize(std::ptr::null_mut());
-    }
-}
-
-#[cfg(not(windows))]
-fn init_windows_com() {}
-
-
-#[cfg(windows)]
-fn install_windows_crash_handler() {
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        MiniDumpWriteDump, SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
-        MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-    };
-    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-    const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
-
-    unsafe extern "system" fn handler(info: *const EXCEPTION_POINTERS) -> i32 {
-        let file = match std::fs::File::create("crash.dmp") {
-            Ok(file) => file,
-            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-        };
-        let process = unsafe { GetCurrentProcess() };
-        let pid = unsafe { GetCurrentProcessId() };
-        let mut exception_info = MINIDUMP_EXCEPTION_INFORMATION {
-            ThreadId: unsafe { GetCurrentThreadId() },
-            ExceptionPointers: info as *mut EXCEPTION_POINTERS,
-            ClientPointers: 0,
-        };
-        let ok = unsafe {
-            MiniDumpWriteDump(
-                process,
-                pid,
-                file.as_raw_handle() as isize,
-                MiniDumpNormal,
-                &mut exception_info as *mut _,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if ok == 0 {
-            EXCEPTION_CONTINUE_SEARCH
-        } else {
-            EXCEPTION_EXECUTE_HANDLER
-        }
-    }
-
-    unsafe {
-        SetUnhandledExceptionFilter(Some(handler));
-    }
-}
+fn install_windows_crash_handler() {}
 
 #[cfg(not(windows))]
 fn install_windows_crash_handler() {}
@@ -233,6 +166,7 @@ enum AudioStretchMode {
     Stretch,
     StretchFormant,
     StretchNeutral,
+    StretchVocal,
     Speed,
 }
 
@@ -271,6 +205,22 @@ struct Clip {
     audio_stretch_mode: AudioStretchMode,
     #[serde(default)]
     audio_time_mul: f32,
+    #[serde(default)]
+    audio_key: Option<u8>,
+    #[serde(default)]
+    audio_key_minor: bool,
+    #[serde(default)]
+    audio_key_source: Option<u8>,
+    #[serde(default)]
+    audio_bpm: Option<f32>,
+    #[serde(default)]
+    audio_fine_pitch_cents: f32,
+    #[serde(default = "default_formant_scale")]
+    audio_formant_scale: f32,
+}
+
+fn default_formant_scale() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -311,6 +261,124 @@ struct Track {
     midi_cc_lanes: Vec<MidiCcLane>,
     #[serde(default)]
     midi_program: Option<u8>,
+    #[serde(default)]
+    treesynth: Option<TreeSynthState>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum TreeSynthMode {
+    Random,
+    Layer,
+    Sequential,
+    Morph,
+    Reorder,
+}
+
+impl Default for TreeSynthMode {
+    fn default() -> Self {
+        Self::Random
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TreeSynthSample {
+    path: String,
+    name: String,
+    root_note: u8,
+    gain: f32,
+    pan: f32,
+    start: f32,
+    end: f32,
+    color: [u8; 3],
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TreeSynthState {
+    folder: Option<String>,
+    samples: Vec<TreeSynthSample>,
+    mode: TreeSynthMode,
+    morph: f32,
+    reorder: f32,
+    gain: f32,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    vibrato_rate: f32,
+    vibrato_depth: f32,
+    tremolo_rate: f32,
+    tremolo_depth: f32,
+    reverb_mix: f32,
+    pitch_bend_range: f32,
+    portamento_ms: f32,
+    legato: bool,
+}
+
+impl Default for TreeSynthState {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            samples: Vec::new(),
+            mode: TreeSynthMode::Random,
+            morph: 0.0,
+            reorder: 0.0,
+            gain: 1.0,
+            attack: 0.005,
+            decay: 0.12,
+            sustain: 0.75,
+            release: 0.25,
+            vibrato_rate: 5.0,
+            vibrato_depth: 0.0,
+            tremolo_rate: 5.0,
+            tremolo_depth: 0.0,
+            reverb_mix: 0.1,
+            pitch_bend_range: 2.0,
+            portamento_ms: 0.0,
+            legato: false,
+        }
+    }
+}
+
+struct TreeSynthVoice {
+    sample_index: usize,
+    sample_pos: f64,
+    sample_end: f64,
+    step: f64,
+    note: u8,
+    start_sample: u64,
+    release_sample: Option<u64>,
+    release_level: f32,
+    gain: f32,
+    pan: f32,
+    rate: f64,
+    rate_step: f64,
+    glide_remaining: u64,
+}
+
+struct TreeSynthRuntime {
+    voices: Vec<TreeSynthVoice>,
+    sequence_index: usize,
+    rng_state: u64,
+    last_note: Option<u8>,
+}
+
+impl TreeSynthRuntime {
+    fn new() -> Self {
+        Self {
+            voices: Vec::new(),
+            sequence_index: 0,
+            rng_state: 0x9E3779B97F4A7C15,
+            last_note: None,
+        }
+    }
+
+    fn next_rand(&mut self) -> u32 {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        (self.rng_state >> 32) as u32
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -328,6 +396,10 @@ struct ProjectState {
     year: String,
     #[serde(default)]
     comment: String,
+    #[serde(default)]
+    project_key: Option<u8>,
+    #[serde(default)]
+    project_key_minor: bool,
     tempo_bpm: f32,
     tracks: Vec<Track>,
     #[serde(default)]
@@ -349,6 +421,8 @@ struct Vst3PresetFile {
     component_state: String,
     #[serde(default)]
     controller_state: String,
+    #[serde(default)]
+    treesynth: Option<TreeSynthState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -362,6 +436,8 @@ struct SettingsState {
     midi_input: String,
     #[serde(default)]
     theme: String,
+    #[serde(default)]
+    key_display_format: String,
     #[serde(default)]
     device_id: String,
     #[serde(default)]
@@ -396,9 +472,15 @@ struct SettingsState {
     play_startup_sound: bool,
     #[serde(default)]
     browser_folders: Vec<String>,
+    #[serde(default = "default_show_clip_labels")]
+    show_clip_labels: bool,
 }
 
 fn default_startup_sound() -> bool {
+    true
+}
+
+fn default_show_clip_labels() -> bool {
     true
 }
 
@@ -412,6 +494,7 @@ impl Default for SettingsState {
             interpolation: "linear".to_string(),
             midi_input: String::new(),
             theme: "Black".to_string(),
+            key_display_format: "camelot".to_string(),
             device_id: String::new(),
             device_salt: String::new(),
             auth_token: String::new(),
@@ -429,6 +512,7 @@ impl Default for SettingsState {
             load_last_project: false,
             play_startup_sound: default_startup_sound(),
             browser_folders: Vec::new(),
+            show_clip_labels: default_show_clip_labels(),
         }
     }
 }
@@ -441,8 +525,26 @@ enum PluginTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PluginKind {
+    Native,
     Vst3,
     Clap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginCategory {
+    Native,
+    Bundled,
+    System,
+}
+
+impl PluginCategory {
+    fn label(self) -> &'static str {
+        match self {
+            PluginCategory::Native => "Native",
+            PluginCategory::Bundled => "Bundled",
+            PluginCategory::System => "System",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -451,6 +553,8 @@ struct PluginCandidate {
     kind: PluginKind,
     clap_id: Option<String>,
     display: String,
+    category: PluginCategory,
+    instrument_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,6 +690,9 @@ struct TrackAudioState {
     automation_lanes: Arc<Mutex<Vec<AutomationLane>>>,
     pending_param_changes: Arc<Mutex<Vec<PendingParamChange>>>,
     silent_blocks: Arc<AtomicU32>,
+    treesynth_state: Option<Arc<Mutex<TreeSynthState>>>,
+    treesynth_runtime: Arc<Mutex<TreeSynthRuntime>>,
+    treesynth_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -754,6 +861,17 @@ impl TrackAudioState {
             automation_lanes: Arc::new(Mutex::new(track.automation_lanes.clone())),
             pending_param_changes: Arc::new(Mutex::new(Vec::new())),
             silent_blocks: Arc::new(AtomicU32::new(0)),
+            treesynth_state: Some(Arc::new(Mutex::new(
+                match &track.treesynth {
+                    Some(ts) if !ts.samples.is_empty() => ts.clone(),
+                    _ => {
+                        eprintln!("[TreeSynth Render Debug] from_track: samples is empty, using default");
+                        TreeSynthState::default()
+                    }
+                }
+            ))),
+            treesynth_runtime: Arc::new(Mutex::new(TreeSynthRuntime::new())),
+            treesynth_enabled: Arc::new(AtomicBool::new(track.treesynth.is_some())),
         }
     }
 
@@ -774,6 +892,25 @@ impl TrackAudioState {
             *bypass = track.effect_bypass.clone();
         }
     }
+
+    fn sync_treesynth(&self, track: &Track, enabled: bool) {
+        if let (Some(state), Some(treesynth_arc)) = (track.treesynth.clone(), self.treesynth_state.as_ref()) {
+            if !state.samples.is_empty() {
+                if let Ok(mut treesynth) = treesynth_arc.lock() {
+                    *treesynth = state;
+                }
+            } else {
+                eprintln!("[TreeSynth Render Debug] sync_treesynth: samples is empty, not updating state");
+            }
+        }
+        self.treesynth_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            if let Ok(mut runtime) = self.treesynth_runtime.lock() {
+                runtime.voices.clear();
+                runtime.sequence_index = 0;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -789,12 +926,270 @@ struct AudioClipData {
     sample_rate: u32,
 }
 
+struct AudioAnalysis {
+    bpm: Option<f32>,
+    key: Option<(u8, bool)>,
+    fine_pitch_cents: Option<f32>,
+}
+
+struct AudioAnalysisRequest {
+    clip_id: usize,
+    path: PathBuf,
+}
+
+struct AudioAnalysisResult {
+    clip_id: usize,
+    path: PathBuf,
+    analysis: Option<AudioAnalysis>,
+}
+
+#[cfg(all(windows, has_rubberband))]
+#[allow(non_upper_case_globals)]
+mod rubberband {
+    use std::os::raw::{c_double, c_float, c_int, c_uint};
+
+    #[repr(C)]
+    pub struct RubberBandState_ {
+        _private: [u8; 0],
+    }
+
+    pub type RubberBandState = *mut RubberBandState_;
+    pub type RubberBandLiveState = *mut std::ffi::c_void;
+    pub type RubberBandOptions = c_int;
+
+    pub const RubberBandOptionProcessRealTime: RubberBandOptions = 0x00000001;
+    pub const RubberBandOptionFormantShifted: RubberBandOptions = 0x00000000;
+    pub const RubberBandOptionFormantPreserved: RubberBandOptions = 0x01000000;
+    pub const RubberBandOptionPitchHighQuality: RubberBandOptions = 0x02000000;
+
+    #[link(name = "rubberband-library", kind = "static")]
+    extern "C" {
+        pub fn rubberband_new(
+            sample_rate: c_uint,
+            channels: c_uint,
+            options: RubberBandOptions,
+            initial_time_ratio: c_double,
+            initial_pitch_scale: c_double,
+        ) -> RubberBandState;
+        pub fn rubberband_delete(state: RubberBandState);
+        pub fn rubberband_reset(state: RubberBandState);
+        pub fn rubberband_set_time_ratio(state: RubberBandState, ratio: c_double);
+        pub fn rubberband_set_pitch_scale(state: RubberBandState, scale: c_double);
+        pub fn rubberband_set_formant_option(state: RubberBandState, options: RubberBandOptions);
+        pub fn rubberband_set_formant_scale(state: RubberBandState, scale: c_double);
+        pub fn rubberband_get_start_delay(state: RubberBandState) -> c_uint;
+        pub fn rubberband_get_samples_required(state: RubberBandState) -> c_uint;
+        pub fn rubberband_process(
+            state: RubberBandState,
+            input: *const *const c_float,
+            samples: c_uint,
+            final_block: c_int,
+        );
+        pub fn rubberband_available(state: RubberBandState) -> c_int;
+        pub fn rubberband_retrieve(
+            state: RubberBandState,
+            output: *const *mut c_float,
+            samples: c_uint,
+        ) -> c_uint;
+
+        pub fn rubberband_live_new(
+            sample_rate: c_uint,
+            channels: c_uint,
+            options: RubberBandOptions,
+        ) -> RubberBandLiveState;
+        pub fn rubberband_live_delete(state: RubberBandLiveState);
+        pub fn rubberband_live_reset(state: RubberBandLiveState);
+        pub fn rubberband_live_set_pitch_scale(state: RubberBandLiveState, scale: c_double);
+        pub fn rubberband_live_set_formant_scale(state: RubberBandLiveState, scale: c_double);
+        pub fn rubberband_live_set_formant_option(state: RubberBandLiveState, options: RubberBandOptions);
+        pub fn rubberband_live_get_block_size(state: RubberBandLiveState) -> c_uint;
+        pub fn rubberband_live_shift(
+            state: RubberBandLiveState,
+            input: *const *const c_float,
+            output: *const *mut c_float,
+        );
+    }
+}
+
+#[cfg(any(not(windows), not(has_rubberband)))]
+#[allow(non_upper_case_globals)]
+mod rubberband {
+    pub type RubberBandState = *mut std::ffi::c_void;
+    pub type RubberBandLiveState = *mut std::ffi::c_void;
+    pub type RubberBandOptions = i32;
+    pub const RubberBandOptionProcessRealTime: RubberBandOptions = 0;
+    pub const RubberBandOptionFormantShifted: RubberBandOptions = 0;
+    pub const RubberBandOptionFormantPreserved: RubberBandOptions = 0;
+    pub const RubberBandOptionPitchHighQuality: RubberBandOptions = 0;
+}
+
+struct RubberBandClipState {
+    #[cfg(all(windows, has_rubberband))]
+    state: rubberband::RubberBandLiveState,
+    channels: usize,
+    sample_rate: u32,
+    pitch_scale: f64,
+    formant_preserve: bool,
+    formant_scale: f64,
+    input_buffers: Vec<Vec<f32>>,
+    output_buffers: Vec<Vec<f32>>,
+    needs_reposition: bool,
+    #[cfg(all(windows, has_rubberband))]
+    block_size: usize,
+}
+
+impl RubberBandClipState {
+    #[cfg(all(windows, has_rubberband))]
+    fn new(
+        sample_rate: u32,
+        channels: usize,
+        pitch_scale: f64,
+        formant_preserve: bool,
+        formant_scale: f64,
+    ) -> Self {
+        let options = rubberband::RubberBandOptionPitchHighQuality;
+        let state = unsafe { rubberband::rubberband_live_new(sample_rate, channels as u32, options) };
+        let block_size = if state.is_null() {
+            256
+        } else {
+            unsafe { rubberband::rubberband_live_get_block_size(state) as usize }
+        }
+        .max(64);
+        if !state.is_null() {
+            let formant_option = if formant_preserve {
+                rubberband::RubberBandOptionFormantPreserved
+            } else {
+                rubberband::RubberBandOptionFormantShifted
+            };
+            unsafe {
+                rubberband::rubberband_live_set_pitch_scale(state, pitch_scale);
+                rubberband::rubberband_live_set_formant_option(state, formant_option);
+                rubberband::rubberband_live_set_formant_scale(state, formant_scale);
+            }
+        }
+        Self {
+            state,
+            channels,
+            sample_rate,
+            pitch_scale,
+            formant_preserve,
+            formant_scale,
+            input_buffers: vec![Vec::new(); channels.max(1)],
+            output_buffers: vec![Vec::new(); channels.max(1)],
+            needs_reposition: false,
+            block_size,
+        }
+    }
+
+    #[cfg(any(not(windows), not(has_rubberband)))]
+    fn new(
+        sample_rate: u32,
+        channels: usize,
+        pitch_scale: f64,
+        formant_preserve: bool,
+        formant_scale: f64,
+    ) -> Self {
+        Self {
+            channels,
+            sample_rate,
+            pitch_scale,
+            formant_preserve,
+            formant_scale,
+            input_buffers: vec![Vec::new(); channels.max(1)],
+            output_buffers: vec![Vec::new(); channels.max(1)],
+            needs_reposition: false,
+            block_size: 256,
+        }
+    }
+
+    #[cfg(all(windows, has_rubberband))]
+    fn reset_stream(&mut self) {
+        if !self.state.is_null() {
+            unsafe {
+                rubberband::rubberband_live_reset(self.state);
+            }
+        }
+    }
+
+    #[cfg(any(not(windows), not(has_rubberband)))]
+    fn reset_stream(&mut self) {
+    }
+
+    #[cfg(all(windows, has_rubberband))]
+    fn ensure_config(
+        &mut self,
+        sample_rate: u32,
+        channels: usize,
+        pitch_scale: f64,
+        formant_preserve: bool,
+        formant_scale: f64,
+    ) {
+        if self.sample_rate != sample_rate || self.channels != channels || self.state.is_null() {
+            if !self.state.is_null() {
+                unsafe { rubberband::rubberband_live_delete(self.state) };
+            }
+            *self = Self::new(sample_rate, channels, pitch_scale, formant_preserve, formant_scale);
+            return;
+        }
+        if (self.pitch_scale - pitch_scale).abs() > f64::EPSILON {
+            self.pitch_scale = pitch_scale;
+            unsafe { rubberband::rubberband_live_set_pitch_scale(self.state, pitch_scale) };
+        }
+        if self.formant_preserve != formant_preserve {
+            self.formant_preserve = formant_preserve;
+            let option = if formant_preserve {
+                rubberband::RubberBandOptionFormantPreserved
+            } else {
+                rubberband::RubberBandOptionFormantShifted
+            };
+            unsafe { rubberband::rubberband_live_set_formant_option(self.state, option) };
+        }
+        if (self.formant_scale - formant_scale).abs() > f64::EPSILON {
+            self.formant_scale = formant_scale;
+            unsafe { rubberband::rubberband_live_set_formant_scale(self.state, formant_scale) };
+        }
+    }
+
+    #[cfg(any(not(windows), not(has_rubberband)))]
+    fn ensure_config(
+        &mut self,
+        sample_rate: u32,
+        channels: usize,
+        pitch_scale: f64,
+        formant_preserve: bool,
+        formant_scale: f64,
+    ) {
+        self.sample_rate = sample_rate;
+        self.channels = channels;
+        self.pitch_scale = pitch_scale;
+        self.formant_preserve = formant_preserve;
+        self.formant_scale = formant_scale;
+        self.needs_reposition = true;
+    }
+}
+
+#[cfg(all(windows, has_rubberband))]
+unsafe impl Send for RubberBandClipState {}
+
+#[cfg(all(windows, has_rubberband))]
+unsafe impl Sync for RubberBandClipState {}
+
+#[cfg(all(windows, has_rubberband))]
+impl Drop for RubberBandClipState {
+    fn drop(&mut self) {
+        if !self.state.is_null() {
+            unsafe { rubberband::rubberband_live_delete(self.state) };
+        }
+    }
+}
+
 struct AudioClipCache {
     entries: HashMap<String, Arc<AudioClipData>>,
     order: VecDeque<String>,
     bytes: usize,
     max_bytes: usize,
     max_entries: usize,
+    stretchers: HashMap<usize, Arc<Mutex<RubberBandClipState>>>,
 }
 
 impl AudioClipCache {
@@ -805,6 +1200,7 @@ impl AudioClipCache {
             bytes: 0,
             max_bytes,
             max_entries,
+            stretchers: HashMap::new(),
         }
     }
 
@@ -836,6 +1232,37 @@ impl AudioClipCache {
         self.entries.clear();
         self.order.clear();
         self.bytes = 0;
+        self.stretchers.clear();
+    }
+
+    fn get_or_create_stretcher(
+        &mut self,
+        clip_id: usize,
+        sample_rate: u32,
+        channels: usize,
+        pitch_scale: f64,
+        formant_preserve: bool,
+        formant_scale: f64,
+    ) -> Arc<Mutex<RubberBandClipState>> {
+        let entry = self.stretchers.entry(clip_id).or_insert_with(|| {
+            Arc::new(Mutex::new(RubberBandClipState::new(
+                sample_rate,
+                channels,
+                pitch_scale,
+                formant_preserve,
+                formant_scale,
+            )))
+        });
+        if let Ok(mut guard) = entry.lock() {
+            guard.ensure_config(
+                sample_rate,
+                channels,
+                pitch_scale,
+                formant_preserve,
+                formant_scale,
+            );
+        }
+        entry.clone()
     }
 
     fn len(&self) -> usize {
@@ -913,6 +1340,7 @@ impl AudioRuntimeStats {
 
 #[derive(Clone)]
 struct AudioClipRender {
+    clip_id: usize,
     path: String,
     track_index: usize,
     start_samples: u64,
@@ -920,8 +1348,12 @@ struct AudioClipRender {
     offset_samples: u64,
     gain: f32,
     time_mul: f32,
+    pitch_semitones: f32,
+    stretch_mode: AudioStretchMode,
+    formant_scale: f32,
 }
 
+#[derive(Clone)]
 struct RenderPlan {
     path: String,
     sample_rate: u32,
@@ -1179,6 +1611,8 @@ struct DawApp {
     metadata_genre: String,
     metadata_year: String,
     metadata_comment: String,
+    project_key: Option<u8>,
+    project_key_minor: bool,
     tracks: Vec<Track>,
     selected_clip: Option<usize>,
     selected_track: Option<usize>,
@@ -1302,6 +1736,9 @@ struct DawApp {
     waveform_len_seconds_cache_order: RefCell<VecDeque<String>>,
     audio_clip_cache: Arc<Mutex<AudioClipCache>>,
     audio_clip_timeline: Arc<Mutex<Vec<AudioClipRender>>>,
+    analysis_sender: Option<Sender<AudioAnalysisRequest>>,
+    analysis_receiver: Option<Receiver<AudioAnalysisResult>>,
+    analysis_pending: HashSet<usize>,
     audio_preview_stream: Option<OutputStream>,
     audio_preview_sink: Option<Sink>,
     audio_preview_loop: bool,
@@ -1489,6 +1926,7 @@ enum MainTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
+    General,
     Audio,
     Midi,
     Theme,
@@ -1603,12 +2041,133 @@ impl Default for DawApp {
                 audio_pitch_semitones: 0.0,
                 audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
             },
-            Clip { id: 2, track: 1, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "CatSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
-            Clip { id: 3, track: 2, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "SannySynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
-            Clip { id: 4, track: 3, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "DogSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
-            Clip { id: 5, track: 4, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "LingSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
-            Clip { id: 6, track: 5, start_beats: 0.0, length_beats: 8.0, is_midi: true, midi_notes: Vec::new(), midi_source_beats: Some(8.0), link_id: None, name: "MiceSynth".to_string(), audio_path: None, audio_source_beats: None, audio_offset_beats: 0.0, audio_gain: 1.0, audio_pitch_semitones: 0.0, audio_stretch_mode: AudioStretchMode::Stretch, audio_time_mul: 1.0 },
+            Clip {
+                id: 2,
+                track: 1,
+                start_beats: 0.0,
+                length_beats: 8.0,
+                is_midi: true,
+                midi_notes: Vec::new(),
+                midi_source_beats: Some(8.0),
+                link_id: None,
+                name: "CatSynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
+                audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            },
+            Clip {
+                id: 3,
+                track: 2,
+                start_beats: 0.0,
+                length_beats: 8.0,
+                is_midi: true,
+                midi_notes: Vec::new(),
+                midi_source_beats: Some(8.0),
+                link_id: None,
+                name: "SannySynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
+                audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            },
+            Clip {
+                id: 4,
+                track: 3,
+                start_beats: 0.0,
+                length_beats: 8.0,
+                is_midi: true,
+                midi_notes: Vec::new(),
+                midi_source_beats: Some(8.0),
+                link_id: None,
+                name: "DogSynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
+                audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            },
+            Clip {
+                id: 5,
+                track: 4,
+                start_beats: 0.0,
+                length_beats: 8.0,
+                is_midi: true,
+                midi_notes: Vec::new(),
+                midi_source_beats: Some(8.0),
+                link_id: None,
+                name: "LingSynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
+                audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            },
+            Clip {
+                id: 6,
+                track: 5,
+                start_beats: 0.0,
+                length_beats: 8.0,
+                is_midi: true,
+                midi_notes: Vec::new(),
+                midi_source_beats: Some(8.0),
+                link_id: None,
+                name: "MiceSynth".to_string(),
+                audio_path: None,
+                audio_source_beats: None,
+                audio_offset_beats: 0.0,
+                audio_gain: 1.0,
+                audio_pitch_semitones: 0.0,
+                audio_stretch_mode: AudioStretchMode::Stretch,
+                audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            },
         ];
 
         let tracks = vec![
@@ -1636,6 +2195,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
             Track {
                 name: "CatSynth".to_string(),
@@ -1661,6 +2221,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
             Track {
                 name: "SannySynth".to_string(),
@@ -1686,6 +2247,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
             Track {
                 name: "DogSynth".to_string(),
@@ -1711,6 +2273,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
             Track {
                 name: "LingSynth".to_string(),
@@ -1736,6 +2299,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
             Track {
                 name: "MiceSynth".to_string(),
@@ -1761,6 +2325,7 @@ impl Default for DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
+                treesynth: None,
             },
         ];
 
@@ -1788,6 +2353,8 @@ impl Default for DawApp {
             metadata_genre: String::new(),
             metadata_year: String::new(),
             metadata_comment: String::new(),
+            project_key: None,
+            project_key_minor: false,
             tracks,
             selected_clip: initial_selected_clip,
             selected_track: Some(0),
@@ -1930,6 +2497,9 @@ impl Default for DawApp {
                 AUDIO_CLIP_CACHE_MAX_ENTRIES,
             ))),
             audio_clip_timeline: Arc::new(Mutex::new(Vec::new())),
+            analysis_sender: None,
+            analysis_receiver: None,
+            analysis_pending: HashSet::new(),
             audio_preview_stream: None,
             audio_preview_sink: None,
             audio_preview_loop: false,
@@ -2013,6 +2583,7 @@ impl eframe::App for DawApp {
             }
         }
         self.poll_license_job();
+        self.poll_audio_analysis_jobs();
         self.sync_last_param_changes();
         let viewport = ctx.input(|i| i.viewport().clone());
         let viewport_has_size = viewport
@@ -2737,6 +3308,17 @@ impl DawApp {
 
     fn sync_track_audio_states(&mut self) {
         self.rebuild_all_track_midi_notes();
+        for track in &mut self.tracks {
+            if track
+                .instrument_path
+                .as_deref()
+                .map(Self::is_treesynth_path)
+                .unwrap_or(false)
+                && track.treesynth.is_none()
+            {
+                track.treesynth = Some(TreeSynthState::default());
+            }
+        }
         if self.track_audio.len() != self.tracks.len() {
             self.track_audio = self
                 .tracks
@@ -2749,6 +3331,12 @@ impl DawApp {
                     state.sync_notes(track);
                     state.sync_automation(track);
                     state.sync_effect_bypass(track);
+                    let enabled = track
+                        .instrument_path
+                        .as_deref()
+                        .map(Self::is_treesynth_path)
+                        .unwrap_or(false);
+                    state.sync_treesynth(track, enabled);
                 }
             }
         }
@@ -2863,7 +3451,11 @@ impl DawApp {
             return Some(host.clone());
         }
         let kind = Self::plugin_kind_from_path(&path);
+        if kind == PluginKind::Native {
+            return None;
+        }
         let host = match kind {
+            PluginKind::Native => None,
             PluginKind::Vst3 => {
                 let host = vst3::Vst3Host::load(
                     &path,
@@ -2872,7 +3464,7 @@ impl DawApp {
                     channels.max(1),
                 )
                 .ok()?;
-                PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))
+                Some(PluginHostHandle::Vst3(Arc::new(Mutex::new(host))))
             }
             PluginKind::Clap => {
                 let clap_id = self
@@ -2892,9 +3484,10 @@ impl DawApp {
                     channels.max(1),
                 )
                 .ok()?;
-                PluginHostHandle::Clap(Arc::new(Mutex::new(host)))
+                Some(PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
             }
         };
+        let host = host?;
         state.host = Some(host.clone());
         Some(host)
     }
@@ -2918,6 +3511,7 @@ impl DawApp {
             for (slot, path) in paths.iter().enumerate() {
                 let kind = Self::plugin_kind_from_path(path);
                 let host = match kind {
+                    PluginKind::Native => None,
                     PluginKind::Vst3 => vst3::Vst3Host::load_with_input(
                         path,
                         self.settings.sample_rate as f64,
@@ -4031,13 +4625,486 @@ impl DawApp {
         }
     }
 
-    fn audio_playback_time_mul(clip: &Clip) -> f32 {
+    fn key_pitch_offset(target_key: Option<u8>, source_key: Option<u8>) -> f32 {
+        let (Some(target_key), Some(source_key)) = (target_key, source_key) else {
+            return 0.0;
+        };
+        let target = (target_key % 12) as i8;
+        let source = (source_key % 12) as i8;
+        let mut diff = target - source;
+        diff = ((diff + 6).rem_euclid(12)) - 6;
+        diff as f32
+    }
+
+    fn clip_effective_pitch_semitones(&self, clip: &Clip) -> f32 {
+        let target_key = clip.audio_key.or(self.project_key);
+        let source_key = clip.audio_key_source.or(clip.audio_key);
+        let key_offset = Self::key_pitch_offset(target_key, source_key);
+        clip.audio_pitch_semitones + (clip.audio_fine_pitch_cents / 100.0) + key_offset
+    }
+
+    fn audio_playback_time_mul(clip: &Clip, pitch_semitones: f32) -> f32 {
         let base = clip.audio_time_mul.max(0.01);
         if clip.audio_stretch_mode == AudioStretchMode::Speed {
-            let ratio = 2.0f32.powf(clip.audio_pitch_semitones / 12.0);
+            let ratio = 2.0f32.powf(pitch_semitones / 12.0);
             (base / ratio).max(0.01)
         } else {
             base
+        }
+    }
+
+    fn draw_audio_analysis_controls(
+        ui: &mut egui::Ui,
+        clip: &mut Clip,
+        clip_path: Option<&Path>,
+        key_display_format: &str,
+        tempo_bpm: f32,
+        analyzing: bool,
+    ) -> (bool, bool) {
+        let mut changed = false;
+        ui.add_space(6.0);
+        ui.label("Analysis");
+        ui.horizontal(|ui| {
+            ui.label("Key");
+            let display = Self::format_key_display_with(
+                key_display_format,
+                clip.audio_key,
+                clip.audio_key_minor,
+            );
+            ui.label(display);
+            if ui.button("-").clicked() {
+                Self::nudge_clip_key(clip, -1);
+                changed = true;
+            }
+            if ui.button("+").clicked() {
+                Self::nudge_clip_key(clip, 1);
+                changed = true;
+            }
+            if ui.checkbox(&mut clip.audio_key_minor, "Minor").changed() {
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("BPM");
+            let mut bpm = clip.audio_bpm.unwrap_or(tempo_bpm.max(1.0));
+            if ui
+                .add(egui::DragValue::new(&mut bpm).speed(0.1).clamp_range(60.0..=200.0))
+                .changed()
+            {
+                Self::apply_clip_bpm(clip, bpm, clip_path);
+                changed = true;
+            }
+            if ui
+                .add_enabled(clip.audio_bpm.is_some(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                clip.audio_bpm = None;
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Fine Pitch");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut clip.audio_fine_pitch_cents)
+                        .speed(0.5)
+                        .clamp_range(-100.0..=100.0),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            ui.label("cents");
+        });
+        let analyze_label = if analyzing { "Analyzing..." } else { "Analyze" };
+        let analyze_clicked = ui
+            .add_enabled(!analyzing, egui::Button::new(analyze_label))
+            .clicked();
+        (analyze_clicked && clip_path.is_some(), changed)
+    }
+
+    fn format_key_display(&self, key: Option<u8>, minor: bool) -> String {
+        Self::format_key_display_with(self.settings.key_display_format.as_str(), key, minor)
+    }
+
+    fn format_key_display_with(format: &str, key: Option<u8>, minor: bool) -> String {
+        let Some(key) = key else {
+            return "Unknown".to_string();
+        };
+        let key = key % 12;
+        match format {
+            "traditional" => Self::key_name_traditional(key, minor),
+            "both" => {
+                let cam = Self::key_name_camelot(key, minor);
+                let trad = Self::key_name_traditional(key, minor);
+                format!("{cam} / {trad}")
+            }
+            _ => Self::key_name_camelot(key, minor).to_string(),
+        }
+    }
+
+    fn key_name_traditional(key: u8, minor: bool) -> String {
+        const NAMES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let name = NAMES[key as usize];
+        if minor {
+            format!("{name}m")
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn key_name_camelot(key: u8, minor: bool) -> &'static str {
+        const MAJOR: [&str; 12] = [
+            "8B", "3B", "10B", "5B", "12B", "7B", "2B", "9B", "4B", "11B", "6B",
+            "1B",
+        ];
+        const MINOR: [&str; 12] = [
+            "5A", "12A", "7A", "2A", "9A", "4A", "11A", "6A", "1A", "8A", "3A",
+            "10A",
+        ];
+        if minor {
+            MINOR[key as usize]
+        } else {
+            MAJOR[key as usize]
+        }
+    }
+
+    fn analyze_audio_clip(&self, path: &Path) -> Option<AudioAnalysis> {
+        Self::analyze_audio_clip_path(path)
+    }
+
+    fn analyze_audio_clip_path(path: &Path) -> Option<AudioAnalysis> {
+        let (samples, channels, sample_rate) = Self::decode_audio_samples(path)?;
+        if samples.is_empty() || sample_rate == 0 || channels == 0 {
+            return None;
+        }
+        let mono = Self::downmix_to_mono(&samples, channels);
+        let bpm = Self::estimate_bpm(&mono, sample_rate);
+        let key = Self::estimate_key(&mono, sample_rate);
+        let fine_pitch_cents = Self::estimate_fine_pitch_cents(&mono, sample_rate);
+        Some(AudioAnalysis {
+            bpm,
+            key,
+            fine_pitch_cents,
+        })
+    }
+
+    fn apply_audio_analysis_to_clip(clip: &mut Clip, path: Option<&Path>, analysis: AudioAnalysis) {
+        if let Some((key, minor)) = analysis.key {
+            clip.audio_key = Some(key);
+            clip.audio_key_minor = minor;
+            clip.audio_key_source = Some(key);
+        }
+        if let Some(bpm) = analysis.bpm {
+            let bpm = bpm.clamp(60.0, 200.0);
+            clip.audio_bpm = Some(bpm);
+            if let Some(path) = path {
+                if let Some(seconds) = Self::audio_length_seconds(path) {
+                    clip.audio_source_beats = Some((seconds * bpm / 60.0).max(0.001));
+                }
+            }
+        }
+        if let Some(cents) = analysis.fine_pitch_cents {
+            clip.audio_fine_pitch_cents = cents.clamp(-100.0, 100.0);
+        }
+    }
+
+    fn apply_clip_bpm(clip: &mut Clip, bpm: f32, path: Option<&Path>) {
+        let bpm = bpm.clamp(60.0, 200.0);
+        clip.audio_bpm = Some(bpm);
+        if let Some(path) = path {
+            if let Some(seconds) = Self::audio_length_seconds(path) {
+                clip.audio_source_beats = Some((seconds * bpm / 60.0).max(0.001));
+            }
+        }
+    }
+
+    fn nudge_clip_key(clip: &mut Clip, delta: i8) {
+        if clip.audio_key_source.is_none() {
+            clip.audio_key_source = clip.audio_key;
+        }
+        let key = clip.audio_key.get_or_insert(0);
+        let next = ((*key as i8) + delta).rem_euclid(12) as u8;
+        *key = next;
+    }
+
+    fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+        if channels <= 1 {
+            return samples.to_vec();
+        }
+        let mut mono = Vec::with_capacity(samples.len() / channels.max(1));
+        for frame in samples.chunks_exact(channels) {
+            let sum: f32 = frame.iter().copied().sum();
+            mono.push(sum / channels as f32);
+        }
+        mono
+    }
+
+    fn estimate_bpm(samples: &[f32], sample_rate: u32) -> Option<f32> {
+        if samples.len() < sample_rate as usize {
+            return None;
+        }
+        let hop = 1024usize;
+        let frame = 2048usize;
+        if samples.len() <= frame {
+            return None;
+        }
+        let mut envelope = Vec::new();
+        let mut idx = 0usize;
+        while idx + frame <= samples.len() {
+            let mut sum = 0.0f32;
+            for sample in &samples[idx..idx + frame] {
+                sum += sample.abs();
+            }
+            envelope.push(sum / frame as f32);
+            idx += hop;
+        }
+        if envelope.len() < 8 {
+            return None;
+        }
+        let mean = envelope.iter().copied().sum::<f32>() / envelope.len() as f32;
+        for value in &mut envelope {
+            *value = (*value - mean).max(0.0);
+        }
+        let min_bpm = 60.0f32;
+        let max_bpm = 200.0f32;
+        let frame_rate = sample_rate as f32 / hop as f32;
+        let min_lag = ((frame_rate * 60.0) / max_bpm).round().max(1.0) as usize;
+        let max_lag = ((frame_rate * 60.0) / min_bpm).round() as usize;
+        if max_lag <= min_lag || max_lag >= envelope.len() {
+            return None;
+        }
+        let mut best_lag = 0usize;
+        let mut best_score = 0.0f32;
+        for lag in min_lag..=max_lag {
+            let mut score = 0.0f32;
+            let limit = envelope.len().saturating_sub(lag);
+            for i in 0..limit {
+                score += envelope[i] * envelope[i + lag];
+            }
+            if score > best_score {
+                best_score = score;
+                best_lag = lag;
+            }
+        }
+        if best_lag == 0 {
+            return None;
+        }
+        let bpm = (60.0 * frame_rate) / best_lag as f32;
+        Some(bpm)
+    }
+
+    fn estimate_key(samples: &[f32], sample_rate: u32) -> Option<(u8, bool)> {
+        if samples.len() < 4096 || sample_rate == 0 {
+            return None;
+        }
+        let fft_size = 4096usize;
+        let hop = 2048usize;
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let mut buffer = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
+        let mut window = Vec::with_capacity(fft_size);
+        let denom = (fft_size - 1) as f32;
+        for i in 0..fft_size {
+            let phase = 2.0 * std::f32::consts::PI * (i as f32 / denom);
+            window.push(0.5 - 0.5 * phase.cos());
+        }
+        let mut chroma = [0.0f32; 12];
+        let mut pos = 0usize;
+        while pos + fft_size <= samples.len() {
+            for i in 0..fft_size {
+                buffer[i].re = samples[pos + i] * window[i];
+                buffer[i].im = 0.0;
+            }
+            fft.process(&mut buffer);
+            let half = fft_size / 2;
+            for bin in 1..half {
+                let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
+                if freq < 30.0 || freq > 5000.0 {
+                    continue;
+                }
+                let mag = buffer[bin].norm();
+                if mag <= 0.0 {
+                    continue;
+                }
+                let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+                let pc = (midi.round() as i32).rem_euclid(12) as usize;
+                chroma[pc] += mag;
+            }
+            pos += hop;
+        }
+        let sum: f32 = chroma.iter().copied().sum();
+        if sum <= 0.0 {
+            return None;
+        }
+        for value in &mut chroma {
+            *value /= sum;
+        }
+        let major_template: [f32; 12] = [
+            6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+        ];
+        let minor_template: [f32; 12] = [
+            6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+        ];
+        let mut best_score = -1.0f32;
+        let mut best_key = 0u8;
+        let mut best_minor = false;
+        for key in 0..12 {
+            let mut major_score = 0.0f32;
+            let mut minor_score = 0.0f32;
+            for i in 0..12 {
+                let idx = (i + key) % 12;
+                major_score += major_template[i] * chroma[idx];
+                minor_score += minor_template[i] * chroma[idx];
+            }
+            if major_score > best_score {
+                best_score = major_score;
+                best_key = key as u8;
+                best_minor = false;
+            }
+            if minor_score > best_score {
+                best_score = minor_score;
+                best_key = key as u8;
+                best_minor = true;
+            }
+        }
+        Some((best_key, best_minor))
+    }
+
+    fn estimate_fine_pitch_cents(samples: &[f32], sample_rate: u32) -> Option<f32> {
+        if samples.len() < 2048 || sample_rate == 0 {
+            return None;
+        }
+        let mut fft_size = 4096usize;
+        if samples.len() < fft_size {
+            fft_size = 2048usize.min(samples.len());
+        }
+        if fft_size < 1024 {
+            return None;
+        }
+        let hop = (fft_size / 2).max(512);
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let mut buffer = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
+        let mut window = Vec::with_capacity(fft_size);
+        let denom = (fft_size - 1) as f32;
+        for i in 0..fft_size {
+            let phase = 2.0 * std::f32::consts::PI * (i as f32 / denom);
+            window.push(0.5 - 0.5 * phase.cos());
+        }
+        let mut weighted = 0.0f32;
+        let mut total = 0.0f32;
+        let mut pos = 0usize;
+        while pos + fft_size <= samples.len() {
+            for i in 0..fft_size {
+                buffer[i].re = samples[pos + i] * window[i];
+                buffer[i].im = 0.0;
+            }
+            fft.process(&mut buffer);
+            let half = fft_size / 2;
+            for bin in 1..half {
+                let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
+                if freq < 50.0 || freq > 2000.0 {
+                    continue;
+                }
+                let mag = buffer[bin].norm();
+                if mag <= 0.0 {
+                    continue;
+                }
+                let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+                let cents = (midi - midi.round()) * 100.0;
+                weighted += cents * mag;
+                total += mag;
+            }
+            pos += hop;
+        }
+        if total <= 0.0 {
+            return None;
+        }
+        Some((weighted / total).clamp(-100.0, 100.0))
+    }
+
+    fn ensure_audio_analysis_worker(&mut self) {
+        if self.analysis_sender.is_some() {
+            return;
+        }
+        let (req_tx, req_rx) = mpsc::channel::<AudioAnalysisRequest>();
+        let (res_tx, res_rx) = mpsc::channel::<AudioAnalysisResult>();
+        thread::spawn(move || {
+            while let Ok(req) = req_rx.recv() {
+                let analysis = Self::analyze_audio_clip_path(&req.path);
+                let _ = res_tx.send(AudioAnalysisResult {
+                    clip_id: req.clip_id,
+                    path: req.path,
+                    analysis,
+                });
+            }
+        });
+        self.analysis_sender = Some(req_tx);
+        self.analysis_receiver = Some(res_rx);
+    }
+
+    fn enqueue_audio_analysis(&mut self, clip_id: usize, path: PathBuf) {
+        if self.analysis_pending.contains(&clip_id) {
+            return;
+        }
+        self.ensure_audio_analysis_worker();
+        if let Some(sender) = self.analysis_sender.as_ref() {
+            if sender
+                .send(AudioAnalysisRequest { clip_id, path })
+                .is_ok()
+            {
+                self.analysis_pending.insert(clip_id);
+                self.status = "Analyzing clip...".to_string();
+            }
+        }
+    }
+
+    fn poll_audio_analysis_jobs(&mut self) {
+        let Some(receiver) = self.analysis_receiver.as_ref() else {
+            return;
+        };
+        while let Ok(result) = receiver.try_recv() {
+            self.analysis_pending.remove(&result.clip_id);
+            let Some((ti, ci)) = self.find_clip_indices_by_id(result.clip_id) else {
+                continue;
+            };
+            let current_path = self
+                .tracks
+                .get(ti)
+                .and_then(|t| t.clips.get(ci))
+                .and_then(|clip| self.resolve_clip_audio_path(clip));
+            let matches_path = current_path
+                .as_ref()
+                .map(|p| Self::paths_equal(p, &result.path))
+                .unwrap_or(false);
+            if !matches_path {
+                continue;
+            }
+            if let Some(analysis) = result.analysis {
+                if let Some(clip) = self
+                    .tracks
+                    .get_mut(ti)
+                    .and_then(|t| t.clips.get_mut(ci))
+                {
+                    Self::apply_audio_analysis_to_clip(clip, Some(&result.path), analysis);
+                    self.status = "Analysis complete".to_string();
+                }
+            } else {
+                self.status = "Analyze failed: unsupported audio file".to_string();
+            }
+        }
+    }
+
+    fn refresh_audio_clip_timeline_if_running(&mut self) {
+        if !self.audio_running {
+            return;
+        }
+        let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
+        if let Ok(mut guard) = self.audio_clip_timeline.lock() {
+            *guard = timeline;
         }
     }
 
@@ -4052,7 +5119,8 @@ impl DawApp {
         if clip.is_midi {
             return Self::midi_loop_len_for_clip(clip);
         }
-        let time_mul = Self::audio_playback_time_mul(clip);
+        let pitch = self.clip_effective_pitch_semitones(clip);
+        let time_mul = Self::audio_playback_time_mul(clip, pitch);
         let source_beats = self.audio_source_beats(clip)?;
         let loop_len = source_beats * time_mul;
         if loop_len > 0.0 {
@@ -4076,7 +5144,8 @@ impl DawApp {
         if let Some(waveform) = waveform {
             let count = waveform.len().max(1);
             let step = rect.width() / count as f32;
-            let time_mul = Self::audio_playback_time_mul(clip);
+            let pitch = self.clip_effective_pitch_semitones(clip);
+            let time_mul = Self::audio_playback_time_mul(clip, pitch);
             let clip_len = clip.length_beats.max(0.001);
             let source_beats = self
                 .get_waveform_seconds_for_clip(clip)
@@ -4538,14 +5607,19 @@ impl DawApp {
                 let start_samples = self.beats_to_samples(clip.start_beats, sample_rate);
                 let length_samples = self.beats_to_samples(clip.length_beats, sample_rate).max(1);
                 let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
+                let pitch = self.clip_effective_pitch_semitones(clip);
                 renders.push(AudioClipRender {
+                    clip_id: clip.id,
                     path: path_str,
                     track_index,
                     start_samples,
                     length_samples,
                     offset_samples,
                     gain: clip.audio_gain,
-                    time_mul: Self::audio_playback_time_mul(clip),
+                    time_mul: Self::audio_playback_time_mul(clip, pitch),
+                    pitch_semitones: pitch,
+                    stretch_mode: clip.audio_stretch_mode,
+                    formant_scale: clip.audio_formant_scale,
                 });
             }
         }
@@ -4577,14 +5651,19 @@ impl DawApp {
                 let length_samples = self.beats_to_samples(clip.length_beats, sample_rate).max(1);
                 let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
                 let render_track_index = if track_filter.is_some() { 0 } else { track_index };
+                let pitch = self.clip_effective_pitch_semitones(clip);
                 renders.push(AudioClipRender {
+                    clip_id: clip.id,
                     path: path_str.clone(),
                     track_index: render_track_index,
                     start_samples,
                     length_samples,
                     offset_samples,
                     gain: clip.audio_gain,
-                    time_mul: Self::audio_playback_time_mul(clip),
+                    time_mul: Self::audio_playback_time_mul(clip, pitch),
+                    pitch_semitones: pitch,
+                    stretch_mode: clip.audio_stretch_mode,
+                    formant_scale: clip.audio_formant_scale,
                 });
                 if !cache.contains_key(&path_str) {
                     if let Some(data) = Self::load_audio_clip_data(&path) {
@@ -4615,6 +5694,21 @@ impl DawApp {
                 }
                 if let Some(data) = Self::load_audio_clip_data(&path) {
                     guard.insert(key, Arc::new(data));
+                }
+            }
+            if let Some(treesynth) = track.treesynth.as_ref() {
+                for sample in &treesynth.samples {
+                    let key = sample.path.clone();
+                    let mut guard = match cache.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    };
+                    if guard.get(&key).is_some() {
+                        continue;
+                    }
+                    if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
+                        guard.insert(key, Arc::new(data));
+                    }
                 }
             }
         }
@@ -7035,6 +8129,14 @@ impl DawApp {
             ui.heading("Arranger");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut hide_labels = !self.settings.show_clip_labels;
+                    if ui.checkbox(&mut hide_labels, "Hide clip labels").changed() {
+                        self.settings.show_clip_labels = !hide_labels;
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
                 ui.label("Grid Snap");
                 let snap_label = if self.arranger_snap_beats < 0.0 {
                     "Cell"
@@ -7708,36 +8810,43 @@ impl DawApp {
                             } else {
                                 clip.name.as_str()
                             };
-                            let header_text = ui.fonts(|f| {
-                                let font =
-                                    egui::FontId::proportional((BASE_UI_FONT_SIZE - 1.0).max(6.0));
-                                let max_width = (header_rect.width() - 10.0).max(4.0);
-                                let mut text = name.to_string();
-                                while text.len() > 1
-                                    && f
-                                        .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE)
-                                        .size()
-                                        .x
-                                        > max_width
-                                {
-                                    text.pop();
-                                }
-                                if text.len() < name.len() {
-                                    if text.len() > 3 {
-                                        text.truncate(text.len().saturating_sub(3));
+                            if self.settings.show_clip_labels {
+                                let header_text = ui.fonts(|f| {
+                                    let font = egui::FontId::proportional(
+                                        (BASE_UI_FONT_SIZE - 1.0).max(6.0),
+                                    );
+                                    let max_width = (header_rect.width() - 10.0).max(4.0);
+                                    let mut text = name.to_string();
+                                    while text.len() > 1
+                                        && f
+                                            .layout_no_wrap(
+                                                text.clone(),
+                                                font.clone(),
+                                                egui::Color32::WHITE,
+                                            )
+                                            .size()
+                                            .x
+                                            > max_width
+                                    {
+                                        text.pop();
                                     }
-                                    text.push_str("...");
-                                }
-                                text
-                            });
-                            Self::outlined_text(
-                                &clip_painter,
-                                egui::pos2(header_rect.left() + 4.0, header_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                &header_text,
-                                egui::FontId::proportional((BASE_UI_FONT_SIZE - 1.0).max(6.0)),
-                                egui::Color32::WHITE,
-                            );
+                                    if text.len() < name.len() {
+                                        if text.len() > 3 {
+                                            text.truncate(text.len().saturating_sub(3));
+                                        }
+                                        text.push_str("...");
+                                    }
+                                    text
+                                });
+                                Self::outlined_text(
+                                    &clip_painter,
+                                    egui::pos2(header_rect.left() + 4.0, header_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &header_text,
+                                    egui::FontId::proportional((BASE_UI_FONT_SIZE - 1.0).max(6.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
                             if clip.is_midi {
                                 let preview_rect = body_rect.shrink2(egui::vec2(2.0, 2.0));
                                 self.draw_midi_preview(
@@ -8344,6 +9453,12 @@ impl DawApp {
                                 audio_pitch_semitones: 0.0,
                                 audio_stretch_mode: AudioStretchMode::Stretch,
                                 audio_time_mul: 1.0,
+                                audio_key: None,
+                                audio_key_minor: false,
+                                audio_key_source: None,
+                                audio_bpm: None,
+                                audio_fine_pitch_cents: 0.0,
+                                audio_formant_scale: 1.0,
                             });
                             self.selected_track = Some(track_index);
                             self.selected_clip = Some(clip_id);
@@ -9187,6 +10302,17 @@ impl DawApp {
                     ui.heading("Parameters");
                     ui.separator();
                     if is_audio_clip {
+                        let key_display_format = self.settings.key_display_format.clone();
+                        let tempo_bpm = self.tempo_bpm;
+                        let analyzing = selected_clip_info
+                            .and_then(|(ti, ci)| {
+                                self.tracks
+                                    .get(ti)
+                                    .and_then(|t| t.clips.get(ci))
+                                    .map(|clip| self.analysis_pending.contains(&clip.id))
+                            })
+                            .unwrap_or(false);
+                        let mut analyze_request: Option<(usize, Option<PathBuf>)> = None;
                         if let Some((ti, ci)) = selected_clip_info {
                             let clip_path = self
                                 .tracks
@@ -9194,6 +10320,7 @@ impl DawApp {
                                 .and_then(|t| t.clips.get(ci))
                                 .and_then(|clip| self.resolve_clip_audio_path(clip))
                                 .map(|path| path.to_path_buf());
+                            let mut audio_changed = false;
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 if let Some(clip) =
                                     self.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci))
@@ -9202,12 +10329,16 @@ impl DawApp {
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
                                         ui.label("Gain");
-                                        Self::colored_slider(
+                                        if Self::colored_slider(
                                             ui,
                                             &mut clip.audio_gain,
                                             0.0..=2.0,
                                             track_color,
-                                        );
+                                        )
+                                        .changed()
+                                        {
+                                            audio_changed = true;
+                                        }
                                     });
                                     if ui
                                         .add(egui::Button::new("Normalize"))
@@ -9220,6 +10351,8 @@ impl DawApp {
                                                     Self::normalize_audio_clip_with_path(clip, path)
                                                 {
                                                     self.status = format!("Normalize failed: {err}");
+                                                } else {
+                                                    audio_changed = true;
                                                 }
                                             }
                                             None => {
@@ -9230,10 +10363,12 @@ impl DawApp {
                                     }
                                     ui.horizontal(|ui| {
                                         ui.label("Stretch");
+                                        let prev = clip.audio_stretch_mode;
                                         let selected = match clip.audio_stretch_mode {
                                             AudioStretchMode::Stretch => "Stretch",
                                             AudioStretchMode::StretchFormant => "Stretch (Formant)",
                                             AudioStretchMode::StretchNeutral => "Stretch (Neutral)",
+                                            AudioStretchMode::StretchVocal => "Vocal (Formant)",
                                             AudioStretchMode::Speed => "Speed (Resample)",
                                         };
                                         egui::ComboBox::from_id_source(
@@ -9258,39 +10393,126 @@ impl DawApp {
                                             );
                                             ui.selectable_value(
                                                 &mut clip.audio_stretch_mode,
+                                                AudioStretchMode::StretchVocal,
+                                                "Vocal (Formant)",
+                                            );
+                                            ui.selectable_value(
+                                                &mut clip.audio_stretch_mode,
                                                 AudioStretchMode::Speed,
                                                 "Speed (Resample)",
                                             );
                                         });
+                                        if clip.audio_stretch_mode != prev {
+                                            audio_changed = true;
+                                        }
                                     });
+                                    let rb_active = cfg!(has_rubberband)
+                                        && clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                    let rb_label = if rb_active {
+                                        "Rubber Band: Active"
+                                    } else if cfg!(has_rubberband) {
+                                        "Rubber Band: Off (Speed mode)"
+                                    } else {
+                                        "Rubber Band: Not linked"
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(rb_label).color(if rb_active {
+                                            egui::Color32::from_rgb(120, 200, 140)
+                                        } else {
+                                            egui::Color32::from_gray(150)
+                                        }),
+                                    );
                                     ui.horizontal(|ui| {
-                                        ui.label("Pitch");
-                                        let pitch_enabled =
-                                            clip.audio_stretch_mode == AudioStretchMode::Speed;
-                                        ui.add_enabled_ui(pitch_enabled, |ui| {
-                                            Self::colored_slider(
-                                                ui,
-                                                &mut clip.audio_pitch_semitones,
-                                                -24.0..=24.0,
-                                                track_color,
-                                            );
+                                        ui.label("Preserve Formant");
+                                        let mut preserve = matches!(
+                                            clip.audio_stretch_mode,
+                                            AudioStretchMode::StretchFormant | AudioStretchMode::StretchVocal
+                                        );
+                                        let enabled = clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            if ui.checkbox(&mut preserve, "").changed() {
+                                                clip.audio_stretch_mode = if preserve {
+                                                    AudioStretchMode::StretchFormant
+                                                } else {
+                                                    AudioStretchMode::Stretch
+                                                };
+                                                audio_changed = true;
+                                            }
                                         });
                                     });
                                     ui.horizontal(|ui| {
-                                        ui.label("Time Mul");
-                                        Self::colored_slider(
+                                        ui.label("Pitch");
+                                        if Self::colored_slider(
                                             ui,
-                                            &mut clip.audio_time_mul,
+                                            &mut clip.audio_pitch_semitones,
+                                            -24.0..=24.0,
+                                            track_color,
+                                        )
+                                        .changed()
+                                        {
+                                            audio_changed = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Formant");
+                                        let enabled = clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            if Self::colored_slider(
+                                                ui,
+                                                &mut clip.audio_formant_scale,
+                                                0.5..=2.0,
+                                                track_color,
+                                            )
+                                            .changed()
+                                            {
+                                                audio_changed = true;
+                                            }
+                                        });
+                                    });
+                                    let (analyze_clicked, analysis_changed) =
+                                        Self::draw_audio_analysis_controls(
+                                        ui,
+                                        clip,
+                                        clip_path.as_deref(),
+                                        key_display_format.as_str(),
+                                        tempo_bpm,
+                                        analyzing,
+                                    );
+                                    if analysis_changed {
+                                        audio_changed = true;
+                                    }
+                                    if analyze_clicked {
+                                        analyze_request = Some((clip.id, clip_path.clone()));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label("Time Mul");
+                                        let mut time_mul = clip.audio_time_mul;
+                                        let slider_changed = Self::colored_slider(
+                                            ui,
+                                            &mut time_mul,
                                             0.25..=4.0,
                                             track_color,
-                                        );
+                                        )
+                                        .changed();
+                                        let input_changed = ui
+                                            .add(egui::DragValue::new(&mut time_mul).speed(0.01))
+                                            .changed();
+                                        if slider_changed || input_changed {
+                                            clip.audio_time_mul = time_mul.clamp(0.01, 8.0);
+                                            audio_changed = true;
+                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Offset");
-                                        ui.add(
-                                            egui::DragValue::new(&mut clip.audio_offset_beats)
-                                                .speed(0.1),
-                                        );
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut clip.audio_offset_beats)
+                                                    .speed(0.1),
+                                            )
+                                            .changed()
+                                        {
+                                            audio_changed = true;
+                                        }
                                     });
                                     ui.add_space(6.0);
                                     if ui
@@ -9300,12 +10522,13 @@ impl DawApp {
                                             ))
                                             .fit_to_exact_size(egui::vec2(12.0, 12.0)),
                                         ))
-                                        .on_hover_text("Fit To Tempo")
+                                        .on_hover_text("Fit to project tempo")
                                         .clicked()
                                     {
                                         if let Some(source) = clip.audio_source_beats {
                                             if source > 0.0 && clip.length_beats > 0.0 {
                                                 clip.audio_time_mul = source / clip.length_beats;
+                                                audio_changed = true;
                                             }
                                         }
                                     }
@@ -9324,6 +10547,13 @@ impl DawApp {
                                         clip.audio_stretch_mode = AudioStretchMode::Stretch;
                                         clip.audio_time_mul = 1.0;
                                         clip.audio_offset_beats = 0.0;
+                                        clip.audio_key = None;
+                                        clip.audio_key_minor = false;
+                                        clip.audio_key_source = None;
+                                        clip.audio_bpm = None;
+                                        clip.audio_fine_pitch_cents = 0.0;
+                                        clip.audio_formant_scale = 1.0;
+                                        audio_changed = true;
                                     }
                                 }
                                 self.draw_effect_params_panel(
@@ -9333,6 +10563,16 @@ impl DawApp {
                                     &mut pending_automation_record,
                                 );
                             });
+                            if audio_changed {
+                                self.refresh_audio_clip_timeline_if_running();
+                            }
+                            if let Some((clip_id, clip_path)) = analyze_request.take() {
+                                if let Some(path) = clip_path {
+                                    self.enqueue_audio_analysis(clip_id, path);
+                                } else {
+                                    self.status = "Analyze failed: clip has no audio file".to_string();
+                                }
+                            }
                         }
                     } else {
                         let track = selected_track_index.and_then(|i| self.tracks.get(i));
@@ -9341,6 +10581,10 @@ impl DawApp {
                         if let Some(track) = track {
                             ui.label(format!("FX slots: {}", track.effect_paths.len()));
                         }
+                        let is_native = track
+                            .and_then(|t| t.instrument_path.as_deref())
+                            .map(Self::is_native_plugin_path)
+                            .unwrap_or(false);
                         let plugin = track
                             .and_then(|t| t.instrument_path.as_deref())
                             .map(Self::plugin_display_name)
@@ -9371,7 +10615,7 @@ impl DawApp {
                                 if choose.clicked() {
                                     self.open_plugin_picker(PluginTarget::Instrument(index));
                                 }
-                                if open.clicked() {
+                                if !is_native && open.clicked() {
                                     self.plugin_ui_target = Some(PluginUiTarget::Instrument(index));
                                     self.show_plugin_ui = true;
                                 }
@@ -9382,6 +10626,7 @@ impl DawApp {
                                     }
                                     if let Some(track) = self.tracks.get_mut(index) {
                                         track.instrument_path = None;
+                                        track.treesynth = None;
                                         track.params = default_midi_params();
                                         track.param_ids.clear();
                                         track.param_values.clear();
@@ -9398,6 +10643,98 @@ impl DawApp {
                         });
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            let is_treesynth = selected_track_index
+                                .and_then(|i| self.tracks.get(i))
+                                .and_then(|track| track.instrument_path.as_deref())
+                                .map(Self::is_treesynth_path)
+                                .unwrap_or(false);
+                            if is_treesynth {
+                                let audio_cache = self.audio_clip_cache.clone();
+                                let mut changed = false;
+                                if let Some(track_index) = selected_track_index {
+                                    if let Some(track) = self.tracks.get_mut(track_index) {
+                                        if let Some(state) = track.treesynth.as_mut() {
+                                            changed = Self::draw_treesynth_panel(ui, state, &audio_cache);
+                                        } else {
+                                            ui.colored_label(egui::Color32::RED, "[TreeSynth] サンプル未ロード: プリセットまたはサンプルをロードしてください");
+                                        }
+                                    }
+                                }
+                                if let Some(track_index) = selected_track_index {
+                                    if let Some(track) = self.tracks.get(track_index) {
+                                        ui.add_space(6.0);
+                                        if ui.button("Save As").clicked() {
+                                            let plugin_path = track
+                                                .instrument_path
+                                                .as_deref()
+                                                .unwrap_or("native:treesynth");
+                                            let base_dir = self.presets_root_global();
+                                            let preset_dir = self.preset_plugin_dir(&base_dir, plugin_path);
+                                            let default_name = "TreeSynth".to_string();
+                                            if track.treesynth.is_none() {
+                                                self.status = "[TreeSynth] サンプル未ロード: 保存できません".to_string();
+                                                return;
+                                            }
+                                            let file_name = format!(
+                                                "{}.lingpreset.json",
+                                                Self::sanitize_folder_name(&default_name)
+                                            );
+                                            let dialog = rfd::FileDialog::new()
+                                                .set_directory(&preset_dir)
+                                                .set_file_name(&file_name)
+                                                .add_filter("Preset", &["json"]);
+                                            if let Some(path) = dialog.save_file() {
+                                                let preset_name = path
+                                                    .file_stem()
+                                                    .and_then(|s| s.to_str())
+                                                    .unwrap_or("TreeSynth");
+                                                match self.save_treesynth_preset_at_path(
+                                                    track_index,
+                                                    &path,
+                                                    preset_name,
+                                                ) {
+                                                    Ok(saved) => {
+                                                        self.status = format!("Preset saved: {saved}")
+                                                    }
+                                                    Err(err) => {
+                                                        self.status = format!("Preset save failed: {err}")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if changed {
+                                    self.mark_dirty();
+                                    if let Some(track_index) = selected_track_index {
+                                        if let Some(track) = self.tracks.get(track_index) {
+                                            if let Some(state) = self.track_audio.get(track_index) {
+                                                let enabled = track
+                                                    .instrument_path
+                                                    .as_deref()
+                                                    .map(Self::is_treesynth_path)
+                                                    .unwrap_or(false);
+                                                state.sync_treesynth(track, enabled);
+                                                if let Ok(mut runtime) =
+                                                    state.treesynth_runtime.lock()
+                                                {
+                                                    runtime.voices.clear();
+                                                    runtime.sequence_index = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(track_index) = selected_track_index {
+                                    self.draw_effect_params_panel(
+                                        ui,
+                                        track_index,
+                                        track_color,
+                                        &mut pending_automation_record,
+                                    );
+                                }
+                                return;
+                            }
                             self.refresh_clap_params_if_needed();
                             self.ensure_live_params();
                             let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
@@ -9896,20 +11233,46 @@ impl DawApp {
                         ui.separator();
                         let track_color = self.selected_track.map(|i| self.track_color(i));
                         if is_audio_clip {
+                            let key_display_format = self.settings.key_display_format.clone();
+                            let tempo_bpm = self.tempo_bpm;
+                            let analyzing = selected_clip_info
+                                .and_then(|(ti, ci)| {
+                                    self.tracks
+                                        .get(ti)
+                                        .and_then(|t| t.clips.get(ci))
+                                        .map(|clip| self.analysis_pending.contains(&clip.id))
+                                })
+                                .unwrap_or(false);
+                            let mut analyze_request: Option<(usize, Option<PathBuf>)> = None;
+                            let clip_path = selected_clip_info
+                                .and_then(|(ti, ci)| {
+                                    self.tracks
+                                        .get(ti)
+                                        .and_then(|t| t.clips.get(ci))
+                                        .and_then(|clip| self.resolve_clip_audio_path(clip))
+                                })
+                                .map(|path| path.to_path_buf());
                             if let Some((ti, ci)) = selected_clip_info {
+                                let mut audio_changed = false;
                                 if let Some(clip) = self.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
                                     ui.label("Clip Properties");
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
                                         ui.label("Gain");
-                                        Self::colored_slider(ui, &mut clip.audio_gain, 0.0..=2.0, track_color);
+                                        if Self::colored_slider(ui, &mut clip.audio_gain, 0.0..=2.0, track_color)
+                                            .changed()
+                                        {
+                                            audio_changed = true;
+                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Stretch");
+                                        let prev = clip.audio_stretch_mode;
                                         let selected = match clip.audio_stretch_mode {
                                             AudioStretchMode::Stretch => "Stretch",
                                             AudioStretchMode::StretchFormant => "Stretch (Formant)",
                                             AudioStretchMode::StretchNeutral => "Stretch (Neutral)",
+                                            AudioStretchMode::StretchVocal => "Vocal (Formant)",
                                             AudioStretchMode::Speed => "Speed (Resample)",
                                         };
                                         egui::ComboBox::from_id_source(("audio_stretch_mode_piano", clip.id))
@@ -9932,36 +11295,126 @@ impl DawApp {
                                                 );
                                                 ui.selectable_value(
                                                     &mut clip.audio_stretch_mode,
+                                                    AudioStretchMode::StretchVocal,
+                                                    "Vocal (Formant)",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut clip.audio_stretch_mode,
                                                     AudioStretchMode::Speed,
                                                     "Speed (Resample)",
                                                 );
                                             });
+                                            if clip.audio_stretch_mode != prev {
+                                                audio_changed = true;
+                                            }
                                     });
+                                    let rb_active = cfg!(has_rubberband)
+                                        && clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                    let rb_label = if rb_active {
+                                        "Rubber Band: Active"
+                                    } else if cfg!(has_rubberband) {
+                                        "Rubber Band: Off (Speed mode)"
+                                    } else {
+                                        "Rubber Band: Not linked"
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(rb_label).color(if rb_active {
+                                            egui::Color32::from_rgb(120, 200, 140)
+                                        } else {
+                                            egui::Color32::from_gray(150)
+                                        }),
+                                    );
                                     ui.horizontal(|ui| {
-                                        ui.label("Pitch");
-                                        let pitch_enabled =
-                                            clip.audio_stretch_mode == AudioStretchMode::Speed;
-                                        ui.add_enabled_ui(pitch_enabled, |ui| {
-                                            Self::colored_slider(
-                                                ui,
-                                                &mut clip.audio_pitch_semitones,
-                                                -24.0..=24.0,
-                                                track_color,
-                                            );
+                                        ui.label("Preserve Formant");
+                                        let mut preserve = matches!(
+                                            clip.audio_stretch_mode,
+                                            AudioStretchMode::StretchFormant | AudioStretchMode::StretchVocal
+                                        );
+                                        let enabled = clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            if ui.checkbox(&mut preserve, "").changed() {
+                                                clip.audio_stretch_mode = if preserve {
+                                                    AudioStretchMode::StretchFormant
+                                                } else {
+                                                    AudioStretchMode::Stretch
+                                                };
+                                                    audio_changed = true;
+                                            }
                                         });
                                     });
                                     ui.horizontal(|ui| {
-                                        ui.label("Time Mul");
-                                        Self::colored_slider(
+                                        ui.label("Pitch");
+                                        if Self::colored_slider(
                                             ui,
-                                            &mut clip.audio_time_mul,
+                                            &mut clip.audio_pitch_semitones,
+                                            -24.0..=24.0,
+                                            track_color,
+                                        )
+                                        .changed()
+                                        {
+                                            audio_changed = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Formant");
+                                        let enabled = clip.audio_stretch_mode != AudioStretchMode::Speed;
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            if Self::colored_slider(
+                                                ui,
+                                                &mut clip.audio_formant_scale,
+                                                0.5..=2.0,
+                                                track_color,
+                                            )
+                                            .changed()
+                                            {
+                                                audio_changed = true;
+                                            }
+                                        });
+                                    });
+                                        let (analyze_clicked, analysis_changed) =
+                                            Self::draw_audio_analysis_controls(
+                                        ui,
+                                        clip,
+                                        clip_path.as_deref(),
+                                        key_display_format.as_str(),
+                                        tempo_bpm,
+                                        analyzing,
+                                    );
+                                        if analysis_changed {
+                                            audio_changed = true;
+                                        }
+                                    if analyze_clicked {
+                                        analyze_request = Some((clip.id, clip_path.clone()));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label("Time Mul");
+                                        let mut time_mul = clip.audio_time_mul;
+                                        let slider_changed = Self::colored_slider(
+                                            ui,
+                                            &mut time_mul,
                                             0.25..=4.0,
                                             track_color,
-                                        );
+                                        )
+                                        .changed();
+                                        let input_changed = ui
+                                            .add(egui::DragValue::new(&mut time_mul).speed(0.01))
+                                            .changed();
+                                        if slider_changed || input_changed {
+                                            clip.audio_time_mul = time_mul.clamp(0.01, 8.0);
+                                            audio_changed = true;
+                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Offset");
-                                        ui.add(egui::DragValue::new(&mut clip.audio_offset_beats).speed(0.1));
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut clip.audio_offset_beats)
+                                                        .speed(0.1),
+                                                )
+                                                .changed()
+                                            {
+                                                audio_changed = true;
+                                            }
                                     });
                                     ui.add_space(6.0);
                                     if ui
@@ -9969,12 +11422,13 @@ impl DawApp {
                                             egui::Image::new(egui::include_image!("../../icons/refresh-cw.svg"))
                                                 .fit_to_exact_size(egui::vec2(12.0, 12.0)),
                                         ))
-                                        .on_hover_text("Fit To Tempo")
+                                        .on_hover_text("Fit to project tempo")
                                         .clicked()
                                     {
                                         if let Some(source) = clip.audio_source_beats {
                                             if source > 0.0 && clip.length_beats > 0.0 {
                                                 clip.audio_time_mul = source / clip.length_beats;
+                                                    audio_changed = true;
                                             }
                                         }
                                     }
@@ -9991,6 +11445,23 @@ impl DawApp {
                                         clip.audio_stretch_mode = AudioStretchMode::Stretch;
                                         clip.audio_time_mul = 1.0;
                                         clip.audio_offset_beats = 0.0;
+                                        clip.audio_key = None;
+                                        clip.audio_key_minor = false;
+                                        clip.audio_key_source = None;
+                                        clip.audio_bpm = None;
+                                        clip.audio_fine_pitch_cents = 0.0;
+                                        clip.audio_formant_scale = 1.0;
+                                            audio_changed = true;
+                                    }
+                                }
+                                    if audio_changed {
+                                        self.refresh_audio_clip_timeline_if_running();
+                                    }
+                                if let Some((clip_id, clip_path)) = analyze_request.take() {
+                                    if let Some(path) = clip_path {
+                                        self.enqueue_audio_analysis(clip_id, path);
+                                    } else {
+                                        self.status = "Analyze failed: clip has no audio file".to_string();
                                     }
                                 }
                             }
@@ -12029,6 +13500,7 @@ impl DawApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
                         ui.selectable_value(&mut self.settings_tab, SettingsTab::Audio, "Audio");
                         ui.selectable_value(&mut self.settings_tab, SettingsTab::Midi, "MIDI");
                         ui.selectable_value(&mut self.settings_tab, SettingsTab::Theme, "Theme");
@@ -12036,6 +13508,50 @@ impl DawApp {
                     ui.separator();
 
                     match self.settings_tab {
+                        SettingsTab::General => {
+                            ui.heading("General");
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("Key Display");
+                                let label = match self.settings.key_display_format.as_str() {
+                                    "traditional" => "Traditional (C#m)",
+                                    "both" => "Both",
+                                    _ => "Camelot (8A)",
+                                };
+                                egui::ComboBox::from_id_source("key_display_format")
+                                    .selected_text(label)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.settings.key_display_format == "camelot",
+                                                "Camelot (8A)",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.settings.key_display_format = "camelot".to_string();
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.settings.key_display_format == "traditional",
+                                                "Traditional (C#m)",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.settings.key_display_format = "traditional".to_string();
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.settings.key_display_format == "both",
+                                                "Both",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.settings.key_display_format = "both".to_string();
+                                        }
+                                    });
+                            });
+                            ui.checkbox(&mut self.settings.show_clip_labels, "Show clip labels in Arranger");
+                        }
                         SettingsTab::Audio => {
                             ui.heading("Audio");
                             ui.separator();
@@ -12215,7 +13731,7 @@ impl DawApp {
             egui::Window::new("Plugin Picker")
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("Scanning VST3 + CLAP folders");
+                    ui.label("Scanning plugins (VST3/CLAP + native)");
                     ui.horizontal(|ui| {
                         ui.label("Search");
                         ui.text_edit_singleline(&mut self.plugin_search);
@@ -12233,18 +13749,44 @@ impl DawApp {
                     ui.separator();
 
                     let search = self.plugin_search.to_ascii_lowercase();
+                    let target_is_instrument = matches!(self.plugin_target, Some(PluginTarget::Instrument(_)));
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for candidate in &self.plugin_candidates {
-                            let display = &candidate.display;
-                            if !search.is_empty()
-                                && !candidate.path.to_ascii_lowercase().contains(&search)
-                                && !display.to_ascii_lowercase().contains(&search)
-                            {
+                        let mut drew_any = false;
+                        for category in [PluginCategory::Native, PluginCategory::Bundled, PluginCategory::System] {
+                            let mut category_items = Vec::new();
+                            for candidate in &self.plugin_candidates {
+                                if candidate.category != category {
+                                    continue;
+                                }
+                                if candidate.instrument_only && !target_is_instrument {
+                                    continue;
+                                }
+                                let display = &candidate.display;
+                                if !search.is_empty()
+                                    && !candidate.path.to_ascii_lowercase().contains(&search)
+                                    && !display.to_ascii_lowercase().contains(&search)
+                                {
+                                    continue;
+                                }
+                                category_items.push(candidate);
+                            }
+                            if category_items.is_empty() {
                                 continue;
                             }
-                            if ui.selectable_label(false, display).clicked() {
-                                chosen = Some(candidate.clone());
+                            if drew_any {
+                                ui.add_space(6.0);
                             }
+                            ui.heading(category.label());
+                            ui.add_space(2.0);
+                            for candidate in category_items {
+                                if ui.selectable_label(false, &candidate.display).clicked() {
+                                    chosen = Some(candidate.clone());
+                                }
+                            }
+                            drew_any = true;
+                        }
+                        if !drew_any {
+                            ui.label("No plugins found.");
                         }
                     });
                 });
@@ -12555,6 +14097,45 @@ impl DawApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.label(format!("Project: {}", self.project_name));
+                    let mut project_key_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Key");
+                        let display = self.format_key_display(self.project_key, self.project_key_minor);
+                        egui::ComboBox::from_id_source("project_key")
+                            .selected_text(display)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.project_key.is_none(), "Unknown")
+                                    .clicked()
+                                {
+                                    self.project_key = None;
+                                    project_key_changed = true;
+                                }
+                                for key in 0u8..12 {
+                                    let name = Self::format_key_display_with(
+                                        self.settings.key_display_format.as_str(),
+                                        Some(key),
+                                        self.project_key_minor,
+                                    );
+                                    if ui
+                                        .selectable_label(self.project_key == Some(key), name)
+                                        .clicked()
+                                    {
+                                        self.project_key = Some(key);
+                                        project_key_changed = true;
+                                    }
+                                }
+                            });
+                        let enabled = self.project_key.is_some();
+                        ui.add_enabled_ui(enabled, |ui| {
+                            if ui.checkbox(&mut self.project_key_minor, "Minor").changed() {
+                                project_key_changed = true;
+                            }
+                        });
+                    });
+                    if project_key_changed {
+                        self.refresh_audio_clip_timeline_if_running();
+                    }
                     ui.label(format!("Tempo: {} BPM", self.tempo_bpm));
                     ui.label("Time Signature: 4/4");
                     ui.label("Sample Rate: 48 kHz");
@@ -12842,6 +14423,7 @@ impl DawApp {
             automation_channels: Vec::new(),
             midi_cc_lanes: Vec::new(),
             midi_program: None,
+            treesynth: None,
         }];
         self.selected_clip = None;
         self.selected_track = Some(0);
@@ -12935,6 +14517,7 @@ impl DawApp {
             automation_channels: Vec::new(),
             midi_cc_lanes: Vec::new(),
             midi_program: None,
+            treesynth: None,
         });
         self.selected_track = Some(self.tracks.len().saturating_sub(1));
         self.refresh_params_for_selected_track(true);
@@ -13122,6 +14705,13 @@ impl DawApp {
     fn save_project_to_folder(&mut self, folder: &Path) -> Result<(), String> {
         let previous_folder = self.project_path.trim().to_string();
         self.capture_plugin_states();
+        // Ensure TreeSynth instrument_path is set
+        let mut tracks = self.tracks.clone();
+        for track in &mut tracks {
+            if track.treesynth.is_some() {
+                track.instrument_path = Some("native:treesynth".to_string());
+            }
+        }
         let state = ProjectState {
             name: self.project_name.clone(),
             artist: self.metadata_artist.clone(),
@@ -13130,8 +14720,10 @@ impl DawApp {
             genre: self.metadata_genre.clone(),
             year: self.metadata_year.clone(),
             comment: self.metadata_comment.clone(),
+            project_key: self.project_key,
+            project_key_minor: self.project_key_minor,
             tempo_bpm: self.tempo_bpm,
-            tracks: self.tracks.clone(),
+            tracks,
             master_settings: self.master_settings_snapshot(),
         };
         let folder = Self::normalize_windows_path(folder);
@@ -13278,6 +14870,8 @@ impl DawApp {
         self.metadata_genre = state.genre;
         self.metadata_year = state.year;
         self.metadata_comment = state.comment;
+        self.project_key = state.project_key;
+        self.project_key_minor = state.project_key_minor;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
         if let Ok(mut master) = self.master_settings.lock() {
@@ -13393,6 +14987,8 @@ impl DawApp {
         self.metadata_genre = state.genre;
         self.metadata_year = state.year;
         self.metadata_comment = state.comment;
+        self.project_key = state.project_key;
+        self.project_key_minor = state.project_key_minor;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
         if let Ok(mut master) = self.master_settings.lock() {
@@ -13642,7 +15238,7 @@ impl DawApp {
 
         let clip_id = self.next_clip_id();
         if let Some(track) = self.tracks.get_mut(track_index) {
-            track.clips.push(Clip {
+            let clip = Clip {
                 id: clip_id,
                 track: track_index,
                 start_beats: start_beats.max(0.0),
@@ -13659,8 +15255,16 @@ impl DawApp {
                 audio_pitch_semitones: 0.0,
                 audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
-            });
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            };
+            track.clips.push(clip);
         }
+        self.enqueue_audio_analysis(clip_id, target);
         self.selected_track = Some(track_index);
         self.selected_clip = Some(clip_id);
         Ok(())
@@ -13868,6 +15472,12 @@ impl DawApp {
                         audio_pitch_semitones: 0.0,
                         audio_stretch_mode: AudioStretchMode::Stretch,
                         audio_time_mul: 1.0,
+                        audio_key: None,
+                        audio_key_minor: false,
+                        audio_key_source: None,
+                        audio_bpm: None,
+                        audio_fine_pitch_cents: 0.0,
+                        audio_formant_scale: 1.0,
                     });
                     next_clip_id = next_clip_id.saturating_add(1);
                     any_clip_notes = true;
@@ -13937,6 +15547,12 @@ impl DawApp {
                             audio_pitch_semitones: 0.0,
                             audio_stretch_mode: AudioStretchMode::Stretch,
                             audio_time_mul: 1.0,
+                            audio_key: None,
+                            audio_key_minor: false,
+                            audio_key_source: None,
+                            audio_bpm: None,
+                            audio_fine_pitch_cents: 0.0,
+                            audio_formant_scale: 1.0,
                         });
                         next_clip_id = next_clip_id.saturating_add(1);
                     }
@@ -13989,6 +15605,12 @@ impl DawApp {
                     audio_pitch_semitones: 0.0,
                     audio_stretch_mode: AudioStretchMode::Stretch,
                     audio_time_mul: 1.0,
+                    audio_key: None,
+                    audio_key_minor: false,
+                    audio_key_source: None,
+                    audio_bpm: None,
+                    audio_fine_pitch_cents: 0.0,
+                    audio_formant_scale: 1.0,
                 });
                 next_clip_id = next_clip_id.saturating_add(1);
             } else {
@@ -14165,6 +15787,12 @@ impl DawApp {
                 audio_pitch_semitones: 0.0,
                 audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
             };
             next_id += 1;
             let track_name = match track_data.program {
@@ -14219,6 +15847,7 @@ impl DawApp {
                 automation_channels: Vec::new(),
                 midi_cc_lanes,
                 midi_program,
+                treesynth: None,
             });
         }
 
@@ -14349,11 +15978,26 @@ impl DawApp {
     }
 
     fn render_with_options(&mut self, folder: &Path) -> Result<(), String> {
+            // レンダー直前にtrack_audioを最新化
+            self.sync_track_audio_states();
         if self.render_job.is_some() {
             return Ok(());
         }
         self.ensure_synth_soundfont();
         self.capture_plugin_states();
+        // Ensure TreeSynth instrument_path is set for all TreeSynth tracks before rendering
+        for track in &mut self.tracks {
+            if track.treesynth.is_some() {
+                track.instrument_path = Some("native:treesynth".to_string());
+            }
+        }
+        // TreeSynth enable/sync for all tracks
+        for (i, track) in self.tracks.iter().enumerate() {
+            if let Some(audio_state) = self.track_audio.get(i) {
+                let enabled = track.treesynth.is_some();
+                audio_state.sync_treesynth(track, enabled);
+            }
+        }
         let license_comment = self.render_license_comment();
         let folder = Self::normalize_windows_path(folder);
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -14420,13 +16064,21 @@ impl DawApp {
             result: result.clone(),
         });
 
+        let track_audio = self.track_audio.clone();
+        let audio_clip_cache = self.audio_clip_cache.clone();
+        let format = self.render_format;
+        let plans = plans.clone();
+        let done = done.clone();
+        let total = total.clone();
+        let finished = finished.clone();
+        let result = result.clone();
         std::thread::spawn(move || {
             let mut final_status = Ok("Render complete".to_string());
             for plan in plans {
                 done.store(0, Ordering::Relaxed);
                 total.store(1, Ordering::Relaxed);
                 let res = match format {
-                    RenderFormat::Wav => render_plan_to_wav(plan, &done, &total),
+                    RenderFormat::Wav => render_plan_to_wav(plan, &done, &total, &track_audio, &audio_clip_cache),
                     RenderFormat::Ogg => render_plan_to_ogg(plan, &done, &total),
                     RenderFormat::Flac => render_plan_to_flac(plan, &done, &total),
                 };
@@ -14458,20 +16110,26 @@ impl DawApp {
         let tracks = self
             .tracks
             .iter()
-            .map(|track| RenderTrack {
-                notes: track.midi_notes.clone(),
-                instrument_path: track.instrument_path.clone(),
-                instrument_clap_id: track.instrument_clap_id.clone(),
-                param_ids: track.param_ids.clone(),
-                param_values: track.param_values.clone(),
-                plugin_state_component: track.plugin_state_component.clone(),
-                plugin_state_controller: track.plugin_state_controller.clone(),
-                effect_paths: track.effect_paths.clone(),
-                effect_clap_ids: track.effect_clap_ids.clone(),
-                effect_bypass: track.effect_bypass.clone(),
-                automation_lanes: track.automation_lanes.clone(),
-                level: track.level,
-                active: !track.muted && (!has_solo || track.solo),
+            .map(|track| {
+                let mut instrument_path = track.instrument_path.clone();
+                if track.treesynth.is_some() {
+                    instrument_path = Some("native:treesynth".to_string());
+                }
+                RenderTrack {
+                    notes: track.midi_notes.clone(),
+                    instrument_path,
+                    instrument_clap_id: track.instrument_clap_id.clone(),
+                    param_ids: track.param_ids.clone(),
+                    param_values: track.param_values.clone(),
+                    plugin_state_component: track.plugin_state_component.clone(),
+                    plugin_state_controller: track.plugin_state_controller.clone(),
+                    effect_paths: track.effect_paths.clone(),
+                    effect_clap_ids: track.effect_clap_ids.clone(),
+                    effect_bypass: track.effect_bypass.clone(),
+                    automation_lanes: track.automation_lanes.clone(),
+                    level: track.level,
+                    active: !track.muted && (!has_solo || track.solo),
+                }
             })
             .collect::<Vec<_>>();
         RenderPlan {
@@ -14509,13 +16167,17 @@ impl DawApp {
         license_comment: Option<String>,
     ) -> RenderPlan {
         let block_size = self.settings.buffer_size.max(64) as usize;
-        let (notes, instrument_path, instrument_clap_id, param_ids, param_values, component, controller, automation_lanes) = self
+        let (notes, mut instrument_path, instrument_clap_id, param_ids, param_values, component, controller, automation_lanes) = self
             .tracks
             .get(index)
             .map(|track| {
+                let mut instrument_path = track.instrument_path.clone();
+                if track.treesynth.is_some() {
+                    instrument_path = Some("native:treesynth".to_string());
+                }
                 (
                     track.midi_notes.clone(),
-                    track.instrument_path.clone(),
+                    instrument_path,
                     track.instrument_clap_id.clone(),
                     track.param_ids.clone(),
                     track.param_values.clone(),
@@ -14739,7 +16401,7 @@ impl DawApp {
         let done = AtomicU64::new(0);
         let total = AtomicU64::new(1);
         self.render_progress = Some((0, 1));
-        let result = render_plan_to_wav(plan, &done, &total);
+        let result = render_plan_to_wav(plan, &done, &total, &self.track_audio, &self.audio_clip_cache);
         self.render_progress = Some((done.load(Ordering::Relaxed), total.load(Ordering::Relaxed)));
         result
     }
@@ -15025,7 +16687,7 @@ impl DawApp {
         let beats = (seconds * self.tempo_bpm.max(1.0) / 60.0).max(0.25);
         let clip_id = self.next_clip_id();
         if let Some(track) = self.tracks.get_mut(track_index) {
-            track.clips.push(Clip {
+            let clip = Clip {
                 id: clip_id,
                 track: track_index,
                 start_beats,
@@ -15042,8 +16704,16 @@ impl DawApp {
                 audio_pitch_semitones: 0.0,
                 audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
-            });
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
+            };
+            track.clips.push(clip);
         }
+        self.enqueue_audio_analysis(clip_id, path.clone());
         if self.audio_running {
             let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
             if let Ok(mut guard) = self.audio_clip_timeline.lock() {
@@ -15085,6 +16755,12 @@ impl DawApp {
                 audio_pitch_semitones: 0.0,
                 audio_stretch_mode: AudioStretchMode::Stretch,
                 audio_time_mul: 1.0,
+                audio_key: None,
+                audio_key_minor: false,
+                audio_key_source: None,
+                audio_bpm: None,
+                audio_fine_pitch_cents: 0.0,
+                audio_formant_scale: 1.0,
             });
             self.sync_track_audio_notes(track_index);
         }
@@ -15343,6 +17019,7 @@ impl DawApp {
                 if state.host.is_none() {
                     let kind = Self::plugin_kind_from_path(&path);
                     let host = match kind {
+                        PluginKind::Native => None,
                         PluginKind::Vst3 => vst3::Vst3Host::load(
                             &path,
                             self.settings.sample_rate as f64,
@@ -15430,13 +17107,14 @@ impl DawApp {
                                 }
                             }
                         }
-                    } else {
+                    } else if kind != PluginKind::Native {
                         self.status = "Plugin host error: unable to load".to_string();
                     }
                 }
                 for (slot, fx_path) in effect_paths.iter().enumerate() {
                     let kind = Self::plugin_kind_from_path(fx_path);
                     let host = match kind {
+                        PluginKind::Native => None,
                         PluginKind::Vst3 => vst3::Vst3Host::load_with_input(
                             fx_path,
                             self.settings.sample_rate as f64,
@@ -15474,7 +17152,7 @@ impl DawApp {
                     };
                     if let Some(host) = host {
                         state.effect_hosts.push(host);
-                    } else {
+                    } else if kind != PluginKind::Native {
                         self.status = "FX host error: unable to load".to_string();
                     }
                 }
@@ -16788,7 +18466,19 @@ impl DawApp {
     }
 
     fn scan_plugins(&self) -> Vec<PluginCandidate> {
-        let mut candidates = Vec::new();
+        let mut native = Vec::new();
+        native.push(PluginCandidate {
+            path: "native:treesynth".to_string(),
+            kind: PluginKind::Native,
+            clap_id: None,
+            display: "TreeSynth (Sampler)".to_string(),
+            category: PluginCategory::Native,
+            instrument_only: true,
+        });
+
+        let mut bundled = Vec::new();
+        let mut system = Vec::new();
+
         let mut vst3_paths = Vec::new();
         for root in self.vst3_search_roots() {
             self.scan_dir_for_exts(&root, &mut vst3_paths, &["vst3"]);
@@ -16796,11 +18486,19 @@ impl DawApp {
         vst3_paths.sort();
         for path in vst3_paths {
             let display = Self::plugin_display_name(&path);
-            candidates.push(PluginCandidate {
+            let category = Self::categorize_plugin_path(&path);
+            let target = if category == PluginCategory::Bundled {
+                &mut bundled
+            } else {
+                &mut system
+            };
+            target.push(PluginCandidate {
                 path,
                 kind: PluginKind::Vst3,
                 clap_id: None,
                 display,
+                category,
+                instrument_only: false,
             });
         }
 
@@ -16810,35 +18508,84 @@ impl DawApp {
         }
         clap_paths.sort();
         for path in clap_paths {
+            let category = Self::categorize_plugin_path(&path);
+            let target = if category == PluginCategory::Bundled {
+                &mut bundled
+            } else {
+                &mut system
+            };
             match clap_host::enumerate_plugins(&path) {
                 Ok(descriptors) if !descriptors.is_empty() => {
                     for desc in descriptors {
                         let display = format!("{} (CLAP)", desc.name);
-                        candidates.push(PluginCandidate {
+                        target.push(PluginCandidate {
                             path: path.clone(),
                             kind: PluginKind::Clap,
                             clap_id: Some(desc.id),
                             display,
+                            category,
+                            instrument_only: false,
                         });
                     }
                 }
                 _ => {
                     let display = format!("{} (CLAP)", Self::plugin_display_name(&path));
-                    candidates.push(PluginCandidate {
+                    target.push(PluginCandidate {
                         path: path.clone(),
                         kind: PluginKind::Clap,
                         clap_id: None,
                         display,
+                        category,
+                        instrument_only: false,
                     });
                 }
             }
         }
 
-        candidates.sort_by(|a, b| a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase()));
+        let sort_by_name = |a: &PluginCandidate, b: &PluginCandidate| {
+            a.display.to_ascii_lowercase().cmp(&b.display.to_ascii_lowercase())
+        };
+        bundled.sort_by(sort_by_name);
+        system.sort_by(sort_by_name);
+        native.sort_by(sort_by_name);
+
+        let mut candidates = Vec::new();
+        candidates.extend(native);
+        candidates.extend(bundled);
+        candidates.extend(system);
         candidates
     }
 
+    fn is_native_plugin_path(path: &str) -> bool {
+        path.starts_with("native:")
+    }
+
+    fn is_treesynth_path(path: &str) -> bool {
+        path.eq_ignore_ascii_case("native:treesynth")
+    }
+
+    fn is_bundled_plugin_path(path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        if lower.starts_with("synths\\") || lower.starts_with("synths/") || lower == "synths" {
+            return true;
+        }
+        lower.contains("\\synths\\") || lower.contains("/synths/")
+    }
+
+    fn categorize_plugin_path(path: &str) -> PluginCategory {
+        if Self::is_native_plugin_path(path) {
+            PluginCategory::Native
+        } else if Self::is_bundled_plugin_path(path) {
+            PluginCategory::Bundled
+        } else {
+            PluginCategory::System
+        }
+    }
+
     fn plugin_kind_from_path(path: &str) -> PluginKind {
+        if Self::is_native_plugin_path(path) {
+            return PluginKind::Native;
+        }
         let ext = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -16857,6 +18604,7 @@ impl DawApp {
         path: &str,
     ) -> Result<Vec<vst3::ParamInfo>, String> {
         match Self::plugin_kind_from_path(path) {
+            PluginKind::Native => Ok(Vec::new()),
             PluginKind::Vst3 => vst3::enumerate_params(path),
             PluginKind::Clap => {
                 let clap_id = self
@@ -16942,6 +18690,9 @@ impl DawApp {
     }
 
     fn plugin_display_name(path: &str) -> String {
+        if Self::is_treesynth_path(path) {
+            return "TreeSynth".to_string();
+        }
         let candidate = Path::new(path)
             .file_stem()
             .or_else(|| Path::new(path).file_name())
@@ -17083,6 +18834,10 @@ impl DawApp {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
+        if Self::is_treesynth_path(plugin_path) {
+            return self.save_treesynth_preset_at_path(index, &preset_path, preset_name);
+        }
+
         let (mut component_bytes, mut controller_bytes) = (Vec::new(), Vec::new());
         if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
             let (component, controller) = host.get_state_bytes();
@@ -17109,6 +18864,7 @@ impl DawApp {
             param_values: track.param_values.clone(),
             component_state: BASE64.encode(&component_bytes),
             controller_state: BASE64.encode(&controller_bytes),
+            treesynth: None,
         };
 
         let json = serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())?;
@@ -17116,7 +18872,12 @@ impl DawApp {
         Ok(preset_path.to_string_lossy().to_string())
     }
 
-    fn load_preset_from_path(&mut self, index: usize, path: &Path) -> Result<(), String> {
+    fn save_treesynth_preset_at_path(
+        &mut self,
+        index: usize,
+        preset_path: &Path,
+        preset_name: &str,
+    ) -> Result<String, String> {
         let track = self
             .tracks
             .get(index)
@@ -17125,12 +18886,103 @@ impl DawApp {
             .instrument_path
             .as_deref()
             .ok_or_else(|| "No instrument loaded".to_string())?;
+        if !Self::is_treesynth_path(plugin_path) {
+            return Err("TreeSynth preset requires native TreeSynth".to_string());
+        }
+        if track.treesynth.is_none() {
+            return Err("[TreeSynth] サンプル未ロード: プリセット保存不可".to_string());
+        }
+        if let Some(parent) = preset_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut state = track.treesynth.clone().unwrap();
+        let samples_dir_name = Self::treesynth_samples_dir_name(preset_name);
+        let samples_dir = preset_path
+            .parent()
+            .ok_or_else(|| "Preset folder missing".to_string())?
+            .join(&samples_dir_name);
+        fs::create_dir_all(&samples_dir).map_err(|e| e.to_string())?;
+        let mut used_names: HashMap<String, usize> = HashMap::new();
+        for sample in state.samples.iter_mut() {
+            let source = Path::new(&sample.path);
+            let file_name = source
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sample.wav");
+            let target_name = Self::treesynth_unique_filename(&mut used_names, file_name);
+            let target_path = samples_dir.join(&target_name);
+            if !target_path.exists() {
+                let _ = fs::copy(source, &target_path);
+            }
+            sample.path = format!("{}/{}", samples_dir_name, target_name);
+            sample.name = target_name.clone();
+        }
+        state.folder = Some(samples_dir_name);
+        let preset = Vst3PresetFile {
+            version: 1,
+            name: preset_name.to_string(),
+            plugin: Self::plugin_display_name(plugin_path),
+            param_names: Vec::new(),
+            param_ids: Vec::new(),
+            param_values: Vec::new(),
+            component_state: String::new(),
+            controller_state: String::new(),
+            treesynth: Some(state),
+        };
+        let json = serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())?;
+        fs::write(preset_path, json).map_err(|e| e.to_string())?;
+        Ok(preset_path.to_string_lossy().to_string())
+    }
+
+    fn load_preset_from_path(&mut self, index: usize, path: &Path) -> Result<(), String> {
+        let plugin_path = self
+            .tracks
+            .get(index)
+            .and_then(|track| track.instrument_path.as_deref())
+            .ok_or_else(|| "No instrument loaded".to_string())?
+            .to_string();
         let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let preset: Vst3PresetFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-        let expected = Self::plugin_display_name(plugin_path).to_ascii_lowercase();
+        let expected = Self::plugin_display_name(&plugin_path).to_ascii_lowercase();
         let actual = preset.plugin.to_ascii_lowercase();
         if expected != actual {
             return Err("Preset plugin does not match current instrument".to_string());
+        }
+
+        if Self::is_treesynth_path(&plugin_path) {
+            let mut state = preset
+                .treesynth
+                .ok_or_else(|| "TreeSynth preset data missing".to_string())?;
+            let preset_dir = path
+                .parent()
+                .ok_or_else(|| "Preset folder missing".to_string())?;
+            if let Some(folder) = state.folder.clone() {
+                if Path::new(&folder).is_relative() {
+                    state.folder = Some(preset_dir.join(&folder).to_string_lossy().to_string());
+                }
+            }
+            for sample in state.samples.iter_mut() {
+                let sample_path = Path::new(&sample.path);
+                if sample_path.is_relative() {
+                    let resolved = preset_dir.join(sample_path);
+                    sample.path = resolved.to_string_lossy().to_string();
+                }
+            }
+            if let Some(track) = self.tracks.get_mut(index) {
+                track.treesynth = Some(state);
+            }
+            if let Some(state) = self.track_audio.get(index) {
+                let enabled = Self::is_treesynth_path(&plugin_path);
+                if let Some(track) = self.tracks.get(index) {
+                    state.sync_treesynth(track, enabled);
+                }
+                if let Ok(mut runtime) = state.treesynth_runtime.lock() {
+                    runtime.voices.clear();
+                    runtime.sequence_index = 0;
+                }
+            }
+            self.preload_audio_clips(&self.audio_clip_cache);
+            return Ok(());
         }
 
         let component_bytes = if preset.component_state.trim().is_empty() {
@@ -17355,6 +19207,9 @@ impl DawApp {
         requested_program: u8,
     ) -> Result<(), String> {
         let params = match Self::plugin_kind_from_path(plugin_path) {
+            PluginKind::Native => {
+                return Err("Native plugins do not support GM presets".to_string());
+            }
             PluginKind::Vst3 => vst3::enumerate_params(plugin_path)?,
             PluginKind::Clap => {
                 let clap_id = clap_host::default_plugin_id(plugin_path)?;
@@ -17452,6 +19307,7 @@ impl DawApp {
             param_values: values,
             component_state: String::new(),
             controller_state: String::new(),
+            treesynth: None,
         }
     }
 
@@ -17599,6 +19455,285 @@ impl DawApp {
                 out.push(path.to_string_lossy().to_string());
             }
         }
+    }
+
+    fn treesynth_color_from_name(name: &str) -> [u8; 3] {
+        let mut hash = 2166136261u32;
+        for byte in name.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16777619);
+        }
+        let r = ((hash >> 16) & 0xFF) as u8;
+        let g = ((hash >> 8) & 0xFF) as u8;
+        let b = (hash & 0xFF) as u8;
+        [r, g, b]
+    }
+
+    fn treesynth_samples_dir_name(preset_name: &str) -> String {
+        let safe = Self::sanitize_folder_name(preset_name);
+        format!("{}_samples", safe)
+    }
+
+    fn treesynth_unique_filename(
+        used: &mut HashMap<String, usize>,
+        candidate: &str,
+    ) -> String {
+        if !used.contains_key(candidate) {
+            used.insert(candidate.to_string(), 1);
+            return candidate.to_string();
+        }
+        let count = used.entry(candidate.to_string()).or_insert(1);
+        *count += 1;
+        let stem = Path::new(candidate)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sample");
+        let ext = Path::new(candidate)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if ext.is_empty() {
+            format!("{}_{}", stem, count)
+        } else {
+            format!("{}_{}.{}", stem, count, ext)
+        }
+    }
+
+    fn scan_dir_for_exts_static(dir: &Path, out: &mut Vec<String>, exts: &[&str]) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let matches_ext = exts.iter().any(|e| *e == ext);
+            if path.is_dir() {
+                if matches_ext {
+                    out.push(path.to_string_lossy().to_string());
+                    continue;
+                }
+                Self::scan_dir_for_exts_static(&path, out, exts);
+            } else if matches_ext {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    fn load_treesynth_folder(folder: &Path) -> Vec<TreeSynthSample> {
+        let mut paths = Vec::new();
+        Self::scan_dir_for_exts_static(
+            folder,
+            &mut paths,
+            &["wav", "wave", "aif", "aiff", "flac", "ogg", "mp3"],
+        );
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let name = Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sample")
+                    .to_string();
+                TreeSynthSample {
+                    path,
+                    name: name.clone(),
+                    root_note: 60,
+                    gain: 1.0,
+                    pan: 0.0,
+                    start: 0.0,
+                    end: 1.0,
+                    color: Self::treesynth_color_from_name(&name),
+                }
+            })
+            .collect()
+    }
+
+    fn draw_treesynth_panel(
+        ui: &mut egui::Ui,
+        state: &mut TreeSynthState,
+        audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
+    ) -> bool {
+        let mut changed = false;
+        ui.heading("TreeSynth");
+        ui.label("Native sampler");
+        ui.add_space(4.0);
+
+        let folder_label = state
+            .folder
+            .clone()
+            .unwrap_or_else(|| "None".to_string());
+        ui.horizontal(|ui| {
+            ui.label("Folder");
+            ui.label(&folder_label);
+            if ui.button("Choose").clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    let folder = Self::normalize_windows_path(&folder);
+                    state.folder = Some(folder.to_string_lossy().to_string());
+                    state.samples = Self::load_treesynth_folder(&folder);
+                    if let Ok(mut cache) = audio_clip_cache.lock() {
+                        for sample in &state.samples {
+                            if cache.get(&sample.path).is_some() {
+                                continue;
+                            }
+                            if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
+                                cache.insert(sample.path.clone(), Arc::new(data));
+                            }
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            let reload_enabled = state.folder.is_some();
+            ui.add_enabled_ui(reload_enabled, |ui| {
+                if ui.button("Reload").clicked() {
+                    if let Some(folder) = state.folder.as_deref() {
+                        let folder = PathBuf::from(folder);
+                        state.samples = Self::load_treesynth_folder(&folder);
+                        if let Ok(mut cache) = audio_clip_cache.lock() {
+                            for sample in &state.samples {
+                                if cache.get(&sample.path).is_some() {
+                                    continue;
+                                }
+                                if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
+                                    cache.insert(sample.path.clone(), Arc::new(data));
+                                }
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+            });
+            ui.add_enabled_ui(reload_enabled, |ui| {
+                if ui.button("Clear").clicked() {
+                    state.folder = None;
+                    state.samples.clear();
+                    changed = true;
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            egui::ComboBox::from_id_source("treesynth_mode")
+                .selected_text(format!("{:?}", state.mode))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut state.mode, TreeSynthMode::Random, "Random").clicked() {
+                        changed = true;
+                    }
+                    if ui.selectable_value(&mut state.mode, TreeSynthMode::Layer, "Layer").clicked() {
+                        changed = true;
+                    }
+                    if ui.selectable_value(&mut state.mode, TreeSynthMode::Sequential, "Sequential").clicked() {
+                        changed = true;
+                    }
+                    if ui.selectable_value(&mut state.mode, TreeSynthMode::Morph, "Morph").clicked() {
+                        changed = true;
+                    }
+                    if ui.selectable_value(&mut state.mode, TreeSynthMode::Reorder, "Reorder").clicked() {
+                        changed = true;
+                    }
+                });
+        });
+        if matches!(state.mode, TreeSynthMode::Morph) {
+            changed |= ui
+                .add(egui::Slider::new(&mut state.morph, 0.0..=1.0).text("Morph"))
+                .changed();
+        }
+        if matches!(state.mode, TreeSynthMode::Reorder) {
+            changed |= ui
+                .add(egui::Slider::new(&mut state.reorder, 0.0..=1.0).text("Reorder"))
+                .changed();
+        }
+
+        ui.add_space(6.0);
+        ui.label("Amp");
+        // パラメータごとに右クリックメニューを追加
+        // TreeSynthパラメータに一意のparam_idを割り当て
+        let treesynth_param_defs = [
+            ("Gain", &mut state.gain, 0, 0.0, 2.0),
+            ("Attack", &mut state.attack, 1, 0.0, 5.0),
+            ("Decay", &mut state.decay, 2, 0.0, 5.0),
+            ("Sustain", &mut state.sustain, 3, 0.0, 1.0),
+            ("Release", &mut state.release, 4, 0.0, 8.0),
+        ];
+        // pending_midi_learn, pending_automationは親UIで管理する必要あり
+        // ここではグローバル変数的に仮定（本来はAppState等で管理）
+        thread_local! {
+            static PENDING_MIDI_LEARN: std::cell::RefCell<Option<(usize, u32, String)>> = std::cell::RefCell::new(None);
+            static PENDING_AUTOMATION: std::cell::RefCell<Option<(usize, u32, String)>> = std::cell::RefCell::new(None);
+        }
+        let track_index = 0; // TODO: 実際のトラックインデックスを渡す
+        for (label, value, param_id, min, max) in treesynth_param_defs {
+            let mut slider = egui::Slider::new(value, min..=max).text(label);
+            let response = ui.add(slider);
+            changed |= response.changed();
+            response.context_menu(|ui| {
+                if ui.button("Create Automation").clicked() {
+                    PENDING_AUTOMATION.with(|pending| {
+                        *pending.borrow_mut() = Some((track_index, param_id, label.to_string()));
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Midi Learn").clicked() {
+                    PENDING_MIDI_LEARN.with(|pending| {
+                        *pending.borrow_mut() = Some((track_index, param_id, label.to_string()));
+                    });
+                    ui.close_menu();
+                }
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.label("Modulation");
+        changed |= ui
+            .add(egui::Slider::new(&mut state.vibrato_rate, 0.1..=20.0).text("Vibrato Rate"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut state.vibrato_depth, 0.0..=1.0).text("Vibrato Depth"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut state.tremolo_rate, 0.1..=20.0).text("Tremolo Rate"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut state.tremolo_depth, 0.0..=1.0).text("Tremolo Depth"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut state.reverb_mix, 0.0..=1.0).text("Reverb Mix"))
+            .changed();
+
+        ui.add_space(6.0);
+        ui.label("Performance");
+        changed |= ui
+            .add(egui::Slider::new(&mut state.pitch_bend_range, 1.0..=24.0).text("Pitch Bend"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut state.portamento_ms, 0.0..=500.0).text("Portamento ms"))
+            .changed();
+        changed |= ui.checkbox(&mut state.legato, "Legato").changed();
+
+        ui.add_space(6.0);
+        ui.label(format!("Samples: {}", state.samples.len()));
+        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+            for sample in state.samples.iter_mut() {
+                ui.horizontal(|ui| {
+                    ui.label(&sample.name);
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut sample.root_note).clamp_range(0..=127))
+                        .changed();
+                    changed |= ui.add(egui::DragValue::new(&mut sample.gain).speed(0.01)).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut sample.pan).speed(0.01)).changed();
+                });
+            }
+        });
+
+        changed
     }
 
     fn home_dir() -> Option<PathBuf> {
@@ -17759,6 +19894,19 @@ impl DawApp {
             track.params = default_instrument_params();
             track.param_ids.clear();
             track.param_values.clear();
+            if Self::is_treesynth_path(track.instrument_path.as_deref().unwrap_or("")) {
+                track.treesynth = Some(TreeSynthState::default());
+            } else {
+                track.treesynth = None;
+            }
+            if let Some(state) = self.track_audio.get(index) {
+                let enabled = track
+                    .instrument_path
+                    .as_deref()
+                    .map(Self::is_treesynth_path)
+                    .unwrap_or(false);
+                state.sync_treesynth(track, enabled);
+            }
         }
         if let Some(state) = self.track_audio.get_mut(index) {
             if let Some(host) = state.host.take() {
@@ -18251,6 +20399,8 @@ fn render_plan_to_wav(
     plan: RenderPlan,
     done: &AtomicU64,
     total: &AtomicU64,
+    track_audio: &[TrackAudioState],
+    audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> Result<(), String> {
     let channels = 2u16;
     let tempo = plan.tempo_bpm.max(1.0);
@@ -18478,118 +20628,138 @@ fn render_plan_to_wav(
             }
             temp.fill(0.0);
             let block_beat = (block_start as f64 / samples_per_beat) as f32;
-            for lane in &track.automation_lanes {
-                if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                    match lane.target {
-                        AutomationTarget::Instrument => {
-                            if let Some(host) = host.as_mut() {
-                                host.push_param_change(lane.param_id, value as f64);
+            let is_treesynth = track.instrument_path.as_deref().map(|p| p.eq_ignore_ascii_case("native:treesynth")).unwrap_or(false);
+            if is_treesynth {
+                if let Some(track_audio) = track_audio.get(track_index) {
+                    let (_processed, _events) = mix_treesynth_block(
+                        &mut temp,
+                        channels as usize,
+                        plan.sample_rate as f32,
+                        block_start,
+                        block_end,
+                        samples_per_beat,
+                        false,
+                        false,
+                        &track.notes,
+                        track_audio,
+                        audio_clip_cache,
+                    );
+                }
+            } else {
+                // 従来のVST/CLAP処理
+                for lane in &track.automation_lanes {
+                    if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                        match lane.target {
+                            AutomationTarget::Instrument => {
+                                if let Some(host) = host.as_mut() {
+                                    host.push_param_change(lane.param_id, value as f64);
+                                }
                             }
-                        }
-                        AutomationTarget::Effect(fx_index) => {
-                            if let Some(fx) = fx_hosts.get_mut(fx_index) {
-                                fx.push_param_change(lane.param_id, value as f64);
+                            AutomationTarget::Effect(fx_index) => {
+                                if let Some(fx) = fx_hosts.get_mut(fx_index) {
+                                    fx.push_param_change(lane.param_id, value as f64);
+                                }
                             }
                         }
                     }
                 }
-            }
-            let mut events = if plan.render_tail_mode == RenderTailMode::Release
-                && start_samples > 0
-                && block_start == start_samples
-            {
-                (0u8..=127)
-                    .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            events.extend(collect_block_events(
-                &track.notes,
-                block_start,
-                block_end,
-                samples_per_beat,
-            ));
-            if let Some(host) = host.as_mut() {
-                let _ = host.process_f32(&mut temp, channels as usize, &events);
-            }
-            if let Some(clips) = per_track_clips.get(track_index) {
-                for (clip, data) in clips {
-                    let clip_end = clip.start_samples + clip.length_samples;
-                    if block_end <= clip.start_samples || block_start >= clip_end {
-                        continue;
-                    }
-                    let src_channels = data.channels.max(1);
-                    let src_frames = data.samples.len() / src_channels;
-                    if src_frames == 0 {
-                        continue;
-                    }
-                    let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
-                    let time_mul = clip.time_mul.max(0.01) as f64;
-                    let start_in_block = block_start.max(clip.start_samples) - block_start;
-                    let end_in_block = block_end.min(clip_end) - block_start;
-                    for i in start_in_block..end_in_block {
-                        let clip_pos = i + block_start - clip.start_samples;
-                        let pos =
-                            ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                                .max(0.0);
-                        let len = src_frames as f64;
-                        let src_pos = if len > 0.0 {
-                            if plan.render_tail_mode == RenderTailMode::Wrap {
-                                pos % len
-                            } else if pos >= len {
-                                continue;
+                let mut events = if plan.render_tail_mode == RenderTailMode::Release
+                    && start_samples > 0
+                    && block_start == start_samples
+                {
+                    (0u8..=127)
+                        .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                events.extend(collect_block_events(
+                    &track.notes,
+                    block_start,
+                    block_end,
+                    samples_per_beat,
+                ));
+                if let Some(host) = host.as_mut() {
+                    let _ = host.process_f32(&mut temp, channels as usize, &events);
+                }
+                if let Some(clips) = per_track_clips.get(track_index) {
+                    for (clip, data) in clips {
+                        let clip_end = clip.start_samples + clip.length_samples;
+                        if block_end <= clip.start_samples || block_start >= clip_end {
+                            continue;
+                        }
+                        let src_channels = data.channels.max(1);
+                        let src_frames = data.samples.len() / src_channels;
+                        if src_frames == 0 {
+                            continue;
+                        }
+                        let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
+                        let time_mul = clip.time_mul.max(0.01) as f64;
+                        let start_in_block = block_start.max(clip.start_samples) - block_start;
+                        let end_in_block = block_end.min(clip_end) - block_start;
+                        for i in start_in_block..end_in_block {
+                            let clip_pos = i + block_start - clip.start_samples;
+                            let pos =
+                                ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                    .max(0.0);
+                            let len = src_frames as f64;
+                            let src_pos = if len > 0.0 {
+                                if plan.render_tail_mode == RenderTailMode::Wrap {
+                                    pos % len
+                                } else if pos >= len {
+                                    continue;
+                                } else {
+                                    pos
+                                }
                             } else {
                                 pos
-                            }
-                        } else {
-                            pos
-                        };
-                        let base = src_pos.floor() as usize;
-                        let frac = (src_pos - base as f64) as f32;
-                        let next = (base + 1).min(src_frames.saturating_sub(1));
-                        for ch in 0..channels as usize {
-                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                            let idx0 = base * src_channels + src_ch;
-                            let idx1 = next * src_channels + src_ch;
-                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                            let sample = s0 + (s1 - s0) * frac;
-                            let out_index = i as usize * channels as usize + ch;
-                            if out_index < temp.len() {
-                                temp[out_index] += sample * clip.gain;
+                            };
+                            let base = src_pos.floor() as usize;
+                            let frac = (src_pos - base as f64) as f32;
+                            let next = (base + 1).min(src_frames.saturating_sub(1));
+                            for ch in 0..channels as usize {
+                                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                                let idx0 = base * src_channels + src_ch;
+                                let idx1 = next * src_channels + src_ch;
+                                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                                let sample = s0 + (s1 - s0) * frac;
+                                let out_index = i as usize * channels as usize + ch;
+                                if out_index < temp.len() {
+                                    temp[out_index] += sample * clip.gain;
+                                }
                             }
                         }
                     }
                 }
-            }
-            let mut current = &mut temp;
-            let mut scratch = &mut fx_temp;
-            for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
-                if track
-                    .effect_bypass
-                    .get(fx_index)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
+                let mut current = &mut temp;
+                let mut scratch = &mut fx_temp;
+                for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
+                    if track
+                        .effect_bypass
+                        .get(fx_index)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    scratch.fill(0.0);
+                    if fx
+                        .process_f32_with_input(
+                            current.as_slice(),
+                            scratch.as_mut_slice(),
+                            channels as usize,
+                            &events,
+                        )
+                        .is_ok()
+                    {
+                        std::mem::swap(&mut current, &mut scratch);
+                    }
                 }
-                scratch.fill(0.0);
-                if fx
-                    .process_f32_with_input(
-                        current.as_slice(),
-                        scratch.as_mut_slice(),
-                        channels as usize,
-                        &events,
-                    )
-                    .is_ok()
-                {
-                    std::mem::swap(&mut current, &mut scratch);
+                let level = track.level.clamp(0.0, 1.0);
+                for (out, sample) in output.iter_mut().zip(current.iter()) {
+                    *out += *sample * level;
                 }
-            }
-            let level = track.level.clamp(0.0, 1.0);
-            for (out, sample) in output.iter_mut().zip(current.iter()) {
-                *out += *sample * level;
             }
         }
         apply_master_processing(
@@ -18621,6 +20791,7 @@ fn load_render_host(
     with_input: bool,
 ) -> Option<RenderHost> {
     match DawApp::plugin_kind_from_path(path) {
+        PluginKind::Native => None,
         PluginKind::Vst3 => {
             if with_input {
                 vst3::Vst3Host::load_with_input(path, sample_rate, block_size, channels, channels)
@@ -19495,6 +21666,336 @@ thread_local! {
     static FX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
+fn treesynth_adsr_level(state: &TreeSynthState, elapsed: f32) -> f32 {
+    let attack = state.attack.max(0.0001);
+    let decay = state.decay.max(0.0001);
+    let sustain = state.sustain.clamp(0.0, 1.0);
+    if elapsed <= 0.0 {
+        0.0
+    } else if elapsed < attack {
+        (elapsed / attack).clamp(0.0, 1.0)
+    } else if elapsed < attack + decay {
+        let t = (elapsed - attack) / decay;
+        (1.0 - (1.0 - sustain) * t).clamp(0.0, 1.0)
+    } else {
+        sustain
+    }
+}
+
+fn treesynth_spawn_voice(
+    runtime: &mut TreeSynthRuntime,
+    state: &TreeSynthState,
+    sample_index: usize,
+    sample: &TreeSynthSample,
+    data: &AudioClipData,
+    note: u8,
+    velocity: u8,
+    start_sample: u64,
+    sample_rate: f32,
+) {
+    let src_frames = data.samples.len() / data.channels.max(1);
+    if src_frames == 0 {
+        return;
+    }
+    let start = (sample.start.clamp(0.0, 1.0) * src_frames as f32) as f64;
+    let mut end = (sample.end.clamp(0.0, 1.0) * src_frames as f32) as f64;
+    if end <= start {
+        end = (start + 1.0).min(src_frames as f64);
+    }
+    let note_diff = note as f64 - sample.root_note as f64;
+    let target_rate = 2.0f64.powf(note_diff / 12.0);
+    let rate_ratio = data.sample_rate as f64 / sample_rate.max(1.0) as f64;
+    let mut rate = target_rate;
+    let mut rate_step = 0.0f64;
+    let mut glide_remaining = 0u64;
+    if state.portamento_ms > 0.0 {
+        if let Some(last_note) = runtime.last_note {
+            if !state.legato || runtime.voices.iter().any(|v| v.release_sample.is_none()) {
+                let last_diff = last_note as f64 - sample.root_note as f64;
+                let start_rate = 2.0f64.powf(last_diff / 12.0);
+                let glide_samples = (state.portamento_ms / 1000.0 * sample_rate.max(1.0))
+                    .round()
+                    .max(1.0) as u64;
+                rate = start_rate;
+                rate_step = (target_rate - start_rate) / glide_samples as f64;
+                glide_remaining = glide_samples;
+            }
+        }
+    }
+    let velocity_gain = (velocity as f32 / 127.0).clamp(0.0, 1.0);
+    let gain = state.gain * sample.gain * velocity_gain;
+    runtime.voices.push(TreeSynthVoice {
+        sample_index,
+        sample_pos: start,
+        sample_end: end,
+        step: rate_ratio * rate,
+        note,
+        start_sample,
+        release_sample: None,
+        release_level: 1.0,
+        gain,
+        pan: sample.pan,
+        rate,
+        rate_step,
+        glide_remaining,
+    });
+}
+
+fn mix_treesynth_block(
+    temp: &mut [f32],
+    channels: usize,
+    sample_rate: f32,
+    block_start: u64,
+    block_end: u64,
+    samples_per_beat: f64,
+    panic_notes: bool,
+    loop_wrapped: bool,
+    notes: &[PianoRollNote],
+    state: &TrackAudioState,
+    audio_cache: &Arc<Mutex<AudioClipCache>>,
+) -> (bool, Vec<vst3::MidiEvent>) {
+    let treesynth_state = match state.treesynth_state.as_ref().and_then(|arc| arc.lock().ok()) {
+        Some(guard) => guard.clone(),
+        None => {
+            println!("[TreeSynth Render Debug] TreeSynthState is None during render!");
+            return (false, Vec::new());
+        }
+    };
+    if treesynth_state.samples.is_empty() {
+        println!("[TreeSynth Render Debug] TreeSynthState.samples is empty during render!");
+        return (false, Vec::new());
+    } else {
+        println!("[TreeSynth Render Debug] TreeSynthState.samples count: {}", treesynth_state.samples.len());
+    }
+
+    let mut events = collect_block_events(notes, block_start, block_end, samples_per_beat);
+    if panic_notes {
+        for channel in 0u8..16 {
+            events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+            events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+        }
+        for channel in 0u8..16 {
+            events.extend(
+                (0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
+            );
+        }
+    }
+    if loop_wrapped {
+        events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
+    }
+    if let Ok(mut queued) = state.midi_events.lock() {
+        events.extend(queued.drain(..));
+    }
+
+    let mut runtime = match state.treesynth_runtime.lock() {
+        Ok(guard) => guard,
+        Err(_) => return (false, events),
+    };
+
+    let sample_count = treesynth_state.samples.len();
+    let mut note_offs: Vec<(u8, u64)> = Vec::new();
+    for event in &events {
+        match event {
+            vst3::MidiEvent::NoteOn {
+                note,
+                velocity,
+                sample_offset,
+                ..
+            } => {
+                if *velocity == 0 {
+                    let offset = (*sample_offset).max(0) as u64;
+                    note_offs.push((*note, block_start + offset));
+                    continue;
+                }
+                let offset = (*sample_offset).max(0) as u64;
+                let start_sample = block_start + offset;
+                match treesynth_state.mode {
+                    TreeSynthMode::Random => {
+                        let idx = (runtime.next_rand() as usize) % sample_count;
+                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                            let mut sample = treesynth_state.samples[idx].clone();
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                        }
+                    }
+                    TreeSynthMode::Sequential => {
+                        let idx = runtime.sequence_index % sample_count;
+                        runtime.sequence_index = runtime.sequence_index.wrapping_add(1);
+                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                            let sample = treesynth_state.samples[idx].clone();
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                        }
+                    }
+                    TreeSynthMode::Reorder => {
+                        let pos = ((f32::from(*note) / 127.0) + treesynth_state.reorder).fract();
+                        let idx = (pos * sample_count as f32).floor() as usize;
+                        let idx = idx.min(sample_count.saturating_sub(1));
+                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                            let sample = treesynth_state.samples[idx].clone();
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                        }
+                    }
+                    TreeSynthMode::Morph => {
+                        let morph = treesynth_state.morph.clamp(0.0, 1.0) * (sample_count.saturating_sub(1) as f32);
+                        let idx0 = morph.floor() as usize;
+                        let idx1 = (idx0 + 1).min(sample_count.saturating_sub(1));
+                        let frac = morph - idx0 as f32;
+                        let weight0 = (1.0f32 - frac).clamp(0.0, 1.0);
+                        let weight1 = frac.clamp(0.0, 1.0);
+                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx0].path)) {
+                            let mut sample = treesynth_state.samples[idx0].clone();
+                            sample.gain *= weight0;
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx0, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                        }
+                        if idx1 != idx0 {
+                            if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx1].path)) {
+                                let mut sample = treesynth_state.samples[idx1].clone();
+                                sample.gain *= weight1;
+                                treesynth_spawn_voice(&mut runtime, &treesynth_state, idx1, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            }
+                        }
+                    }
+                    TreeSynthMode::Layer => {
+                        for idx in 0..sample_count {
+                            if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                                let sample = treesynth_state.samples[idx].clone();
+                                treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            }
+                        }
+                    }
+                }
+                runtime.last_note = Some(*note);
+            }
+            vst3::MidiEvent::NoteOff { note, sample_offset, .. } => {
+                let offset = (*sample_offset).max(0) as u64;
+                note_offs.push((*note, block_start + offset));
+            }
+            _ => {}
+        }
+    }
+
+    for (note, release_sample) in note_offs {
+        for voice in runtime.voices.iter_mut().filter(|v| v.note == note && v.release_sample.is_none()) {
+            let elapsed = (release_sample.saturating_sub(voice.start_sample)) as f32 / sample_rate.max(1.0);
+            voice.release_level = treesynth_adsr_level(&treesynth_state, elapsed);
+            voice.release_sample = Some(release_sample);
+        }
+    }
+
+    let mut processed = false;
+    let frame_count = (block_end - block_start) as usize;
+    runtime.voices.retain_mut(|voice| {
+        let sample_index = voice.sample_index;
+        let sample = match treesynth_state.samples.get(sample_index) {
+            Some(sample) => sample,
+            None => return false,
+        };
+        let data = match audio_cache.lock().ok().and_then(|c| c.get(&sample.path)) {
+            Some(data) => data,
+            None => return false,
+        };
+        if let Some(release_sample) = voice.release_sample {
+            let release_frames: u64 =
+                (treesynth_state.release.max(0.0001) * sample_rate.max(1.0)) as u64;
+            if block_start >= release_sample.saturating_add(release_frames) {
+                return false;
+            }
+        }
+        let src_channels = data.channels.max(1);
+        let src_frames = data.samples.len() / src_channels;
+        if src_frames == 0 {
+            return false;
+        }
+        let rate_ratio = data.sample_rate as f64 / sample_rate.max(1.0) as f64;
+        let tremolo_rate = treesynth_state.tremolo_rate.max(0.1);
+        let vibrato_rate = treesynth_state.vibrato_rate.max(0.1);
+        let mut alive = false;
+        for i in 0..frame_count {
+            let current_sample = block_start + i as u64;
+            if current_sample < voice.start_sample {
+                continue;
+            }
+            let elapsed = (current_sample - voice.start_sample) as f32 / sample_rate.max(1.0);
+            let mut level = if let Some(release_sample) = voice.release_sample {
+                if current_sample >= release_sample {
+                    let release = treesynth_state.release.max(0.0001);
+                    let rel_t = (current_sample - release_sample) as f32 / sample_rate.max(1.0);
+                    let remaining = (1.0 - rel_t / release).clamp(0.0, 1.0);
+                    voice.release_level * remaining
+                } else {
+                    treesynth_adsr_level(&treesynth_state, elapsed)
+                }
+            } else {
+                treesynth_adsr_level(&treesynth_state, elapsed)
+            };
+            if level <= 0.0001 {
+                continue;
+            }
+            let trem = if treesynth_state.tremolo_depth > 0.0 {
+                let t = (TAU * tremolo_rate * elapsed).sin();
+                (1.0 - treesynth_state.tremolo_depth)
+                    + (0.5 + 0.5 * t) * treesynth_state.tremolo_depth
+            } else {
+                1.0
+            };
+            level *= trem;
+
+            if voice.glide_remaining > 0 {
+                voice.rate += voice.rate_step;
+                voice.glide_remaining -= 1;
+            }
+            let vibrato = if treesynth_state.vibrato_depth > 0.0 {
+                let t = (TAU * vibrato_rate * elapsed).sin() as f64;
+                2.0f64.powf((treesynth_state.vibrato_depth as f64 * t) / 12.0)
+            } else {
+                1.0
+            };
+            voice.step = rate_ratio * voice.rate * vibrato;
+            let pos = voice.sample_pos;
+            if pos >= voice.sample_end {
+                continue;
+            }
+            let base = pos.floor() as usize;
+            let next = (base + 1).min(src_frames.saturating_sub(1));
+            let frac = (pos - base as f64) as f32;
+            let left_gain = if channels >= 2 {
+                (1.0 - voice.pan.clamp(-1.0, 1.0)) * 0.5
+            } else {
+                1.0
+            };
+            let right_gain = if channels >= 2 {
+                (1.0 + voice.pan.clamp(-1.0, 1.0)) * 0.5
+            } else {
+                1.0
+            };
+            for ch in 0..channels {
+                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                let idx0 = base * src_channels + src_ch;
+                let idx1 = next * src_channels + src_ch;
+                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                let mut sample_value = s0 + (s1 - s0) * frac;
+                let pan_gain = if ch == 0 { left_gain } else { right_gain };
+                sample_value *= voice.gain * level * pan_gain;
+                let out_index = i * channels + ch;
+                if out_index < temp.len() {
+                    temp[out_index] += sample_value;
+                }
+            }
+            voice.sample_pos += voice.step;
+            alive = true;
+        }
+        if voice.sample_pos >= voice.sample_end {
+            return false;
+        }
+        alive
+    });
+
+    if !runtime.voices.is_empty() {
+        processed = true;
+    }
+    (processed, events)
+}
+
 fn mix_track_hosts(
     output: &mut [f32],
     channels: usize,
@@ -19639,6 +22140,25 @@ fn mix_track_hosts(
                 let mut track_processed = false;
                 let mut remaining_params: Vec<PendingParamChange> = Vec::new();
                 let mut filtered_events: Vec<vst3::MidiEvent> = Vec::new();
+                if state.treesynth_enabled.load(Ordering::Relaxed) {
+                    let (processed, events) = mix_treesynth_block(
+                        &mut temp,
+                        channels,
+                        sample_rate,
+                        block_start,
+                        block_end,
+                        samples_per_beat,
+                        panic_notes,
+                        loop_wrapped,
+                        &notes,
+                        state,
+                        audio_cache,
+                    );
+                    if processed {
+                        track_processed = true;
+                    }
+                    filtered_events = events;
+                }
                 if let Some(host) = state.host.as_ref() {
                     let mut events =
                         collect_block_events(&notes, block_start, block_end, samples_per_beat);
@@ -19732,39 +22252,67 @@ fn mix_track_hosts(
                         if block_end <= clip.start_samples || block_start >= clip_end {
                             continue;
                         }
-                        let src_channels = data.channels.max(1);
-                        let src_frames = data.samples.len() / src_channels;
-                        if src_frames == 0 {
-                            continue;
-                        }
-                        let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
-                        let time_mul = clip.time_mul.max(0.01) as f64;
-                        let start_in_block = block_start.max(clip.start_samples) - block_start;
-                        let end_in_block = block_end.min(clip_end) - block_start;
-                        for i in start_in_block..end_in_block {
-                            let clip_pos = i + block_start - clip.start_samples;
-                            let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                                .max(0.0);
-                            let src_pos = if src_frames > 0 {
-                                let len = src_frames as f64;
-                                pos % len
-                            } else {
-                                pos
-                            };
-                            let base = src_pos.floor() as usize;
-                            let frac = (src_pos - base as f64) as f32;
-                            let next = (base + 1).min(src_frames.saturating_sub(1));
-                            for ch in 0..channels {
-                                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                                let idx0 = base * src_channels + src_ch;
-                                let idx1 = next * src_channels + src_ch;
-                                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                                let sample = s0 + (s1 - s0) * frac;
-                                let out_index = i as usize * channels + ch;
-                                if out_index < temp.len() {
-                                    temp[out_index] += sample * clip.gain;
-                                }
+                        if clip.stretch_mode == AudioStretchMode::Speed {
+                            mix_clip_resample(
+                                &mut temp,
+                                channels,
+                                clip,
+                                data,
+                                block_start,
+                                block_end,
+                                sample_rate,
+                            );
+                        } else {
+                            #[cfg(all(windows, has_rubberband))]
+                            {
+                                let formant_preserve = matches!(
+                                    clip.stretch_mode,
+                                    AudioStretchMode::StretchFormant
+                                        | AudioStretchMode::StretchNeutral
+                                        | AudioStretchMode::StretchVocal
+                                );
+                                let time_mul = clip.time_mul.max(0.01) as f64;
+                                let pitch_scale = time_mul
+                                    * 2.0f64.powf(clip.pitch_semitones as f64 / 12.0);
+                                let formant_scale = clip.formant_scale.max(0.25) as f64;
+                                let stretcher = {
+                                    let mut cache = match audio_cache.lock() {
+                                        Ok(cache) => cache,
+                                        Err(_) => {
+                                            continue;
+                                        }
+                                    };
+                                    cache.get_or_create_stretcher(
+                                        clip.clip_id,
+                                        sample_rate as u32,
+                                        channels,
+                                        pitch_scale,
+                                        formant_preserve,
+                                        formant_scale,
+                                    )
+                                };
+                                mix_clip_stretch(
+                                    &mut temp,
+                                    channels,
+                                    clip,
+                                    data,
+                                    block_start,
+                                    block_end,
+                                    sample_rate,
+                                    &stretcher,
+                                );
+                            }
+                            #[cfg(any(not(windows), not(has_rubberband)))]
+                            {
+                                mix_clip_resample(
+                                    &mut temp,
+                                    channels,
+                                    clip,
+                                    data,
+                                    block_start,
+                                    block_end,
+                                    sample_rate,
+                                );
                             }
                         }
                         track_processed = true;
@@ -19850,6 +22398,150 @@ fn mix_track_hosts(
     }
 
     processed_any
+}
+
+fn mix_clip_resample(
+    temp: &mut [f32],
+    channels: usize,
+    clip: &AudioClipRender,
+    data: &AudioClipData,
+    block_start: u64,
+    block_end: u64,
+    sample_rate: f32,
+) {
+    let clip_end = clip.start_samples + clip.length_samples;
+    let src_channels = data.channels.max(1);
+    let src_frames = data.samples.len() / src_channels;
+    if src_frames == 0 {
+        return;
+    }
+    let rate_ratio = data.sample_rate as f64 / sample_rate as f64;
+    let time_mul = clip.time_mul.max(0.01) as f64;
+    let start_in_block = block_start.max(clip.start_samples) - block_start;
+    let end_in_block = block_end.min(clip_end) - block_start;
+    for i in start_in_block..end_in_block {
+        let clip_pos = i + block_start - clip.start_samples;
+        let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul).max(0.0);
+        let src_pos = if src_frames > 0 {
+            let len = src_frames as f64;
+            pos % len
+        } else {
+            pos
+        };
+        let base = src_pos.floor() as usize;
+        let frac = (src_pos - base as f64) as f32;
+        let next = (base + 1).min(src_frames.saturating_sub(1));
+        for ch in 0..channels {
+            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+            let idx0 = base * src_channels + src_ch;
+            let idx1 = next * src_channels + src_ch;
+            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+            let sample = s0 + (s1 - s0) * frac;
+            let out_index = i as usize * channels + ch;
+            if out_index < temp.len() {
+                temp[out_index] += sample * clip.gain;
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, has_rubberband))]
+fn mix_clip_stretch(
+    temp: &mut [f32],
+    channels: usize,
+    clip: &AudioClipRender,
+    data: &AudioClipData,
+    block_start: u64,
+    block_end: u64,
+    sample_rate: f32,
+    stretcher: &Arc<Mutex<RubberBandClipState>>,
+) {
+    let clip_end = clip.start_samples + clip.length_samples;
+    let start_in_block = block_start.max(clip.start_samples) - block_start;
+    let end_in_block = block_end.min(clip_end) - block_start;
+    let frames_needed = (end_in_block - start_in_block) as usize;
+    if frames_needed == 0 {
+        return;
+    }
+    let src_channels = data.channels.max(1);
+    let src_frames = data.samples.len() / src_channels;
+    if src_frames == 0 {
+        return;
+    }
+    let rate_ratio = data.sample_rate as f64 / sample_rate.max(1.0) as f64;
+    let time_mul = clip.time_mul.max(0.01) as f64;
+    let mut state = match stretcher.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if state.state.is_null() {
+        drop(state);
+        mix_clip_resample(
+            temp,
+            channels,
+            clip,
+            data,
+            block_start,
+            block_end,
+            sample_rate,
+        );
+        return;
+    }
+    if state.needs_reposition {
+        state.reset_stream();
+        state.needs_reposition = false;
+    }
+    let block_size = state.block_size.max(64);
+    for ch in 0..channels {
+        state.input_buffers[ch].resize(block_size, 0.0);
+        state.output_buffers[ch].resize(block_size, 0.0);
+    }
+
+    let mut frames_done = 0usize;
+    while frames_done < frames_needed {
+        let chunk = (frames_needed - frames_done).min(block_size);
+        for ch in 0..channels {
+            for i in 0..block_size {
+                state.input_buffers[ch][i] = 0.0;
+            }
+        }
+        for i in 0..chunk {
+            let clip_pos = frames_done as u64 + i as u64 + block_start - clip.start_samples;
+            let pos = ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul).max(0.0);
+            let src_pos = if src_frames > 0 {
+                pos.rem_euclid(src_frames as f64)
+            } else {
+                pos
+            };
+            let base = src_pos.floor() as usize;
+            let frac = (src_pos - base as f64) as f32;
+            let next = (base + 1).min(src_frames.saturating_sub(1));
+            for ch in 0..channels {
+                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                let idx0 = base * src_channels + src_ch;
+                let idx1 = next * src_channels + src_ch;
+                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                state.input_buffers[ch][i] = s0 + (s1 - s0) * frac;
+            }
+        }
+        let input_ptrs: Vec<*const f32> = state.input_buffers.iter().map(|b| b.as_ptr()).collect();
+        let mut output_ptrs: Vec<*mut f32> =
+            state.output_buffers.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        unsafe {
+            rubberband::rubberband_live_shift(state.state, input_ptrs.as_ptr(), output_ptrs.as_mut_ptr());
+        }
+        for i in 0..chunk {
+            let out_index = (start_in_block as usize + frames_done + i) * channels;
+            for ch in 0..channels {
+                if out_index + ch < temp.len() {
+                    temp[out_index + ch] += state.output_buffers[ch][i] * clip.gain;
+                }
+            }
+        }
+        frames_done += chunk;
+    }
 }
 
 fn apply_fade_in_if_needed(samples: &mut [f32], channels: usize, flag: &AtomicBool) {

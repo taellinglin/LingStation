@@ -34,6 +34,7 @@ hound = "3.5"
 ogg = "0.8"
 vorbis-encoder = "0.1"
 flacenc = "0.5.1"
+rustfft = "6.2"
 windows-sys = { version = "0.52", features = [
 	"Win32_Foundation",
 	"Win32_Graphics_Gdi",
