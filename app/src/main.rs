@@ -41,9 +41,11 @@ const AUDIO_CLIP_CACHE_MAX_ENTRIES: usize = 256;
 const WAVEFORM_CACHE_MAX_ENTRIES: usize = 256;
 const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
 const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
+const TREESYNTH_MAX_VOICES: usize = 64;
 
 fn main() -> eframe::Result<()> {
     install_crash_logger();
+    install_runtime_working_directory();
     init_windows_com();
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "render" {
@@ -97,6 +99,35 @@ fn init_windows_com() {
     {
         vst3::init_windows_com_for_thread();
     }
+}
+
+fn install_runtime_working_directory() {
+    let Some(root) = detect_runtime_root() else {
+        return;
+    };
+    let _ = std::env::set_current_dir(root);
+}
+
+fn detect_runtime_root() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let mut cursor = Some(parent.to_path_buf());
+            for _ in 0..5 {
+                let Some(dir) = cursor.clone() else {
+                    break;
+                };
+                candidates.push(dir.clone());
+                cursor = dir.parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("synths").exists() || dir.join("sample_kits").exists())
 }
 
 fn load_app_icon() -> Option<egui::IconData> {
@@ -864,10 +895,7 @@ impl TrackAudioState {
             treesynth_state: Some(Arc::new(Mutex::new(
                 match &track.treesynth {
                     Some(ts) if !ts.samples.is_empty() => ts.clone(),
-                    _ => {
-                        eprintln!("[TreeSynth Render Debug] from_track: samples is empty, using default");
-                        TreeSynthState::default()
-                    }
+                    _ => TreeSynthState::default(),
                 }
             ))),
             treesynth_runtime: Arc::new(Mutex::new(TreeSynthRuntime::new())),
@@ -899,8 +927,6 @@ impl TrackAudioState {
                 if let Ok(mut treesynth) = treesynth_arc.lock() {
                     *treesynth = state;
                 }
-            } else {
-                eprintln!("[TreeSynth Render Debug] sync_treesynth: samples is empty, not updating state");
             }
         }
         self.treesynth_enabled.store(enabled, Ordering::Relaxed);
@@ -1387,6 +1413,7 @@ enum RenderTailMode {
 
 #[derive(Clone)]
 struct RenderTrack {
+    source_track_index: Option<usize>,
     notes: Vec<PianoRollNote>,
     instrument_path: Option<String>,
     instrument_clap_id: Option<String>,
@@ -6496,16 +6523,22 @@ impl DawApp {
         }
 
         if let Some(ui_host) = self.plugin_ui.as_ref() {
+            let mut restored_visibility = false;
             if self.plugin_ui_hidden {
                 show_plugin_window(ui_host.hwnd);
                 self.plugin_ui_hidden = false;
+                restored_visibility = true;
             }
             pump_plugin_messages(ui_host.hwnd);
             show_plugin_window(ui_host.hwnd);
-            bring_window_to_front(ui_host.hwnd);
+            if restored_visibility {
+                bring_window_to_front(ui_host.hwnd);
+            }
             match &ui_host.editor {
                 PluginUiEditor::Vst3(editor) => {
-                    editor.set_focus(true);
+                    if restored_visibility {
+                        editor.set_focus(true);
+                    }
                     if let Some((cw, ch)) = client_window_size(ui_host.child_hwnd) {
                         editor.set_size(cw, ch);
                     }
@@ -10652,9 +10685,19 @@ impl DawApp {
                                 let audio_cache = self.audio_clip_cache.clone();
                                 let mut changed = false;
                                 if let Some(track_index) = selected_track_index {
+                                    let project_root = if self.project_path.trim().is_empty() {
+                                        None
+                                    } else {
+                                        Some(PathBuf::from(self.project_path.trim()))
+                                    };
                                     if let Some(track) = self.tracks.get_mut(track_index) {
                                         if let Some(state) = track.treesynth.as_mut() {
-                                            changed = Self::draw_treesynth_panel(ui, state, &audio_cache);
+                                            changed = Self::draw_treesynth_panel(
+                                                ui,
+                                                state,
+                                                &audio_cache,
+                                                project_root.as_deref(),
+                                            );
                                         } else {
                                             ui.colored_label(egui::Color32::RED, "[TreeSynth] サンプル未ロード: プリセットまたはサンプルをロードしてください");
                                         }
@@ -14863,6 +14906,7 @@ impl DawApp {
         let manifest_path = folder.join("project.json");
         let data = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
         let state: ProjectState = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        let project_root = Self::normalize_windows_path(folder);
         self.project_name = state.name;
         self.metadata_artist = state.artist;
         self.metadata_title = state.title;
@@ -14874,6 +14918,20 @@ impl DawApp {
         self.project_key_minor = state.project_key_minor;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
+        for track in &mut self.tracks {
+            if let Some(treesynth) = track.treesynth.as_mut() {
+                if track
+                    .instrument_path
+                    .as_deref()
+                    .map(Self::is_treesynth_path)
+                    .unwrap_or(false)
+                    == false
+                {
+                    track.instrument_path = Some("native:treesynth".to_string());
+                }
+                Self::resolve_treesynth_paths_from_project_root(treesynth, &project_root);
+            }
+        }
         if let Ok(mut master) = self.master_settings.lock() {
             *master = state.master_settings.clone();
         }
@@ -14902,6 +14960,26 @@ impl DawApp {
         self.clear_dirty();
         self.status = format!("Loaded {}", self.project_path);
         Ok(())
+    }
+
+    fn resolve_treesynth_paths_from_project_root(state: &mut TreeSynthState, project_root: &Path) {
+        if let Some(folder) = state.folder.as_deref() {
+            let path = Path::new(folder);
+            if path.is_relative() {
+                state.folder = Some(
+                    project_root
+                        .join(path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        for sample in &mut state.samples {
+            let path = Path::new(&sample.path);
+            if path.is_relative() {
+                sample.path = project_root.join(path).to_string_lossy().to_string();
+            }
+        }
     }
 
     fn open_project_dialog(&mut self) -> Result<(), String> {
@@ -15980,6 +16058,7 @@ impl DawApp {
     fn render_with_options(&mut self, folder: &Path) -> Result<(), String> {
             // レンダー直前にtrack_audioを最新化
             self.sync_track_audio_states();
+        self.preload_audio_clips(&self.audio_clip_cache);
         if self.render_job.is_some() {
             return Ok(());
         }
@@ -16079,8 +16158,8 @@ impl DawApp {
                 total.store(1, Ordering::Relaxed);
                 let res = match format {
                     RenderFormat::Wav => render_plan_to_wav(plan, &done, &total, &track_audio, &audio_clip_cache),
-                    RenderFormat::Ogg => render_plan_to_ogg(plan, &done, &total),
-                    RenderFormat::Flac => render_plan_to_flac(plan, &done, &total),
+                    RenderFormat::Ogg => render_plan_to_ogg(plan, &done, &total, &track_audio, &audio_clip_cache),
+                    RenderFormat::Flac => render_plan_to_flac(plan, &done, &total, &track_audio, &audio_clip_cache),
                 };
                 if let Err(err) = res {
                     final_status = Err(err);
@@ -16110,12 +16189,14 @@ impl DawApp {
         let tracks = self
             .tracks
             .iter()
-            .map(|track| {
+            .enumerate()
+            .map(|(track_index, track)| {
                 let mut instrument_path = track.instrument_path.clone();
                 if track.treesynth.is_some() {
                     instrument_path = Some("native:treesynth".to_string());
                 }
                 RenderTrack {
+                    source_track_index: Some(track_index),
                     notes: track.midi_notes.clone(),
                     instrument_path,
                     instrument_clap_id: track.instrument_clap_id.clone(),
@@ -16195,6 +16276,7 @@ impl DawApp {
         let (audio_clips, audio_cache) =
             self.build_audio_clip_render_data(sample_rate, Some(index));
         let track = RenderTrack {
+            source_track_index: Some(index),
             notes,
             instrument_path,
             instrument_clap_id,
@@ -19558,6 +19640,7 @@ impl DawApp {
         ui: &mut egui::Ui,
         state: &mut TreeSynthState,
         audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
+        project_root: Option<&Path>,
     ) -> bool {
         let mut changed = false;
         ui.heading("TreeSynth");
@@ -19574,6 +19657,12 @@ impl DawApp {
             if ui.button("Choose").clicked() {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                     let folder = Self::normalize_windows_path(&folder);
+                    let folder = if let Some(project_root) = project_root {
+                        Self::import_treesynth_folder_to_project(&folder, project_root)
+                            .unwrap_or(folder)
+                    } else {
+                        folder
+                    };
                     state.folder = Some(folder.to_string_lossy().to_string());
                     state.samples = Self::load_treesynth_folder(&folder);
                     if let Ok(mut cache) = audio_clip_cache.lock() {
@@ -19734,6 +19823,36 @@ impl DawApp {
         });
 
         changed
+    }
+
+    fn import_treesynth_folder_to_project(source_folder: &Path, project_root: &Path) -> Result<PathBuf, String> {
+        let source_folder = Self::normalize_windows_path(source_folder);
+        if !source_folder.exists() {
+            return Err("TreeSynth source folder not found".to_string());
+        }
+        let project_root = Self::normalize_windows_path(project_root);
+        let samples_root = project_root.join("samples").join("treesynth");
+        fs::create_dir_all(&samples_root).map_err(|e| e.to_string())?;
+
+        let base_name = source_folder
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(Self::sanitize_folder_name)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "TreeSynthSamples".to_string());
+
+        let mut dest = samples_root.join(&base_name);
+        let mut suffix = 1usize;
+        while dest.exists() && !Self::paths_equal(&dest, &source_folder) {
+            dest = samples_root.join(format!("{}-{}", base_name, suffix));
+            suffix += 1;
+        }
+
+        if !Self::paths_equal(&dest, &source_folder) {
+            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+            Self::copy_dir_recursive(&source_folder, &dest)?;
+        }
+        Ok(dest)
     }
 
     fn home_dir() -> Option<PathBuf> {
@@ -20402,6 +20521,7 @@ fn render_plan_to_wav(
     track_audio: &[TrackAudioState],
     audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> Result<(), String> {
+    reset_treesynth_runtime_for_plan(&plan, track_audio);
     let channels = 2u16;
     let tempo = plan.tempo_bpm.max(1.0);
     let start_beats = plan.start_beats.max(0.0);
@@ -20471,6 +20591,7 @@ fn render_plan_to_wav(
             None
         };
         let single = RenderTrack {
+            source_track_index: None,
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
             instrument_clap_id: None,
@@ -20529,90 +20650,6 @@ fn render_plan_to_wav(
         per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
     }
 
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_hosts.len()];
-    for clip in plan.audio_clips.iter() {
-        if clip.track_index >= per_track_clips.len() {
-            continue;
-        }
-        let Some(data) = plan.audio_cache.get(&clip.path) else {
-            continue;
-        };
-        per_track_clips[clip.track_index].push((clip.clone(), data.clone()));
-    }
-
     let mut master_state = MasterCompState::default();
     let mut cursor = 0usize;
     while cursor < total_samples {
@@ -20628,10 +20665,43 @@ fn render_plan_to_wav(
             }
             temp.fill(0.0);
             let block_beat = (block_start as f64 / samples_per_beat) as f32;
+            for lane in &track.automation_lanes {
+                if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                    match lane.target {
+                        AutomationTarget::Instrument => {
+                            if let Some(host) = host.as_mut() {
+                                host.push_param_change(lane.param_id, value as f64);
+                            }
+                        }
+                        AutomationTarget::Effect(fx_index) => {
+                            if let Some(fx) = fx_hosts.get_mut(fx_index) {
+                                fx.push_param_change(lane.param_id, value as f64);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut events = if plan.render_tail_mode == RenderTailMode::Release
+                && start_samples > 0
+                && block_start == start_samples
+            {
+                (0u8..=127)
+                    .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            events.extend(collect_block_events(
+                &track.notes,
+                block_start,
+                block_end,
+                samples_per_beat,
+            ));
             let is_treesynth = track.instrument_path.as_deref().map(|p| p.eq_ignore_ascii_case("native:treesynth")).unwrap_or(false);
             if is_treesynth {
-                if let Some(track_audio) = track_audio.get(track_index) {
-                    let (_processed, _events) = mix_treesynth_block(
+                let source_index = track.source_track_index.unwrap_or(track_index);
+                if let Some(track_audio) = track_audio.get(source_index) {
+                    let (_processed, treesynth_events) = mix_treesynth_block(
                         &mut temp,
                         channels as usize,
                         plan.sample_rate as f32,
@@ -20644,122 +20714,92 @@ fn render_plan_to_wav(
                         track_audio,
                         audio_clip_cache,
                     );
-                }
-            } else {
-                // 従来のVST/CLAP処理
-                for lane in &track.automation_lanes {
-                    if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                        match lane.target {
-                            AutomationTarget::Instrument => {
-                                if let Some(host) = host.as_mut() {
-                                    host.push_param_change(lane.param_id, value as f64);
-                                }
-                            }
-                            AutomationTarget::Effect(fx_index) => {
-                                if let Some(fx) = fx_hosts.get_mut(fx_index) {
-                                    fx.push_param_change(lane.param_id, value as f64);
-                                }
-                            }
-                        }
+                    if !treesynth_events.is_empty() {
+                        events = treesynth_events;
                     }
                 }
-                let mut events = if plan.render_tail_mode == RenderTailMode::Release
-                    && start_samples > 0
-                    && block_start == start_samples
-                {
-                    (0u8..=127)
-                        .map(|note| vst3::MidiEvent::note_off_at(0, note, 0, 0))
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                events.extend(collect_block_events(
-                    &track.notes,
-                    block_start,
-                    block_end,
-                    samples_per_beat,
-                ));
+            } else {
                 if let Some(host) = host.as_mut() {
                     let _ = host.process_f32(&mut temp, channels as usize, &events);
                 }
-                if let Some(clips) = per_track_clips.get(track_index) {
-                    for (clip, data) in clips {
-                        let clip_end = clip.start_samples + clip.length_samples;
-                        if block_end <= clip.start_samples || block_start >= clip_end {
-                            continue;
-                        }
-                        let src_channels = data.channels.max(1);
-                        let src_frames = data.samples.len() / src_channels;
-                        if src_frames == 0 {
-                            continue;
-                        }
-                        let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
-                        let time_mul = clip.time_mul.max(0.01) as f64;
-                        let start_in_block = block_start.max(clip.start_samples) - block_start;
-                        let end_in_block = block_end.min(clip_end) - block_start;
-                        for i in start_in_block..end_in_block {
-                            let clip_pos = i + block_start - clip.start_samples;
-                            let pos =
-                                ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
-                                    .max(0.0);
-                            let len = src_frames as f64;
-                            let src_pos = if len > 0.0 {
-                                if plan.render_tail_mode == RenderTailMode::Wrap {
-                                    pos % len
-                                } else if pos >= len {
-                                    continue;
-                                } else {
-                                    pos
-                                }
+            }
+            if let Some(clips) = per_track_clips.get(track_index) {
+                for (clip, data) in clips {
+                    let clip_end = clip.start_samples + clip.length_samples;
+                    if block_end <= clip.start_samples || block_start >= clip_end {
+                        continue;
+                    }
+                    let src_channels = data.channels.max(1);
+                    let src_frames = data.samples.len() / src_channels;
+                    if src_frames == 0 {
+                        continue;
+                    }
+                    let rate_ratio = data.sample_rate as f64 / plan.sample_rate as f64;
+                    let time_mul = clip.time_mul.max(0.01) as f64;
+                    let start_in_block = block_start.max(clip.start_samples) - block_start;
+                    let end_in_block = block_end.min(clip_end) - block_start;
+                    for i in start_in_block..end_in_block {
+                        let clip_pos = i + block_start - clip.start_samples;
+                        let pos =
+                            ((clip_pos as f64 + clip.offset_samples as f64) * rate_ratio / time_mul)
+                                .max(0.0);
+                        let len = src_frames as f64;
+                        let src_pos = if len > 0.0 {
+                            if plan.render_tail_mode == RenderTailMode::Wrap {
+                                pos % len
+                            } else if pos >= len {
+                                continue;
                             } else {
                                 pos
-                            };
-                            let base = src_pos.floor() as usize;
-                            let frac = (src_pos - base as f64) as f32;
-                            let next = (base + 1).min(src_frames.saturating_sub(1));
-                            for ch in 0..channels as usize {
-                                let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
-                                let idx0 = base * src_channels + src_ch;
-                                let idx1 = next * src_channels + src_ch;
-                                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
-                                let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
-                                let sample = s0 + (s1 - s0) * frac;
-                                let out_index = i as usize * channels as usize + ch;
-                                if out_index < temp.len() {
-                                    temp[out_index] += sample * clip.gain;
-                                }
+                            }
+                        } else {
+                            pos
+                        };
+                        let base = src_pos.floor() as usize;
+                        let frac = (src_pos - base as f64) as f32;
+                        let next = (base + 1).min(src_frames.saturating_sub(1));
+                        for ch in 0..channels as usize {
+                            let src_ch = if src_channels == 1 { 0 } else { ch.min(src_channels - 1) };
+                            let idx0 = base * src_channels + src_ch;
+                            let idx1 = next * src_channels + src_ch;
+                            let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                            let s1 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                            let sample = s0 + (s1 - s0) * frac;
+                            let out_index = i as usize * channels as usize + ch;
+                            if out_index < temp.len() {
+                                temp[out_index] += sample * clip.gain;
                             }
                         }
                     }
                 }
-                let mut current = &mut temp;
-                let mut scratch = &mut fx_temp;
-                for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
-                    if track
-                        .effect_bypass
-                        .get(fx_index)
-                        .copied()
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    scratch.fill(0.0);
-                    if fx
-                        .process_f32_with_input(
-                            current.as_slice(),
-                            scratch.as_mut_slice(),
-                            channels as usize,
-                            &events,
-                        )
-                        .is_ok()
-                    {
-                        std::mem::swap(&mut current, &mut scratch);
-                    }
+            }
+            let mut current = &mut temp;
+            let mut scratch = &mut fx_temp;
+            for (fx_index, fx) in fx_hosts.iter_mut().enumerate() {
+                if track
+                    .effect_bypass
+                    .get(fx_index)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
                 }
-                let level = track.level.clamp(0.0, 1.0);
-                for (out, sample) in output.iter_mut().zip(current.iter()) {
-                    *out += *sample * level;
+                scratch.fill(0.0);
+                if fx
+                    .process_f32_with_input(
+                        current.as_slice(),
+                        scratch.as_mut_slice(),
+                        channels as usize,
+                        &events,
+                    )
+                    .is_ok()
+                {
+                    std::mem::swap(&mut current, &mut scratch);
                 }
+            }
+            let level = track.level.clamp(0.0, 1.0);
+            for (out, sample) in output.iter_mut().zip(current.iter()) {
+                *out += *sample * level;
             }
         }
         apply_master_processing(
@@ -20885,11 +20925,14 @@ fn render_plan_for_each_block<F>(
     plan: &RenderPlan,
     done: &AtomicU64,
     progress_offset: u64,
+    track_audio: &[TrackAudioState],
+    audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
     mut on_block: F,
 ) -> Result<usize, String>
 where
     F: FnMut(&[f32], usize) -> Result<(), String>,
 {
+    reset_treesynth_runtime_for_plan(plan, track_audio);
     let channels = 2u16;
     let tempo = plan.tempo_bpm.max(1.0);
     let start_beats = plan.start_beats.max(0.0);
@@ -20951,6 +20994,7 @@ where
             None
         };
         let single = RenderTrack {
+            source_track_index: None,
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
             instrument_clap_id: None,
@@ -21056,7 +21100,32 @@ where
                 block_end,
                 samples_per_beat,
             ));
-            if let Some(host) = host.as_mut() {
+            let is_treesynth = track
+                .instrument_path
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("native:treesynth"))
+                .unwrap_or(false);
+            if is_treesynth {
+                let source_index = track.source_track_index.unwrap_or(track_index);
+                if let Some(track_audio) = track_audio.get(source_index) {
+                    let (_processed, treesynth_events) = mix_treesynth_block(
+                        &mut temp,
+                        channels as usize,
+                        plan.sample_rate as f32,
+                        block_start,
+                        block_end,
+                        samples_per_beat,
+                        false,
+                        false,
+                        &track.notes,
+                        track_audio,
+                        audio_clip_cache,
+                    );
+                    if !treesynth_events.is_empty() {
+                        events = treesynth_events;
+                    }
+                }
+            } else if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
             if let Some(clips) = per_track_clips.get(track_index) {
@@ -21158,7 +21227,10 @@ fn render_plan_to_f32(
     plan: RenderPlan,
     done: &AtomicU64,
     total: &AtomicU64,
+    track_audio: &[TrackAudioState],
+    audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> Result<Vec<f32>, String> {
+    reset_treesynth_runtime_for_plan(&plan, track_audio);
     let channels = 2u16;
     let tempo = plan.tempo_bpm.max(1.0);
     let start_beats = plan.start_beats.max(0.0);
@@ -21219,6 +21291,7 @@ fn render_plan_to_f32(
             None
         };
         let single = RenderTrack {
+            source_track_index: None,
             notes: plan.notes.clone(),
             instrument_path: plan.instrument_path.clone(),
             instrument_clap_id: None,
@@ -21308,8 +21381,33 @@ fn render_plan_to_f32(
                     }
                 }
             }
-            let events = collect_block_events(&track.notes, block_start, block_end, samples_per_beat);
-            if let Some(host) = host.as_mut() {
+            let mut events = collect_block_events(&track.notes, block_start, block_end, samples_per_beat);
+            let is_treesynth = track
+                .instrument_path
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("native:treesynth"))
+                .unwrap_or(false);
+            if is_treesynth {
+                let source_index = track.source_track_index.unwrap_or(track_index);
+                if let Some(track_audio) = track_audio.get(source_index) {
+                    let (_processed, treesynth_events) = mix_treesynth_block(
+                        &mut temp,
+                        channels as usize,
+                        plan.sample_rate as f32,
+                        block_start,
+                        block_end,
+                        samples_per_beat,
+                        false,
+                        false,
+                        &track.notes,
+                        track_audio,
+                        audio_clip_cache,
+                    );
+                    if !treesynth_events.is_empty() {
+                        events = treesynth_events;
+                    }
+                }
+            } else if let Some(host) = host.as_mut() {
                 let _ = host.process_f32(&mut temp, channels as usize, &events);
             }
             if let Some(clips) = per_track_clips.get(track_index) {
@@ -21404,11 +21502,13 @@ fn render_plan_to_ogg(
     plan: RenderPlan,
     done: &AtomicU64,
     total: &AtomicU64,
+    track_audio: &[TrackAudioState],
+    audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> Result<(), String> {
     let path = plan.path.clone();
     let sample_rate = plan.sample_rate;
     let bitrate = plan.bitrate_kbps;
-    let mut samples = render_plan_to_f32(plan, done, total)?;
+    let mut samples = render_plan_to_f32(plan, done, total, track_audio, audio_clip_cache)?;
     if samples.is_empty() {
         return Ok(());
     }
@@ -21441,10 +21541,38 @@ fn render_plan_to_ogg(
     Ok(())
 }
 
+fn reset_treesynth_runtime_for_plan(plan: &RenderPlan, track_audio: &[TrackAudioState]) {
+    let mut reset_indices = HashSet::new();
+    for (track_index, track) in plan.tracks.iter().enumerate() {
+        let is_treesynth = track
+            .instrument_path
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case("native:treesynth"))
+            .unwrap_or(false);
+        if !is_treesynth {
+            continue;
+        }
+        let source_index = track.source_track_index.unwrap_or(track_index);
+        reset_indices.insert(source_index);
+    }
+    for index in reset_indices {
+        if let Some(state) = track_audio.get(index) {
+            if let Ok(mut runtime) = state.treesynth_runtime.lock() {
+                runtime.voices.clear();
+                runtime.sequence_index = 0;
+                runtime.last_note = None;
+                runtime.rng_state = 0x9E3779B97F4A7C15;
+            }
+        }
+    }
+}
+
 fn render_plan_to_flac(
     mut plan: RenderPlan,
     done: &AtomicU64,
     total: &AtomicU64,
+    track_audio: &[TrackAudioState],
+    audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> Result<(), String> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
@@ -21491,6 +21619,8 @@ fn render_plan_to_flac(
         &plan,
         done,
         0,
+        track_audio,
+        audio_clip_cache,
         |output, frames| {
             let mut pcm_i32 = Vec::with_capacity(output.len());
             for sample in output {
@@ -21564,6 +21694,8 @@ fn render_plan_to_flac(
         &plan,
         done,
         total_samples as u64,
+        track_audio,
+        audio_clip_cache,
         |output, _frames| {
             let mut pcm_i32 = Vec::with_capacity(output.len());
             for sample in output {
@@ -21693,6 +21825,13 @@ fn treesynth_spawn_voice(
     start_sample: u64,
     sample_rate: f32,
 ) {
+    if runtime.voices.len() >= TREESYNTH_MAX_VOICES {
+        if let Some(pos) = runtime.voices.iter().position(|v| v.release_sample.is_some()) {
+            runtime.voices.remove(pos);
+        } else if !runtime.voices.is_empty() {
+            runtime.voices.remove(0);
+        }
+    }
     let src_frames = data.samples.len() / data.channels.max(1);
     if src_frames == 0 {
         return;
@@ -21756,16 +21895,10 @@ fn mix_treesynth_block(
 ) -> (bool, Vec<vst3::MidiEvent>) {
     let treesynth_state = match state.treesynth_state.as_ref().and_then(|arc| arc.lock().ok()) {
         Some(guard) => guard.clone(),
-        None => {
-            println!("[TreeSynth Render Debug] TreeSynthState is None during render!");
-            return (false, Vec::new());
-        }
+        None => return (false, Vec::new()),
     };
     if treesynth_state.samples.is_empty() {
-        println!("[TreeSynth Render Debug] TreeSynthState.samples is empty during render!");
         return (false, Vec::new());
-    } else {
-        println!("[TreeSynth Render Debug] TreeSynthState.samples count: {}", treesynth_state.samples.len());
     }
 
     let mut events = collect_block_events(notes, block_start, block_end, samples_per_beat);
@@ -21793,6 +21926,24 @@ fn mix_treesynth_block(
     };
 
     let sample_count = treesynth_state.samples.len();
+    let sample_data: Vec<Option<Arc<AudioClipData>>> = if let Ok(mut cache) = audio_cache.lock() {
+        treesynth_state
+            .samples
+            .iter()
+            .map(|sample| {
+                if let Some(data) = cache.get(&sample.path) {
+                    return Some(data);
+                }
+                let loaded = DawApp::load_audio_clip_data(Path::new(&sample.path)).map(Arc::new);
+                if let Some(data) = loaded.as_ref() {
+                    cache.insert(sample.path.clone(), data.clone());
+                }
+                loaded
+            })
+            .collect()
+    } else {
+        vec![None; sample_count]
+    };
     let mut note_offs: Vec<(u8, u64)> = Vec::new();
     for event in &events {
         match event {
@@ -21812,15 +21963,15 @@ fn mix_treesynth_block(
                 match treesynth_state.mode {
                     TreeSynthMode::Random => {
                         let idx = (runtime.next_rand() as usize) % sample_count;
-                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
-                            let mut sample = treesynth_state.samples[idx].clone();
+                        if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
+                            let sample = treesynth_state.samples[idx].clone();
                             treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
                     }
                     TreeSynthMode::Sequential => {
                         let idx = runtime.sequence_index % sample_count;
                         runtime.sequence_index = runtime.sequence_index.wrapping_add(1);
-                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                        if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
                             let sample = treesynth_state.samples[idx].clone();
                             treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
@@ -21829,7 +21980,7 @@ fn mix_treesynth_block(
                         let pos = ((f32::from(*note) / 127.0) + treesynth_state.reorder).fract();
                         let idx = (pos * sample_count as f32).floor() as usize;
                         let idx = idx.min(sample_count.saturating_sub(1));
-                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                        if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
                             let sample = treesynth_state.samples[idx].clone();
                             treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
@@ -21841,13 +21992,13 @@ fn mix_treesynth_block(
                         let frac = morph - idx0 as f32;
                         let weight0 = (1.0f32 - frac).clamp(0.0, 1.0);
                         let weight1 = frac.clamp(0.0, 1.0);
-                        if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx0].path)) {
+                        if let Some(data) = sample_data.get(idx0).and_then(|d| d.as_ref()) {
                             let mut sample = treesynth_state.samples[idx0].clone();
                             sample.gain *= weight0;
                             treesynth_spawn_voice(&mut runtime, &treesynth_state, idx0, &sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
                         if idx1 != idx0 {
-                            if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx1].path)) {
+                            if let Some(data) = sample_data.get(idx1).and_then(|d| d.as_ref()) {
                                 let mut sample = treesynth_state.samples[idx1].clone();
                                 sample.gain *= weight1;
                                 treesynth_spawn_voice(&mut runtime, &treesynth_state, idx1, &sample, &data, *note, *velocity, start_sample, sample_rate);
@@ -21856,7 +22007,7 @@ fn mix_treesynth_block(
                     }
                     TreeSynthMode::Layer => {
                         for idx in 0..sample_count {
-                            if let Some(data) = audio_cache.lock().ok().and_then(|c| c.get(&treesynth_state.samples[idx].path)) {
+                            if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
                                 let sample = treesynth_state.samples[idx].clone();
                                 treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
                             }
@@ -21885,11 +22036,10 @@ fn mix_treesynth_block(
     let frame_count = (block_end - block_start) as usize;
     runtime.voices.retain_mut(|voice| {
         let sample_index = voice.sample_index;
-        let sample = match treesynth_state.samples.get(sample_index) {
-            Some(sample) => sample,
-            None => return false,
-        };
-        let data = match audio_cache.lock().ok().and_then(|c| c.get(&sample.path)) {
+        if treesynth_state.samples.get(sample_index).is_none() {
+            return false;
+        }
+        let data = match sample_data.get(sample_index).and_then(|d| d.as_ref()) {
             Some(data) => data,
             None => return false,
         };
