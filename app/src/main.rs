@@ -279,6 +279,10 @@ fn default_performance_launch_quantize_beats() -> f32 {
     1.0
 }
 
+fn performance_scene_matches(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.01
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Track {
     name: String,
@@ -5591,6 +5595,78 @@ impl DawApp {
         Ok(())
     }
 
+    fn next_performance_follow_target(
+        &self,
+        runtime: &PerformanceRuntimeClip,
+        current_samples: u64,
+        samples_per_beat: f64,
+    ) -> Option<(usize, usize, PerformanceClipSettings, u64)> {
+        let mut next_runtime = runtime.clone();
+        let mut next_settings = self
+            .performance_clip_settings
+            .get(&runtime.clip.id)
+            .cloned()
+            .unwrap_or_default();
+        let mut visited = HashSet::new();
+        let mut traversed = false;
+
+        loop {
+            if next_runtime.loop_enabled {
+                break;
+            }
+            let end_samples = next_runtime
+                .launch_samples
+                .saturating_add(performance_length_samples(&next_runtime, samples_per_beat));
+            if current_samples < end_samples {
+                break;
+            }
+            if !next_settings.auto_follow {
+                return None;
+            }
+            let next_clip_id = next_settings.next_clip_id?;
+            if !visited.insert(next_clip_id) {
+                return None;
+            }
+            let (next_track_index, next_clip_index) = self.find_clip_indices_by_id(next_clip_id)?;
+            let clip = self
+                .tracks
+                .get(next_track_index)
+                .and_then(|track| track.clips.get(next_clip_index))
+                .cloned()?;
+            next_settings = self
+                .performance_clip_settings
+                .get(&next_clip_id)
+                .cloned()
+                .unwrap_or_default();
+            next_runtime = PerformanceRuntimeClip {
+                track_index: next_track_index,
+                launch_samples: end_samples,
+                loop_enabled: next_settings.loop_enabled
+                    || next_settings.trigger_mode == PerformanceTriggerMode::Loop,
+                trigger_mode: next_settings.trigger_mode,
+                resolved_audio_path: if clip.is_midi {
+                    None
+                } else {
+                    self.resolve_clip_audio_path(&clip)
+                        .map(|path| path.to_string_lossy().to_string())
+                },
+                clip,
+            };
+            traversed = true;
+        }
+
+        if traversed {
+            Some((
+                next_runtime.track_index,
+                next_runtime.clip.id,
+                next_settings,
+                next_runtime.launch_samples,
+            ))
+        } else {
+            None
+        }
+    }
+
     fn update_performance_auto_follow(&mut self) {
         if !self.audio_running {
             return;
@@ -5606,40 +5682,42 @@ impl DawApp {
             .unwrap_or_default();
 
         let mut relaunches = Vec::new();
-        for (track_index, slot) in runtime_snapshot.iter().enumerate() {
+        let mut clears = Vec::new();
+        for slot in runtime_snapshot.iter() {
             let Some(runtime) = slot.as_ref() else {
                 continue;
             };
-            if runtime.loop_enabled {
-                continue;
+            if let Some(target) =
+                self.next_performance_follow_target(runtime, current_samples, samples_per_beat)
+            {
+                if runtime.track_index != target.0 {
+                    clears.push((runtime.track_index, runtime.clip.id));
+                }
+                relaunches.push(target);
+            } else if !runtime.loop_enabled {
+                let end_samples = runtime
+                    .launch_samples
+                    .saturating_add(performance_length_samples(runtime, samples_per_beat));
+                if current_samples >= end_samples {
+                    clears.push((runtime.track_index, runtime.clip.id));
+                }
             }
-            let end_samples = runtime
-                .launch_samples
-                .saturating_add(performance_length_samples(runtime, samples_per_beat));
-            if current_samples < end_samples {
-                continue;
-            }
-            let Some(settings) = self.performance_clip_settings.get(&runtime.clip.id).cloned() else {
-                continue;
-            };
-            if !settings.auto_follow {
-                continue;
-            }
-            let Some(next_clip_id) = settings.next_clip_id else {
-                continue;
-            };
-            let Some((next_track_index, _)) = self.find_clip_indices_by_id(next_clip_id) else {
-                continue;
-            };
-            if next_track_index != track_index {
-                continue;
-            }
-            let next_settings = self.performance_clip_settings.get(&next_clip_id).cloned().unwrap_or_default();
-            relaunches.push((track_index, next_clip_id, next_settings, end_samples));
         }
 
         for (track_index, clip_id, settings, launch_samples) in relaunches {
             let _ = self.launch_performance_clip_at(track_index, clip_id, settings, launch_samples);
+        }
+
+        if !clears.is_empty() {
+            if let Ok(mut runtime) = self.performance_runtime.lock() {
+                for (track_index, clip_id) in clears {
+                    if let Some(Some(active)) = runtime.get(track_index) {
+                        if active.clip.id == clip_id {
+                            runtime[track_index] = None;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5892,6 +5970,12 @@ impl DawApp {
                 visuals = egui::Visuals::dark();
             }
             _ => {}
+        }
+        if self.wallpaper_enabled() {
+            visuals.window_fill = egui::Color32::from_rgba_premultiplied(0, 0, 0, 208);
+            visuals.panel_fill = egui::Color32::from_rgba_premultiplied(0, 0, 0, 176);
+            visuals.faint_bg_color = egui::Color32::from_rgba_premultiplied(10, 10, 10, 176);
+            visuals.extreme_bg_color = egui::Color32::from_rgba_premultiplied(0, 0, 0, 224);
         }
         ctx.set_visuals(visuals);
     }
@@ -12688,7 +12772,11 @@ impl DawApp {
 
     fn center_performance(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let panel_fill = egui::Color32::from_rgb(9, 11, 14);
+            let panel_fill = if self.wallpaper_enabled() {
+                egui::Color32::from_rgba_premultiplied(9, 11, 14, 210)
+            } else {
+                egui::Color32::from_rgb(9, 11, 14)
+            };
             let strip_fill = egui::Color32::from_rgba_premultiplied(18, 21, 26, 244);
             let panel_edge = egui::Color32::from_rgba_premultiplied(88, 98, 116, 180);
             let header_fill = egui::Color32::from_rgba_premultiplied(16, 19, 24, 252);
@@ -12773,7 +12861,7 @@ impl DawApp {
                 .flat_map(|t| t.clips.iter().map(|c| c.start_beats.max(0.0)))
                 .collect();
             scenes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            scenes.dedup_by(|a, b| (*a - *b).abs() < 0.0001);
+            scenes.dedup_by(|a, b| performance_scene_matches(*a, *b));
             let quantize_label = if self.performance_launch_quantize_beats <= f32::EPSILON {
                 "Off"
             } else if (self.performance_launch_quantize_beats - 0.25).abs() <= f32::EPSILON {
@@ -13242,7 +13330,7 @@ impl DawApp {
                                                 .filter(|slot| {
                                                     slot.as_ref()
                                                         .map(|runtime| {
-                                                            (runtime.clip.start_beats - *scene_beat).abs() < 0.0001
+                                                            performance_scene_matches(runtime.clip.start_beats, *scene_beat)
                                                                 && runtime.launch_samples > current_transport_samples
                                                         })
                                                         .unwrap_or(false)
@@ -13253,7 +13341,7 @@ impl DawApp {
                                                 .filter(|slot| {
                                                     slot.as_ref()
                                                         .map(|runtime| {
-                                                            (runtime.clip.start_beats - *scene_beat).abs() < 0.0001
+                                                            performance_scene_matches(runtime.clip.start_beats, *scene_beat)
                                                                 && runtime.launch_samples <= current_transport_samples
                                                         })
                                                         .unwrap_or(false)
@@ -13263,7 +13351,7 @@ impl DawApp {
                                                 .and_then(|clip_id| {
                                                     self.find_clip_indices_by_id(clip_id)
                                                         .and_then(|(ti, ci)| self.tracks.get(ti).and_then(|t| t.clips.get(ci)))
-                                                        .map(|clip| (clip.start_beats - *scene_beat).abs() < 0.0001)
+                                                        .map(|clip| performance_scene_matches(clip.start_beats, *scene_beat))
                                                 })
                                                 .unwrap_or(false);
                                             let scene_button = egui::Button::new(
@@ -13295,7 +13383,7 @@ impl DawApp {
                                                 let clip = track
                                                     .clips
                                                     .iter()
-                                                    .find(|c| (c.start_beats - *scene_beat).abs() < 0.0001);
+                                                    .find(|c| performance_scene_matches(c.start_beats, *scene_beat));
 
                                                 if let Some(clip) = clip {
                                                     let is_selected = selected_clip_id == Some(clip.id);
@@ -13972,8 +14060,9 @@ impl DawApp {
             });
 
             if let Some(scene_beat) = scene_launch_action {
-                let launch_beat = self.samples_to_beats(self.performance_launch_samples());
-                match self.launch_performance_scene(scene_beat) {
+                let launch_samples = self.performance_launch_samples();
+                let launch_beat = self.samples_to_beats(launch_samples);
+                match self.launch_performance_scene_at(scene_beat, launch_samples) {
                     Ok(launched) => {
                         if self.is_recording && self.record_performance {
                             let _ = self.record_performance_scene_trigger_at(scene_beat, launch_beat);
@@ -13985,7 +14074,7 @@ impl DawApp {
                             .find_map(|(track_index, track)| {
                                 track.clips
                                     .iter()
-                                    .any(|clip| (clip.start_beats - scene_beat).abs() < 0.0001)
+                                    .any(|clip| performance_scene_matches(clip.start_beats, scene_beat))
                                     .then_some(track_index)
                             });
                         self.status = format!("Scene launched: {} clips", launched);
@@ -21276,6 +21365,15 @@ impl DawApp {
     }
 
     fn launch_performance_scene(&mut self, scene_beat: f32) -> Result<usize, String> {
+        let launch_samples = self.performance_launch_samples();
+        self.launch_performance_scene_at(scene_beat, launch_samples)
+    }
+
+    fn launch_performance_scene_at(
+        &mut self,
+        scene_beat: f32,
+        launch_samples: u64,
+    ) -> Result<usize, String> {
         let launches: Vec<(usize, usize, PerformanceClipSettings)> = self
             .tracks
             .iter()
@@ -21283,7 +21381,7 @@ impl DawApp {
             .filter_map(|(track_index, track)| {
                 track.clips
                     .iter()
-                    .find(|clip| (clip.start_beats - scene_beat).abs() < 0.0001)
+                    .find(|clip| performance_scene_matches(clip.start_beats, scene_beat))
                     .map(|clip| {
                         (
                             track_index,
@@ -21298,7 +21396,7 @@ impl DawApp {
             .collect();
         let launched = launches.len();
         for (track_index, clip_id, settings) in launches {
-            self.launch_performance_clip(track_index, clip_id, settings)?;
+            self.launch_performance_clip_at(track_index, clip_id, settings, launch_samples)?;
         }
         Ok(launched)
     }
@@ -21324,7 +21422,7 @@ impl DawApp {
             .filter_map(|(track_index, track)| {
                 track.clips
                     .iter()
-                    .find(|clip| (clip.start_beats - scene_beat).abs() < 0.0001)
+                    .find(|clip| performance_scene_matches(clip.start_beats, scene_beat))
                     .map(|clip| {
                         (
                             track_index,
@@ -22296,13 +22394,17 @@ impl DawApp {
             || !self.settings.registered_to.trim().is_empty()
     }
 
+    fn wallpaper_enabled(&self) -> bool {
+        self.is_registered_user() && !self.settings.wallpaper_path.trim().is_empty()
+    }
+
     fn invalidate_wallpaper_texture(&mut self) {
         self.wallpaper_texture = None;
         self.wallpaper_texture_path.clear();
     }
 
     fn ensure_wallpaper_texture(&mut self, ctx: &egui::Context) -> Result<(), String> {
-        if !self.is_registered_user() || self.settings.wallpaper_path.trim().is_empty() {
+        if !self.wallpaper_enabled() {
             self.invalidate_wallpaper_texture();
             return Ok(());
         }
@@ -22332,7 +22434,7 @@ impl DawApp {
     }
 
     fn paint_wallpaper(&mut self, ctx: &egui::Context) {
-        if !self.is_registered_user() {
+        if !self.wallpaper_enabled() {
             self.invalidate_wallpaper_texture();
             return;
         }
@@ -27987,33 +28089,6 @@ fn mix_track_hosts(
                 }
                 slot.midi_in = (slot.midi_in * 0.78).max(midi_in_levels[index]);
                 slot.midi_out = (slot.midi_out * 0.78).max(midi_out_levels[index]);
-            }
-        }
-    }
-
-    let mut expired_tracks = Vec::new();
-    for (track_index, runtime) in performance_snapshot.iter().enumerate() {
-        let Some(runtime) = runtime.as_ref() else {
-            continue;
-        };
-        if runtime.loop_enabled {
-            continue;
-        }
-        let clip_end = runtime
-            .launch_samples
-            .saturating_add(performance_length_samples(runtime, samples_per_beat));
-        if block_start >= clip_end {
-            expired_tracks.push((track_index, runtime.clip.id));
-        }
-    }
-    if !expired_tracks.is_empty() {
-        if let Ok(mut runtime) = performance_runtime.lock() {
-            for (track_index, clip_id) in expired_tracks {
-                if let Some(Some(active)) = runtime.get(track_index) {
-                    if active.clip.id == clip_id {
-                        runtime[track_index] = None;
-                    }
-                }
             }
         }
     }
