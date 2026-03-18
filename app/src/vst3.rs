@@ -337,9 +337,9 @@ impl IAttributeListTrait for AttributeList {
         &self,
         id: AttrID,
         string: *mut TChar,
-        sizeInBytes: u32,
+        size_in_bytes: u32,
     ) -> tresult {
-        if string.is_null() || sizeInBytes == 0 {
+        if string.is_null() || size_in_bytes == 0 {
             return kResultFalse;
         }
         let Some(key) = attr_id_to_string(id) else {
@@ -347,7 +347,7 @@ impl IAttributeListTrait for AttributeList {
         };
         if let Ok(map) = self.strings.lock() {
             if let Some(found) = map.get(&key) {
-                let max_chars = (sizeInBytes as usize / std::mem::size_of::<TChar>()).max(1);
+                let max_chars = (size_in_bytes as usize / std::mem::size_of::<TChar>()).max(1);
                 let mut count = found.len().min(max_chars);
                 if count == max_chars {
                     count -= 1;
@@ -360,14 +360,14 @@ impl IAttributeListTrait for AttributeList {
         kResultFalse
     }
 
-    unsafe fn setBinary(&self, id: AttrID, data: *const std::ffi::c_void, sizeInBytes: u32) -> tresult {
+    unsafe fn setBinary(&self, id: AttrID, data: *const std::ffi::c_void, size_in_bytes: u32) -> tresult {
         let Some(key) = attr_id_to_string(id) else {
             return kResultFalse;
         };
-        if data.is_null() || sizeInBytes == 0 {
+        if data.is_null() || size_in_bytes == 0 {
             return kResultFalse;
         }
-        let slice = std::slice::from_raw_parts(data as *const u8, sizeInBytes as usize);
+        let slice = std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize);
         if let Ok(mut map) = self.binary.lock() {
             map.insert(key, slice.to_vec());
             kResultOk
@@ -380,9 +380,9 @@ impl IAttributeListTrait for AttributeList {
         &self,
         id: AttrID,
         data: *mut *const std::ffi::c_void,
-        sizeInBytes: *mut u32,
+        size_in_bytes: *mut u32,
     ) -> tresult {
-        if data.is_null() || sizeInBytes.is_null() {
+        if data.is_null() || size_in_bytes.is_null() {
             return kResultFalse;
         }
         let Some(key) = attr_id_to_string(id) else {
@@ -391,7 +391,7 @@ impl IAttributeListTrait for AttributeList {
         if let Ok(map) = self.binary.lock() {
             if let Some(found) = map.get(&key) {
                 *data = found.as_ptr() as *const std::ffi::c_void;
-                *sizeInBytes = found.len() as u32;
+                *size_in_bytes = found.len() as u32;
                 return kResultOk;
             }
         }
@@ -899,6 +899,20 @@ unsafe impl Send for Vst3Host {}
 unsafe impl Sync for Vst3Host {}
 
 impl Vst3Host {
+    fn skips_host_context(plugin_path: &str) -> bool {
+        let path = plugin_path.to_ascii_lowercase();
+        [
+            "catsynth",
+            "dogsynth",
+            "fishsynth",
+            "lingsynth",
+            "micesynth",
+            "sannysynth",
+        ]
+        .iter()
+        .any(|name| path.contains(name))
+    }
+
     pub fn io_channels(&self) -> (usize, usize) {
         (self.input_channels, self.output_channels)
     }
@@ -925,6 +939,22 @@ impl Vst3Host {
         init_windows_com_for_thread();
         let module_path = resolve_vst3_binary(plugin_path)?;
         eprintln!("VST3 load: {plugin_path}");
+        if let Ok(meta) = std::fs::metadata(&module_path) {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            eprintln!(
+                "VST3 resolved binary: {} (size={} modified_unix={})",
+                module_path.display(),
+                meta.len(),
+                modified
+            );
+        } else {
+            eprintln!("VST3 resolved binary: {}", module_path.display());
+        }
         unsafe {
             let lib = Library::new(&module_path).map_err(|e| e.to_string())?;
             let init_module: Option<unsafe extern "C" fn() -> bool> = lib
@@ -953,16 +983,20 @@ impl Vst3Host {
                 .to_com_ptr::<IHostApplication>()
                 .ok_or_else(|| "Host application unavailable".to_string())?;
 
-            let mut factory3_ptr: *mut IPluginFactory3 = std::ptr::null_mut();
-            let qi_result = ((*(*factory).vtbl).base.queryInterface)(
-                factory as *mut FUnknown,
-                &IPluginFactory3_iid as *const TUID,
-                &mut factory3_ptr as *mut _ as *mut *mut std::ffi::c_void,
-            );
-            if qi_result == kResultOk && !factory3_ptr.is_null() {
-                if let Some(factory3) = ComPtr::from_raw(factory3_ptr) {
-                    let result = factory3.setHostContext(host_ptr.as_ptr() as *mut FUnknown);
-                    eprintln!("VST3 setHostContext -> {result}");
+            if Self::skips_host_context(plugin_path) {
+                eprintln!("VST3 setHostContext skipped for {plugin_path}");
+            } else {
+                let mut factory3_ptr: *mut IPluginFactory3 = std::ptr::null_mut();
+                let qi_result = ((*(*factory).vtbl).base.queryInterface)(
+                    factory as *mut FUnknown,
+                    &IPluginFactory3_iid as *const TUID,
+                    &mut factory3_ptr as *mut _ as *mut *mut std::ffi::c_void,
+                );
+                if qi_result == kResultOk && !factory3_ptr.is_null() {
+                    if let Some(factory3) = ComPtr::from_raw(factory3_ptr) {
+                        let result = factory3.setHostContext(host_ptr.as_ptr() as *mut FUnknown);
+                        eprintln!("VST3 setHostContext -> {result}");
+                    }
                 }
             }
 
@@ -1128,9 +1162,6 @@ impl Vst3Host {
             if audio_out_count <= 0 {
                 return Err("VST3 has no audio output buses".to_string());
             }
-            if audio_out_count > 1 {
-                return Err("VST3 multiple output buses not supported".to_string());
-            }
             if audio_in_count > 1 {
                 return Err("VST3 multiple input buses not supported".to_string());
             }
@@ -1155,54 +1186,40 @@ impl Vst3Host {
             } else {
                 SpeakerArr::kStereo
             };
-            let mut bus_result = if input_channels == 0 {
-                processor.setBusArrangements(
-                    std::ptr::null_mut(),
-                    0,
-                    &mut output_arrangement as *mut _,
-                    1,
-                )
-            } else {
-                processor.setBusArrangements(
+            let mut bus_negotiated = false;
+            if input_channels > 0 {
+                let mut bus_result = processor.setBusArrangements(
                     &mut input_arrangement as *mut _,
                     1,
                     &mut output_arrangement as *mut _,
                     1,
-                )
-            };
-            if bus_result != kResultOk {
-                output_arrangement = if output_channels == 1 {
-                    SpeakerArr::kStereo
-                } else {
-                    SpeakerArr::kMono
-                };
-                input_arrangement = if input_channels == 1 {
-                    SpeakerArr::kStereo
-                } else {
-                    SpeakerArr::kMono
-                };
-                bus_result = if input_channels == 0 {
-                    processor.setBusArrangements(
-                        std::ptr::null_mut(),
-                        0,
-                        &mut output_arrangement as *mut _,
-                        1,
-                    )
-                } else {
-                    processor.setBusArrangements(
+                );
+                if bus_result != kResultOk {
+                    output_arrangement = if output_channels == 1 {
+                        SpeakerArr::kStereo
+                    } else {
+                        SpeakerArr::kMono
+                    };
+                    input_arrangement = if input_channels == 1 {
+                        SpeakerArr::kStereo
+                    } else {
+                        SpeakerArr::kMono
+                    };
+                    bus_result = processor.setBusArrangements(
                         &mut input_arrangement as *mut _,
                         1,
                         &mut output_arrangement as *mut _,
                         1,
-                    )
-                };
-            }
-            if bus_result != kResultOk {
-                eprintln!(
-                    "VST3 setBusArrangements failed: {bus_result} (continuing with defaults)"
-                );
-            } else {
-                eprintln!("VST3 bus arrangement result: {bus_result}");
+                    );
+                }
+                if bus_result != kResultOk {
+                    eprintln!(
+                        "VST3 setBusArrangements failed: {bus_result} (continuing with defaults)"
+                    );
+                } else {
+                    eprintln!("VST3 bus arrangement result: {bus_result}");
+                    bus_negotiated = true;
+                }
             }
             if audio_out_count > 0 {
                 let _ = component.activateBus(
@@ -1242,7 +1259,7 @@ impl Vst3Host {
             );
             if bus_info_result == kResultOk {
                 let count = bus_info.channelCount as usize;
-                if count == 1 || count == 2 {
+                if (1..=2).contains(&count) {
                     output_channels = count;
                 }
             }
@@ -1254,11 +1271,28 @@ impl Vst3Host {
             );
             if in_bus_info_result == kResultOk {
                 let count = bus_info.channelCount as usize;
-                if count == 1 || count == 2 {
+                if (1..=2).contains(&count) {
                     input_channels = count;
                 }
             } else if audio_in_count == 0 {
                 input_channels = 0;
+            }
+
+            if bus_negotiated {
+                output_channels = if output_arrangement == SpeakerArr::kMono {
+                    1
+                } else {
+                    2
+                };
+                if audio_in_count > 0 {
+                    input_channels = if input_arrangement == SpeakerArr::kMono {
+                        1
+                    } else {
+                        2
+                    };
+                } else {
+                    input_channels = 0;
+                }
             }
 
             let active_result = component.setActive(1);
@@ -1345,6 +1379,7 @@ impl Vst3Host {
     }
 
     pub fn prepare_for_drop(&mut self) {
+        eprintln!("VST3 unload prepare: {}", self.plugin_path);
         unsafe {
             let _ = self.processor.setProcessing(0);
             let _ = self.component.setActive(0);
@@ -1765,6 +1800,7 @@ impl Vst3Host {
 
 impl Drop for Vst3Host {
     fn drop(&mut self) {
+        eprintln!("VST3 unload drop: {}", self.plugin_path);
         unsafe {
             let _ = self.processor.setProcessing(0);
             let _ = self.component.setActive(0);
@@ -2114,10 +2150,54 @@ fn resolve_vst3_binary(plugin_path: &str) -> Result<PathBuf, String> {
         let binary_root = path.join("Contents").join("x86_64-win");
         if binary_root.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&binary_root) {
+                let mut candidates: Vec<PathBuf> = Vec::new();
                 for entry in entries.flatten() {
                     let candidate = entry.path();
                     if candidate.extension().and_then(|e| e.to_str()) == Some("vst3") {
-                        return Ok(candidate);
+                        candidates.push(candidate);
+                    }
+                }
+                if !candidates.is_empty() {
+                    let preferred_stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    let rank = |candidate: &PathBuf| {
+                        let stem_match = preferred_stem
+                            .as_ref()
+                            .map(|preferred| {
+                                candidate
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.eq_ignore_ascii_case(preferred))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        let modified = std::fs::metadata(candidate)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        (stem_match, modified)
+                    };
+                    let selected = candidates
+                        .iter()
+                        .max_by_key(|candidate| rank(candidate))
+                        .cloned();
+                    if candidates.len() > 1 {
+                        eprintln!(
+                            "VST3 resolve: multiple binaries under {} ({} candidates), selected {}",
+                            binary_root.display(),
+                            candidates.len(),
+                            selected
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "(none)".to_string())
+                        );
+                    }
+                    if let Some(selected) = selected {
+                        return Ok(selected);
                     }
                 }
             }

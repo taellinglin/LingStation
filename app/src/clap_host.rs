@@ -199,10 +199,48 @@ impl ClapHost {
         input_channels: usize,
         output_channels: usize,
     ) -> Result<Self, String> {
+        eprintln!(
+            "CLAP load start: path={} id={} sr={} block={} in_ch={} out_ch={}",
+            path,
+            plugin_id,
+            sample_rate,
+            block_size,
+            input_channels,
+            output_channels
+        );
         let host_info = HostInfo::new("LingStation", "LingStation", "", "0.1")
             .map_err(|e| e.to_string())?;
-        let module_path = resolve_clap_binary(path)?;
-        let entry = unsafe { PluginEntry::load(&module_path) }.map_err(|e| e.to_string())?;
+        let module_path = resolve_clap_binary(path).map_err(|e| {
+            eprintln!("CLAP load fail: resolve binary failed path={} err={}", path, e);
+            e
+        })?;
+        eprintln!("clap_plugin->init begin id={} module={}", plugin_id, module_path.display());
+        if let Ok(meta) = std::fs::metadata(&module_path) {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            eprintln!(
+                "CLAP resolved binary: {} (size={} modified_unix={})",
+                module_path.display(),
+                meta.len(),
+                modified
+            );
+        } else {
+            eprintln!("CLAP resolved binary: {}", module_path.display());
+        }
+        let entry = unsafe { PluginEntry::load(&module_path) }.map_err(|e| {
+            let err = e.to_string();
+            eprintln!(
+                "CLAP load fail: PluginEntry::load failed module={} err={}",
+                module_path.display(),
+                err
+            );
+            err
+        })?;
+        eprintln!("clap_plugin->init ok id={}", plugin_id);
         let plugin_id_str = plugin_id.to_string();
         let plugin_id = CString::new(plugin_id).map_err(|e| e.to_string())?;
 
@@ -219,21 +257,58 @@ impl ClapHost {
             plugin_id.as_c_str(),
             &host_info,
         )
-        .map_err(|e| format!("CLAP instance failed: {e}"))?;
+        .map_err(|e| {
+            let err = format!("CLAP instance failed: {e}");
+            eprintln!(
+                "CLAP load fail: PluginInstance::new failed id={} module={} err={}",
+                plugin_id_str,
+                module_path.display(),
+                err
+            );
+            err
+        })?;
+
+        let safe_block_size = block_size.clamp(1, 2048);
+        if safe_block_size != block_size {
+            eprintln!(
+                "CLAP load note: clamped block size {} -> {} for id={}",
+                block_size,
+                safe_block_size,
+                plugin_id_str
+            );
+        }
 
         let audio_config = PluginAudioConfiguration {
             sample_rate,
-            min_frames_count: block_size.max(1),
-            max_frames_count: block_size.max(1),
+            min_frames_count: safe_block_size,
+            max_frames_count: safe_block_size,
         };
+        eprintln!("clap_plugin->activate begin id={} block={}", plugin_id_str, safe_block_size);
         let processor = instance
             .activate(|_, _| (), audio_config)
-            .map_err(|e| format!("CLAP activate failed: {e}"))?;
+            .map_err(|e| {
+                let err = format!("CLAP activate failed: {e}");
+                eprintln!(
+                    "CLAP load fail: activate failed id={} err={}",
+                    plugin_id_str,
+                    err
+                );
+                err
+            })?;
+            eprintln!("clap_plugin->activate ok id={}", plugin_id_str);
 
         let params_ext = instance.access_shared_handler(|h| h.params_ext.get().copied().flatten());
         let state_ext = instance.access_shared_handler(|h| h.state_ext.get().copied().flatten());
         let gui_ext = instance.access_shared_handler(|h| h.gui_ext.get().copied().flatten());
         let latency_ext = instance.access_shared_handler(|h| h.latency_ext.get().copied().flatten());
+
+        eprintln!(
+            "CLAP load ok: id={} module={} in_ch={} out_ch={}",
+            plugin_id_str,
+            module_path.display(),
+            input_channels,
+            output_channels
+        );
 
         Ok(Self {
             entry,
@@ -244,7 +319,7 @@ impl ClapHost {
             gui_ext,
             latency_ext,
             plugin_id: plugin_id_str.clone(),
-            block_param_changes: Self::is_vital_id(&plugin_id_str),
+            block_param_changes: Self::has_restricted_runtime_params(&plugin_id_str),
             input_channels,
             output_channels,
             input_buffers: Vec::new(),
@@ -330,6 +405,16 @@ impl ClapHost {
     }
 
     pub fn set_state_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // Vital is already handled in a restricted mode for param writes.
+        // Restoring serialized state has been observed to crash inside the plugin on some builds.
+        if self.block_param_changes || Self::is_plantsynth_id(&self.plugin_id) {
+            eprintln!(
+                "CLAP state restore skipped: id={} bytes={} blocked=true",
+                self.plugin_id,
+                bytes.len()
+            );
+            return Ok(());
+        }
         let Some(state) = self.state_ext else {
             return Ok(());
         };
@@ -352,8 +437,14 @@ impl ClapHost {
 
     pub fn open_gui(&mut self, parent_hwnd: isize) -> Result<(), String> {
         let Some(gui) = self.gui_ext else {
+            eprintln!("CLAP GUI open fail: id={} reason=no_gui_ext", self.plugin_id);
             return Err("CLAP GUI not supported".to_string());
         };
+        eprintln!(
+            "CLAP GUI open start: id={} parent_hwnd={}",
+            self.plugin_id,
+            parent_hwnd
+        );
         let mut handle = self.instance.plugin_handle();
         let api = GuiApiType::WIN32;
         let embedded = GuiConfiguration {
@@ -366,16 +457,24 @@ impl ClapHost {
         };
         let can_embed = parent_hwnd != 0 && gui.is_api_supported(&mut handle, embedded);
         if can_embed {
+            eprintln!("clap_plugin_gui->create begin id={} mode=embedded", self.plugin_id);
             if gui.create(&mut handle, embedded).is_ok() {
                 self.gui_created = true;
                 let window = Window::from_win32_hwnd(parent_hwnd as *mut _);
+                eprintln!("clap_plugin_gui->set_parent begin id={}", self.plugin_id);
                 if unsafe { gui.set_parent(&mut handle, window) }.is_ok() {
                     if let Some(size) = gui.get_size(&mut handle) {
                         self.gui_size = Some(size);
                     }
+                    eprintln!("clap_plugin_gui->show begin id={}", self.plugin_id);
                     gui.show(&mut handle).map_err(|e| e.to_string())?;
                     self.gui_parent = Some(window);
                     self.gui_open = true;
+                    eprintln!(
+                        "CLAP GUI open ok: id={} mode=embedded size={:?}",
+                        self.plugin_id,
+                        self.gui_size.map(|s| (s.width, s.height))
+                    );
                     return Ok(());
                 }
                 gui.destroy(&mut handle);
@@ -384,16 +483,25 @@ impl ClapHost {
         }
 
         if !gui.is_api_supported(&mut handle, floating) {
+            eprintln!("CLAP GUI open fail: id={} reason=win32_unsupported", self.plugin_id);
             return Err("CLAP GUI does not support Win32".to_string());
         }
+        eprintln!("clap_plugin_gui->create begin id={} mode=floating", self.plugin_id);
         gui.create(&mut handle, floating).map_err(|e| e.to_string())?;
         self.gui_created = true;
         if let Some(size) = gui.get_size(&mut handle) {
             self.gui_size = Some(size);
         }
+        eprintln!("clap_plugin_gui->set_window begin id={}", self.plugin_id);
+        eprintln!("clap_plugin_gui->show begin id={}", self.plugin_id);
         gui.show(&mut handle).map_err(|e| e.to_string())?;
         self.gui_parent = None;
         self.gui_open = true;
+        eprintln!(
+            "CLAP GUI open ok: id={} mode=floating size={:?}",
+            self.plugin_id,
+            self.gui_size.map(|s| (s.width, s.height))
+        );
         Ok(())
     }
 
@@ -419,6 +527,7 @@ impl ClapHost {
         let mut handle = self.instance.plugin_handle();
         let _ = gui.hide(&mut handle);
         self.gui_open = false;
+        eprintln!("CLAP GUI hide: id={}", self.plugin_id);
     }
 
     pub fn show_gui(&mut self) {
@@ -431,6 +540,7 @@ impl ClapHost {
         let mut handle = self.instance.plugin_handle();
         let _ = gui.show(&mut handle);
         self.gui_open = true;
+        eprintln!("CLAP GUI show: id={}", self.plugin_id);
     }
 
     pub fn destroy_gui(&mut self) {
@@ -446,6 +556,7 @@ impl ClapHost {
         self.gui_open = false;
         self.gui_parent = None;
         self.gui_size = None;
+        eprintln!("CLAP GUI destroy: id={}", self.plugin_id);
     }
 
     pub fn gui_size(&self) -> Option<(i32, i32)> {
@@ -493,6 +604,7 @@ impl ClapHost {
     }
 
     pub fn prepare_for_drop(&mut self) {
+        eprintln!("CLAP unload prepare: id={}", self.plugin_id);
         let _ = self.audio_processor.ensure_processing_stopped();
         let _ = self.instance.try_deactivate();
         self.destroy_gui();
@@ -500,6 +612,14 @@ impl ClapHost {
 
     fn is_vital_id(id: &str) -> bool {
         id.to_ascii_lowercase().contains("vital")
+    }
+
+    fn is_plantsynth_id(id: &str) -> bool {
+        id.to_ascii_lowercase().contains("plantsynth")
+    }
+
+    fn has_restricted_runtime_params(id: &str) -> bool {
+        Self::is_vital_id(id) || Self::is_plantsynth_id(id)
     }
 
     fn process_internal(
@@ -692,6 +812,12 @@ impl ClapHost {
     }
 }
 
+impl Drop for ClapHost {
+    fn drop(&mut self) {
+        eprintln!("CLAP unload drop: id={}", self.plugin_id);
+    }
+}
+
 pub fn default_plugin_id(path: &str) -> Result<String, String> {
     let plugins = enumerate_plugins(path)?;
     plugins
@@ -782,6 +908,11 @@ fn resolve_clap_binary(path: &str) -> Result<std::path::PathBuf, String> {
         }
     }
 
+    let preferred_stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let mut stack = vec![input.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -806,9 +937,44 @@ fn resolve_clap_binary(path: &str) -> Result<std::path::PathBuf, String> {
             #[cfg(target_os = "macos")]
             let ok = ext == "clap";
             if ok {
-                return Ok(path);
+                candidates.push(path);
             }
         }
     }
-    Err("CLAP binary not found".to_string())
+    if candidates.is_empty() {
+        return Err("CLAP binary not found".to_string());
+    }
+    let rank = |candidate: &std::path::PathBuf| {
+        let stem_match = preferred_stem
+            .as_ref()
+            .map(|preferred| {
+                candidate
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case(preferred))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let modified = std::fs::metadata(candidate)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (stem_match, modified)
+    };
+    let selected = candidates
+        .iter()
+        .max_by_key(|candidate| rank(candidate))
+        .cloned()
+        .ok_or_else(|| "CLAP binary not found".to_string())?;
+    if candidates.len() > 1 {
+        eprintln!(
+            "CLAP resolve: multiple binaries under {} ({} candidates), selected {}",
+            input.display(),
+            candidates.len(),
+            selected.display()
+        );
+    }
+    Ok(selected)
 }
