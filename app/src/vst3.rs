@@ -111,7 +111,7 @@ impl Class for ParamValueQueue {
 }
 
 struct ParameterChanges {
-    queues: Mutex<Vec<ComWrapper<ParamValueQueue>>>,
+    queues: spin::Mutex<Vec<ComWrapper<ParamValueQueue>>>,
 }
 
 impl ParameterChanges {
@@ -123,20 +123,20 @@ impl ParameterChanges {
             queues.push(ComWrapper::new(queue));
         }
         Self {
-            queues: Mutex::new(queues),
+            queues: spin::Mutex::new(queues),
         }
     }
 }
 
 impl IParameterChangesTrait for ParameterChanges {
     unsafe fn getParameterCount(&self) -> i32 {
-        self.queues.lock().map(|q| q.len() as i32).unwrap_or(0)
+        self.queues.try_lock().map(|q| q.len() as i32).unwrap_or(0)
     }
 
     unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
-        let guard = match self.queues.lock() {
-            Ok(guard) => guard,
-            Err(_) => return std::ptr::null_mut(),
+        let guard = match self.queues.try_lock() {
+            Some(guard) => guard,
+            None => return std::ptr::null_mut(),
         };
         if index < 0 || index as usize >= guard.len() {
             return std::ptr::null_mut();
@@ -152,9 +152,9 @@ impl IParameterChangesTrait for ParameterChanges {
             return std::ptr::null_mut();
         }
         let id_value = *id;
-        let mut guard = match self.queues.lock() {
-            Ok(guard) => guard,
-            Err(_) => return std::ptr::null_mut(),
+        let mut guard = match self.queues.try_lock() {
+            Some(guard) => guard,
+            None => return std::ptr::null_mut(),
         };
         let position = guard.len() as i32;
         let queue = ComWrapper::new(ParamValueQueue::new(id_value));
@@ -175,8 +175,8 @@ impl Class for ParameterChanges {
 }
 
 struct ComponentHandler {
-    last_param_change: Arc<Mutex<Option<(ParamID, ParamValue)>>>,
-    pending_param_changes: Arc<Mutex<Vec<(ParamID, ParamValue)>>>,
+    last_param_change: Arc<spin::Mutex<Option<(ParamID, ParamValue)>>>,
+    pending_param_changes: Arc<spin::Mutex<Vec<(ParamID, ParamValue)>>>,
 }
 
 struct HostConnectionPoint {
@@ -463,10 +463,10 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
-        if let Ok(mut last) = self.last_param_change.lock() {
+        if let Some(mut last) = self.last_param_change.try_lock() {
             *last = Some((id, value_normalized));
         }
-        if let Ok(mut pending) = self.pending_param_changes.lock() {
+        if let Some(mut pending) = self.pending_param_changes.try_lock() {
             pending.push((id, value_normalized));
         }
         kResultOk
@@ -860,8 +860,8 @@ pub struct Vst3Host {
     _host_cp_to_component: Option<ComWrapper<HostConnectionPoint>>,
     event_list: ComWrapper<EventList>,
     event_list_ptr: ComPtr<IEventList>,
-    pending_param_changes: Arc<Mutex<Vec<(ParamID, ParamValue)>>>,
-    last_param_change: Arc<Mutex<Option<(ParamID, ParamValue)>>>,
+    pending_param_changes: Arc<spin::Mutex<Vec<(ParamID, ParamValue)>>>,
+    last_param_change: Arc<spin::Mutex<Option<(ParamID, ParamValue)>>>,
     last_process_param_count: AtomicUsize,
     process_context: ProcessContext,
     input_buffers: Vec<Vec<f32>>,
@@ -1112,8 +1112,8 @@ impl Vst3Host {
                 HashMap::new()
             };
 
-            let last_param_change = Arc::new(Mutex::new(None));
-            let pending_param_changes = Arc::new(Mutex::new(Vec::new()));
+            let last_param_change = Arc::new(spin::Mutex::new(None));
+            let pending_param_changes = Arc::new(spin::Mutex::new(Vec::new()));
             let component_handler = controller.as_ref().and_then(|controller| {
                 let handler = ComWrapper::new(ComponentHandler {
                     last_param_change: last_param_change.clone(),
@@ -1343,13 +1343,13 @@ impl Vst3Host {
     }
 
     pub fn push_param_change(&mut self, param_id: u32, value: f64) {
-        if let Ok(mut last) = self.last_param_change.lock() {
+        if let Some(mut last) = self.last_param_change.try_lock() {
             *last = Some((param_id, value));
         }
         if let Some(controller) = self.controller.as_ref() {
             let _ = unsafe { controller.setParamNormalized(param_id, value) };
         }
-        if let Ok(mut changes) = self.pending_param_changes.lock() {
+        if let Some(mut changes) = self.pending_param_changes.try_lock() {
             changes.push((param_id, value));
         }
     }
@@ -1361,7 +1361,7 @@ impl Vst3Host {
     }
 
     pub fn take_last_param_change(&mut self) -> Option<(ParamID, ParamValue)> {
-        if let Ok(mut last) = self.last_param_change.lock() {
+        if let Some(mut last) = self.last_param_change.try_lock() {
             last.take()
         } else {
             None
@@ -1516,7 +1516,7 @@ impl Vst3Host {
         let mut _param_changes = None;
         let mut param_changes_ptr = std::ptr::null_mut();
         self.last_process_param_count.store(0, Ordering::Relaxed);
-        if let Ok(mut pending) = self.pending_param_changes.lock() {
+        if let Some(mut pending) = self.pending_param_changes.try_lock() {
             if !pending.is_empty() {
                 let changes = std::mem::take(&mut *pending);
                 self.last_process_param_count
@@ -1651,7 +1651,7 @@ impl Vst3Host {
         let mut _param_changes = None;
         let mut param_changes_ptr = std::ptr::null_mut();
         self.last_process_param_count.store(0, Ordering::Relaxed);
-        if let Ok(mut pending) = self.pending_param_changes.lock() {
+        if let Some(mut pending) = self.pending_param_changes.try_lock() {
             if !pending.is_empty() {
                 let changes = std::mem::take(&mut *pending);
                 self.last_process_param_count
@@ -1708,7 +1708,7 @@ impl Vst3Host {
     }
 
     pub fn debug_last_param_change(&self) -> Option<(ParamID, ParamValue)> {
-        self.last_param_change.lock().ok().and_then(|v| *v)
+        self.last_param_change.try_lock().and_then(|v| *v)
     }
 
     pub fn debug_last_process_param_count(&self) -> usize {

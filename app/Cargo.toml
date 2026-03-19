@@ -49,6 +49,7 @@ windows-sys = { version = "0.52", features = [
 	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_UI_WindowsAndMessaging",
 ] }
+spin = "0.10.0"
 
 [build-dependencies]
 winres = "0.1"

@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
+use rayon::prelude::*;
 use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
 use engine::timeline::PianoRollNote;
 use image::GenericImageView;
@@ -425,7 +426,7 @@ struct TreeSynthRuntime {
 impl TreeSynthRuntime {
     fn new() -> Self {
         Self {
-            voices: Vec::new(),
+            voices: Vec::with_capacity(32),
             sequence_index: 0,
             rng_state: 0x9E3779B97F4A7C15,
             last_note: None,
@@ -847,6 +848,12 @@ struct TrackAudioState {
     treesynth_state: Option<Arc<Mutex<TreeSynthState>>>,
     treesynth_runtime: Arc<Mutex<TreeSynthRuntime>>,
     treesynth_enabled: Arc<AtomicBool>,
+    track_buffer: Arc<Mutex<Vec<f32>>>,
+    fx_buffer: Arc<Mutex<Vec<f32>>>,
+    midi_in_peak: Arc<AtomicU32>,
+    midi_out_peak: Arc<AtomicU32>,
+    fx_in_peaks: Arc<Mutex<Vec<f32>>>,
+    fx_out_peaks: Arc<Mutex<Vec<f32>>>,
 }
 
 #[derive(Clone)]
@@ -985,11 +992,11 @@ impl PluginHostHandle {
     ) -> Result<(), String> {
         match self {
             PluginHostHandle::Vst3(host) => host
-                .lock()
+                .try_lock()
                 .map_err(|_| "Plugin lock failed".to_string())?
                 .process_f32(output, channels, midi_events),
             PluginHostHandle::Clap(host) => host
-                .lock()
+                .try_lock()
                 .map_err(|_| "Plugin lock failed".to_string())?
                 .process_f32(output, channels, midi_events),
         }
@@ -1004,11 +1011,11 @@ impl PluginHostHandle {
     ) -> Result<(), String> {
         match self {
             PluginHostHandle::Vst3(host) => host
-                .lock()
+                .try_lock()
                 .map_err(|_| "Plugin lock failed".to_string())?
                 .process_f32_with_input(input, output, channels, midi_events),
             PluginHostHandle::Clap(host) => host
-                .lock()
+                .try_lock()
                 .map_err(|_| "Plugin lock failed".to_string())?
                 .process_f32_with_input(input, output, channels, midi_events),
         }
@@ -1038,6 +1045,12 @@ impl TrackAudioState {
             ))),
             treesynth_runtime: Arc::new(Mutex::new(TreeSynthRuntime::new())),
             treesynth_enabled: Arc::new(AtomicBool::new(track.treesynth.is_some())),
+            track_buffer: Arc::new(Mutex::new(Vec::with_capacity(8192))),
+            fx_buffer: Arc::new(Mutex::new(Vec::with_capacity(8192))),
+            midi_in_peak: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            midi_out_peak: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            fx_in_peaks: Arc::new(Mutex::new(Vec::with_capacity(16))),
+            fx_out_peaks: Arc::new(Mutex::new(Vec::with_capacity(16))),
         }
     }
 
@@ -6228,10 +6241,6 @@ impl DawApp {
         }
     }
 
-    fn analyze_audio_clip(&self, path: &Path) -> Option<AudioAnalysis> {
-        Self::analyze_audio_clip_path(path)
-    }
-
     fn analyze_audio_clip_path(path: &Path) -> Option<AudioAnalysis> {
         let (samples, channels, sample_rate) = Self::decode_audio_samples(path)?;
         if samples.is_empty() || sample_rate == 0 || channels == 0 {
@@ -10350,7 +10359,12 @@ impl DawApp {
                             0.0,
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0, 0)),
                         );
-                        for clip in &track_clips {
+                let visible_start_beats = (-self.arranger_pan.x / beat_width).max(0.0) - 1.0;
+                let visible_end_beats = ((-self.arranger_pan.x + rect.width()) / beat_width) + 1.0;
+                for clip in &track_clips {
+                    if clip.start_beats + clip.length_beats < visible_start_beats || clip.start_beats > visible_end_beats {
+                        continue;
+                    }
                             let clip_x = row_left + clip.start_beats * beat_width;
                             let clip_w = (clip.length_beats * beat_width).max(1.0);
                             let clip_left = clip_x.max(row_rect.left());
@@ -11545,7 +11559,7 @@ impl DawApp {
                         if !updated {
                             lane.points.push(AutomationPoint { beat, value });
                         }
-                        lane.points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap());
+                        lane.points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
                         if let Some(state) = self.track_audio.get(track_index) {
                             if let Ok(mut lanes) = state.automation_lanes.lock() {
                                 *lanes = track.automation_lanes.clone();
@@ -16373,12 +16387,21 @@ impl DawApp {
                                 self.tracks.get(track_index).and_then(|t| t.clips.get(clip_index))
                             {
                                 if !clip.midi_notes.is_empty() {
+                                    let visible_start_beats = clip_offset - (self.piano_pan.x / beat_width) - 1.0;
+                                    let visible_end_beats = visible_start_beats + (roll_rect.width() / beat_width) + 2.0;
+
                                     for (index, note) in clip.midi_notes.iter().enumerate() {
+                                        if note.start_beats + note.length_beats < visible_start_beats || note.start_beats > visible_end_beats {
+                                            continue;
+                                        }
                                         let local_start = note.start_beats - clip_offset;
                                         let x = roll_rect.left() + self.piano_pan.x + local_start * beat_width;
+                                        let w = (note.length_beats * beat_width).max(12.0);
+                                        if x + w < roll_rect.left() || x > roll_rect.right() {
+                                            continue;
+                                        }
                                         let y = roll_rect.bottom() + self.piano_pan.y
                                             - (note.midi_note as f32 - 40.0) * note_height;
-                                        let w = (note.length_beats * beat_width).max(12.0);
                                         let note_rect = egui::Rect::from_min_size(
                                             egui::pos2(x, y - note_height),
                                             egui::vec2(w, note_height),
@@ -17156,6 +17179,13 @@ impl DawApp {
                                         PianoLaneMode::Velocity => {
                                             if let Some(clip) = clip {
                                                 for note in &clip.midi_notes {
+                                                    let x = roll_rect.left()
+                                                        + self.piano_pan.x
+                                                        + (note.start_beats - clip_offset) * beat_width;
+                                                    let w = (note.length_beats * beat_width).max(6.0);
+                                                    if x + w < roll_rect.left() || x > roll_rect.right() {
+                                                        continue;
+                                                    }
                                                     let value =
                                                         (note.velocity as f32 / 127.0).clamp(0.0, 1.0);
                                                     let h = lane_rect.height() * value;
@@ -17167,10 +17197,6 @@ impl DawApp {
                                                     let r = (30.0 + tint_r).clamp(0.0, 255.0) as u8;
                                                     let g = (140.0 + value * 100.0).clamp(0.0, 255.0) as u8;
                                                     let b = (30.0 + tint_b).clamp(0.0, 255.0) as u8;
-                                                    let x = roll_rect.left()
-                                                        + self.piano_pan.x
-                                                        + (note.start_beats - clip_offset) * beat_width;
-                                                    let w = (note.length_beats * beat_width).max(6.0);
                                                     let bar_rect = egui::Rect::from_min_size(
                                                         egui::pos2(x, lane_rect.bottom() - h),
                                                         egui::vec2(w, h),
@@ -20052,7 +20078,7 @@ impl DawApp {
                     }
                 }
                 if !points.is_empty() {
-                    points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap());
+                    points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
                     midi_cc_lanes.push(MidiCcLane { cc: 65, points });
                 }
             }
@@ -20168,52 +20194,7 @@ impl DawApp {
         Ok(())
     }
 
-    fn render_dialog(&mut self, format: RenderFormat) -> Result<(), String> {
-        let (_label, ext) = match format {
-            RenderFormat::Wav => ("WAV", "wav"),
-            RenderFormat::Ogg => ("OGG", "ogg"),
-            RenderFormat::Flac => ("FLAC", "flac"),
-        };
-        let default_name = format!("{}.{}", self.render_base_name(), ext);
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(dir) = self.default_render_dir() {
-            dialog = dialog.set_directory(dir);
-        }
-        let folder = dialog.pick_folder();
-        if let Some(folder) = folder {
-            let folder = Self::normalize_windows_path(&folder);
-            if let Err(err) = fs::create_dir_all(&folder) {
-                return Err(format!("Render folder create failed: {err}"));
-            }
-            let path = folder.join(default_name);
-            if let Some(parent) = path.parent() {
-                if let Err(err) = fs::create_dir_all(parent) {
-                    return Err(format!("Render folder create failed: {err}"));
-                }
-            }
-            let path = Self::normalize_windows_path(&path);
-            let path_str = path.to_string_lossy().to_string();
-            if let Err(err) = std::fs::File::create(&path) {
-                return Err(format!("Render file create failed: {err} ({path_str})"));
-            }
-            match format {
-                RenderFormat::Wav => {
-                    self.render_to_wav(&path_str)
-                        .map_err(|err| format!("{err} ({path_str})"))?;
-                    self.status = format!("Rendered WAV: {}", path_str);
-                }
-                RenderFormat::Ogg => {
-                    self.status = "OGG render uses the Render window".to_string();
-                    return Err("Use the Render window for OGG".to_string());
-                }
-                RenderFormat::Flac => {
-                    self.status = "FLAC render uses the Render window".to_string();
-                    return Err("Use the Render window for FLAC".to_string());
-                }
-            }
-        }
-        Ok(())
-    }
+
 
     fn render_with_options(&mut self, folder: &Path) -> Result<(), String> {
             // レンダー直前にtrack_audioを最新化
@@ -20629,34 +20610,7 @@ impl DawApp {
         path.to_path_buf()
     }
 
-    fn render_to_wav(&mut self, path: &str) -> Result<(), String> {
-        let sample_rate = self.settings.sample_rate.max(1);
-        self.render_to_wav_with_rate(path, sample_rate)
-    }
 
-    fn render_to_wav_with_rate(&mut self, path: &str, sample_rate: u32) -> Result<(), String> {
-        if self.audio_running {
-            self.stop_audio_and_midi_internal(false);
-            self.status = "Playback paused for render stability".to_string();
-        }
-        self.ensure_synth_soundfont();
-        self.capture_plugin_states();
-        let beats = self.project_end_beats().max(1.0);
-        let license_comment = self.render_license_comment();
-        let plan = self.build_master_render_plan(
-            Path::new(path),
-            sample_rate,
-            0.0,
-            beats,
-            license_comment,
-        );
-        let done = AtomicU64::new(0);
-        let total = AtomicU64::new(1);
-        self.render_progress = Some((0, 1));
-        let result = render_plan_to_wav(plan, &done, &total, &self.track_audio, &self.audio_clip_cache);
-        self.render_progress = Some((done.load(Ordering::Relaxed), total.load(Ordering::Relaxed)));
-        result
-    }
 
     fn project_end_beats(&self) -> f32 {
         let mut max_beat = 0.0f32;
@@ -21577,7 +21531,7 @@ impl DawApp {
     }
 
     fn coalesce_automation_points(points: &mut Vec<AutomationPoint>, epsilon: f32) {
-        points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap());
+        points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
         let mut merged: Vec<AutomationPoint> = Vec::with_capacity(points.len());
         for point in points.drain(..) {
             if let Some(last) = merged.last_mut() {
@@ -21910,7 +21864,29 @@ impl DawApp {
         let audio_stats = self.audio_stats.clone();
 
         let mut stream_config: cpal::StreamConfig = config.clone().into();
-        stream_config.sample_rate = cpal::SampleRate(self.settings.sample_rate);
+        let target_rate = self.settings.sample_rate;
+        let mut actual_rate = target_rate;
+        if let Ok(supported) = device.supported_output_configs() {
+            let mut found = false;
+            let mut closest_rate = 44100;
+            let mut min_diff = u32::MAX;
+            for conf in supported {
+                let min = conf.min_sample_rate().0;
+                let max = conf.max_sample_rate().0;
+                if target_rate >= min && target_rate <= max {
+                    found = true;
+                    break;
+                }
+                let diff_min = target_rate.abs_diff(min);
+                let diff_max = target_rate.abs_diff(max);
+                if diff_min < min_diff { min_diff = diff_min; closest_rate = min; }
+                if diff_max < min_diff { min_diff = diff_max; closest_rate = max; }
+            }
+            if !found && min_diff != u32::MAX {
+                actual_rate = closest_rate;
+            }
+        }
+        stream_config.sample_rate = cpal::SampleRate(actual_rate);
         stream_config.buffer_size = cpal::BufferSize::Fixed(effective_buffer);
 
         let stream = match config.sample_format() {
@@ -21963,8 +21939,8 @@ impl DawApp {
                         if !processed {
                             render_sine(data, channels, sample_rate, &freq_bits, &gate);
                         }
-                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.lock() {
+                        let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 data,
                                 channels,
@@ -22054,8 +22030,8 @@ impl DawApp {
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
                         }
-                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.lock() {
+                        let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 &mut temp,
                                 channels,
@@ -22150,8 +22126,8 @@ impl DawApp {
                         if !processed {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
                         }
-                        let settings = master_settings.lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.lock() {
+                        let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
+                        if let Ok(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 &mut temp,
                                 channels,
@@ -25404,26 +25380,7 @@ fn is_window_visible(_hwnd: isize) -> bool {
     false
 }
 
-fn try_process_vst3(
-    output: &mut [f32],
-    channels: usize,
-    host: &Option<Arc<Mutex<vst3::Vst3Host>>>,
-    midi_events: &Arc<Mutex<Vec<vst3::MidiEvent>>>,
-) -> bool {
-    let host = match host {
-        Some(host) => host,
-        None => return false,
-    };
-    let mut host = match host.lock() {
-        Ok(host) => host,
-        Err(_) => return false,
-    };
-    let events = match midi_events.lock() {
-        Ok(mut guard) => guard.drain(..).collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
-    host.process_f32(output, channels, &events).is_ok()
-}
+
 
 fn wav_spec_for_depth(
     sample_rate: u32,
@@ -27081,6 +27038,9 @@ fn treesynth_spawn_voice(
     }
     let velocity_gain = (velocity as f32 / 127.0).clamp(0.0, 1.0);
     let gain = state.gain * sample.gain * velocity_gain;
+    if runtime.voices.len() >= 32 {
+        runtime.voices.remove(0);
+    }
     runtime.voices.push(TreeSynthVoice {
         sample_index,
         sample_pos: start,
@@ -27146,7 +27106,7 @@ fn mix_treesynth_block(
     };
 
     let sample_count = treesynth_state.samples.len();
-    let sample_data: Vec<Option<Arc<AudioClipData>>> = if let Ok(mut cache) = audio_cache.lock() {
+    let sample_data: Vec<Option<Arc<AudioClipData>>> = if let Ok(mut cache) = audio_cache.try_lock() {
         treesynth_state
             .samples
             .iter()
@@ -27408,29 +27368,19 @@ fn mix_track_hosts(
     }
     let block_beat = (block_start as f64 / samples_per_beat) as f32;
 
-    let mix_snapshot = track_mix.lock().ok().map(|m| m.clone()).unwrap_or_default();
+    let mix_snapshot = track_mix.try_lock().ok().map(|m| m.clone()).unwrap_or_default();
     let any_solo = mix_snapshot.iter().any(|m| m.solo);
     let performance_snapshot = performance_runtime
-        .lock()
+        .try_lock()
         .ok()
         .map(|runtime| runtime.clone())
         .unwrap_or_default();
     let track_count = track_audio.len();
     let mut track_has_audio = vec![false; track_count];
-    let mut midi_in_levels = vec![0.0f32; track_count];
-    let mut midi_out_levels = vec![0.0f32; track_count];
-    let mut fx_in_levels: Vec<Vec<f32>> = track_audio
-        .iter()
-        .map(|state| vec![0.0; state.effect_hosts.len()])
-        .collect();
-    let mut fx_out_levels: Vec<Vec<f32>> = track_audio
-        .iter()
-        .map(|state| vec![0.0; state.effect_hosts.len()])
-        .collect();
     let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
         vec![Vec::new(); track_count];
     if arrangement_playing {
-        if let Ok(clips) = audio_clips.lock() {
+        if let Ok(clips) = audio_clips.try_lock() {
             for clip in clips.iter() {
                 if clip.track_index >= track_count {
                     continue;
@@ -27441,7 +27391,7 @@ fn mix_track_hosts(
                 }
                 track_has_audio[clip.track_index] = true;
                 let data = {
-                    let cache = match audio_cache.lock() {
+                    let cache = match audio_cache.try_lock() {
                         Ok(cache) => cache,
                         Err(_) => continue,
                     };
@@ -27455,20 +27405,21 @@ fn mix_track_hosts(
         }
     }
 
-    let mut processed_any = false;
-    let routes_snapshot = node_routes.lock().ok().map(|r| r.clone()).unwrap_or_default();
+    let routes_snapshot = node_routes.try_lock().ok().map(|r| r.clone()).unwrap_or_default();
     if sidechain_states.len() < routes_snapshot.len() {
         sidechain_states.resize(routes_snapshot.len(), 1.0);
     } else if sidechain_states.len() > routes_snapshot.len() {
         sidechain_states.truncate(routes_snapshot.len());
     }
-    let mut track_buffers: Vec<Vec<f32>> = (0..track_count)
-        .map(|_| vec![0.0; output.len()])
-        .collect();
-    let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_count];
 
-    // Process tracks on the calling thread to avoid VST3 thread-affinity issues.
-    for index in 0..track_count {
+    let processed_any_atomic = AtomicBool::new(false);
+
+    // Prepare track host outputs for sidechaining
+    let track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_count];
+    let track_host_outputs_shared = Arc::new(Mutex::new(track_host_outputs));
+
+    // Parallel track processing with Rayon
+    (0..track_count).into_par_iter().for_each(|index| {
         let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
             muted: false,
             solo: false,
@@ -27476,17 +27427,20 @@ fn mix_track_hosts(
         });
         let state = match track_audio.get(index) {
             Some(state) => state,
-            None => continue,
+            None => return,
         };
+
         if mix.muted || (any_solo && !mix.solo) {
             state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-            continue;
+            state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+            state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+            return;
         }
 
         let notes = if arrangement_playing {
-            match state.clip_notes.lock() {
+            match state.clip_notes.try_lock() {
                 Ok(guard) => guard.clone(),
                 Err(_) => Vec::new(),
             }
@@ -27504,27 +27458,15 @@ fn mix_track_hosts(
                 .as_ref()
                 .map(|runtime| !runtime.clip.is_midi)
                 .unwrap_or(false);
-        let learned_map = state
-            .learned_cc
-            .lock()
-            .ok()
-            .map(|map| map.clone())
-            .unwrap_or_default();
         let automation = state
             .automation_lanes
-            .lock()
+            .try_lock()
             .ok()
             .map(|lanes| lanes.clone())
             .unwrap_or_default();
-        let bypass = state
-            .effect_bypass
-            .lock()
-            .ok()
-            .map(|b| b.clone())
-            .unwrap_or_default();
         let queued_len = state
             .midi_events
-            .lock()
+            .try_lock()
             .ok()
             .map(|q| q.len())
             .unwrap_or(0);
@@ -27533,17 +27475,22 @@ fn mix_track_hosts(
             && !has_audio
             && queued_len == 0
             && automation.is_empty();
+        
         if should_suspend {
             let blocks = state.silent_blocks.fetch_add(1, Ordering::Relaxed) + 1;
             if blocks >= 4 {
                 state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
-                continue;
+                state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+                return;
             }
         } else {
             state.silent_blocks.store(0, Ordering::Relaxed);
         }
+
+        let mut track_processed = false;
 
         MIX_TEMP.with(|mix_cell| {
             FX_TEMP.with(|fx_cell| {
@@ -27553,7 +27500,13 @@ fn mix_track_hosts(
                 }
                 temp.fill(0.0);
 
-                let mut track_processed = false;
+                let learned_map = state
+                    .learned_cc
+                    .try_lock()
+                    .ok()
+                    .map(|map| map.clone())
+                    .unwrap_or_default();
+
                 let mut remaining_params: Vec<PendingParamChange> = Vec::new();
                 let mut filtered_events: Vec<vst3::MidiEvent> = Vec::new();
                 let performance_events = active_performance
@@ -27567,6 +27520,7 @@ fn mix_track_hosts(
                         )
                     })
                     .unwrap_or_default();
+
                 if state.treesynth_enabled.load(Ordering::Relaxed) {
                     let (processed, events) = mix_treesynth_block(
                         &mut temp,
@@ -27587,9 +27541,9 @@ fn mix_track_hosts(
                     }
                     filtered_events = events;
                 }
+
                 if let Some(host) = state.host.as_ref() {
-                    let mut events =
-                        collect_block_events(&notes, block_start, block_end, samples_per_beat);
+                    let mut events = collect_block_events(&notes, block_start, block_end, samples_per_beat);
                     events.extend(performance_events.iter().cloned());
                     if panic_notes {
                         for channel in 0u8..16 {
@@ -27597,17 +27551,12 @@ fn mix_track_hosts(
                             events.push(vst3::MidiEvent::control_change(channel, 123, 0));
                         }
                         for channel in 0u8..16 {
-                            events.extend(
-                                (0u8..=127)
-                                    .map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
-                            );
+                            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)));
                         }
                         if frames > 1 {
                             for event in events.iter_mut() {
                                 if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
-                                    if *sample_offset == 0 {
-                                        *sample_offset = 1;
-                                    }
+                                    if *sample_offset == 0 { *sample_offset = 1; }
                                 }
                             }
                         }
@@ -27618,9 +27567,7 @@ fn mix_track_hosts(
                     if let Ok(mut queued) = state.midi_events.lock() {
                         events.extend(queued.drain(..));
                     }
-                    let has_note_on = events
-                        .iter()
-                        .any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
+                    let has_note_on = events.iter().any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
                     let pending_params = state
                         .pending_param_changes
                         .lock()
@@ -27629,12 +27576,8 @@ fn mix_track_hosts(
                         .unwrap_or_default();
                     for pending in &pending_params {
                         match pending.target {
-                            PendingParamTarget::Instrument => {
-                                host.push_param_change(pending.param_id, pending.value);
-                            }
-                            PendingParamTarget::Effect(_) => {
-                                remaining_params.push(*pending);
-                            }
+                            PendingParamTarget::Instrument => { host.push_param_change(pending.param_id, pending.value); }
+                            PendingParamTarget::Effect(_) => { remaining_params.push(*pending); }
                         }
                     }
                     for lane in &automation {
@@ -27647,11 +27590,7 @@ fn mix_track_hosts(
                     let mut filtered = Vec::with_capacity(events.len());
                     for event in events {
                         match event {
-                            vst3::MidiEvent::ControlChange {
-                                channel,
-                                controller,
-                                value,
-                            } => {
+                            vst3::MidiEvent::ControlChange { channel, controller, value } => {
                                 if controller >= 120 {
                                     filtered.push(event);
                                     continue;
@@ -27667,26 +27606,20 @@ fn mix_track_hosts(
                         }
                     }
                     filtered_events = filtered;
-                    let host_out_channels = host
-                        .io_channels()
-                        .1
-                        .max(channels)
-                        .clamp(1, MAX_PLUGIN_OUTPUT_CHANNELS);
+                    let host_out_channels = host.io_channels().1.max(channels).clamp(1, MAX_PLUGIN_OUTPUT_CHANNELS);
                     let mut host_output = vec![0.0f32; frames * host_out_channels];
                     if host.process_f32(&mut host_output, host_out_channels, &filtered_events).is_ok() {
                         for frame in 0..frames {
                             let src_base = frame * host_out_channels;
                             let dst_base = frame * channels;
                             for ch in 0..channels {
-                                let src_ch = if host_out_channels == 1 {
-                                    0
-                                } else {
-                                    ch.min(host_out_channels - 1)
-                                };
+                                let src_ch = if host_out_channels == 1 { 0 } else { ch.min(host_out_channels - 1) };
                                 temp[dst_base + ch] += host_output[src_base + src_ch];
                             }
                         }
-                        track_host_outputs[index] = Some((host_output, host_out_channels));
+                        if let Ok(mut shared) = track_host_outputs_shared.lock() {
+                            shared[index] = Some((host_output, host_out_channels));
+                        }
                         track_processed = true;
                     }
                     if panic_notes && !has_note_on {
@@ -27696,244 +27629,111 @@ fn mix_track_hosts(
 
                 if !filtered_events.is_empty() {
                     let midi_level = (filtered_events.len() as f32 / 16.0).clamp(0.0, 1.0);
-                    midi_in_levels[index] = midi_in_levels[index].max(midi_level);
-                    midi_out_levels[index] = midi_out_levels[index].max(midi_level);
+                    state.midi_in_peak.store(midi_level.to_bits(), Ordering::Relaxed);
+                    state.midi_out_peak.store(midi_level.to_bits(), Ordering::Relaxed);
+                } else {
+                    state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
                 }
 
                 if let Some(clips) = per_track_clips.get(index) {
                     for (clip, data) in clips {
-                        let clip_end = clip.start_samples + clip.length_samples;
-                        if block_end <= clip.start_samples || block_start >= clip_end {
-                            continue;
-                        }
-                        if clip.stretch_mode == AudioStretchMode::Speed {
-                            mix_clip_resample(
-                                &mut temp,
-                                channels,
-                                clip,
-                                data,
-                                block_start,
-                                block_end,
-                                sample_rate,
-                            );
-                        } else {
-                            #[cfg(all(windows, has_rubberband))]
-                            {
-                                let formant_preserve = matches!(
-                                    clip.stretch_mode,
-                                    AudioStretchMode::StretchFormant
-                                        | AudioStretchMode::StretchNeutral
-                                        | AudioStretchMode::StretchVocal
-                                );
-                                let time_mul = clip.time_mul.max(0.01) as f64;
-                                let pitch_scale = time_mul
-                                    * 2.0f64.powf(clip.pitch_semitones as f64 / 12.0);
-                                let formant_scale = clip.formant_scale.max(0.25) as f64;
-                                if let Ok(mut cache) = audio_cache.lock() {
-                                    let stretcher = cache.get_or_create_stretcher(
-                                        clip.clip_id,
-                                        sample_rate as u32,
-                                        channels,
-                                        pitch_scale,
-                                        formant_preserve,
-                                        formant_scale,
-                                    );
-                                    mix_clip_stretch(
-                                        &mut temp,
-                                        channels,
-                                        clip,
-                                        data,
-                                        block_start,
-                                        block_end,
-                                        sample_rate,
-                                        &stretcher,
-                                    );
-                                } else {
-                                    mix_clip_resample(
-                                        &mut temp,
-                                        channels,
-                                        clip,
-                                        data,
-                                        block_start,
-                                        block_end,
-                                        sample_rate,
-                                    );
-                                }
-                            }
-                            #[cfg(any(not(windows), not(has_rubberband)))]
-                            {
-                                mix_clip_resample(
-                                    &mut temp,
-                                    channels,
-                                    clip,
-                                    data,
-                                    block_start,
-                                    block_end,
-                                    sample_rate,
-                                );
-                            }
-                        }
+                        mix_clip_resample(&mut temp, channels, clip, data, block_start, block_end, sample_rate);
                         track_processed = true;
                     }
                 }
-                if let Some(runtime) = active_performance.as_ref() {
+
+                if let Some(runtime) = active_performance {
                     if let Some((clip, data)) = performance_audio_clip_for_block(
-                        runtime,
+                        &runtime,
                         block_start,
                         sample_rate as u32,
                         samples_per_beat,
                         audio_cache,
                     ) {
-                        if clip.stretch_mode == AudioStretchMode::Speed {
-                            mix_clip_resample(
-                                &mut temp,
-                                channels,
-                                &clip,
-                                &data,
-                                block_start,
-                                block_end,
-                                sample_rate,
-                            );
-                        } else {
-                            #[cfg(all(windows, has_rubberband))]
-                            {
-                                let formant_preserve = matches!(
-                                    clip.stretch_mode,
-                                    AudioStretchMode::StretchFormant
-                                        | AudioStretchMode::StretchNeutral
-                                        | AudioStretchMode::StretchVocal
-                                );
-                                let time_mul = clip.time_mul.max(0.01) as f64;
-                                let pitch_scale = time_mul
-                                    * 2.0f64.powf(clip.pitch_semitones as f64 / 12.0);
-                                let formant_scale = clip.formant_scale.max(0.25) as f64;
-                                if let Ok(mut cache) = audio_cache.lock() {
-                                    let stretcher = cache.get_or_create_stretcher(
-                                        clip.clip_id,
-                                        sample_rate as u32,
-                                        channels,
-                                        pitch_scale,
-                                        formant_preserve,
-                                        formant_scale,
-                                    );
-                                    mix_clip_stretch(
-                                        &mut temp,
-                                        channels,
-                                        &clip,
-                                        &data,
-                                        block_start,
-                                        block_end,
-                                        sample_rate,
-                                        &stretcher,
-                                    );
-                                } else {
-                                    mix_clip_resample(
-                                        &mut temp,
-                                        channels,
-                                        &clip,
-                                        &data,
-                                        block_start,
-                                        block_end,
-                                        sample_rate,
-                                    );
-                                }
-                            }
-                            #[cfg(any(not(windows), not(has_rubberband)))]
-                            {
-                                mix_clip_resample(
-                                    &mut temp,
-                                    channels,
-                                    &clip,
-                                    &data,
-                                    block_start,
-                                    block_end,
-                                    sample_rate,
-                                );
-                            }
-                        }
+                        mix_clip_resample(&mut temp, channels, &clip, &data, block_start, block_end, sample_rate);
                         track_processed = true;
                     }
                 }
 
-                if !state.effect_hosts.is_empty() {
-                    let mut scratch = fx_cell.borrow_mut();
-                    if scratch.len() != temp.len() {
-                        scratch.resize(temp.len(), 0.0);
-                    }
-                    let mut use_temp = true;
-                    let mut current: &mut [f32] = &mut temp;
-                    let mut scratch_slice: &mut [f32] = &mut scratch;
-                    let skip_fx = smart_disable_plugins && !has_notes && !has_audio;
-                    for (fx_index, fx_host) in state.effect_hosts.iter().enumerate() {
-                        if skip_fx || bypass.get(fx_index).copied().unwrap_or(false) {
+                let mut fx_temp_buf = fx_cell.borrow_mut();
+                if fx_temp_buf.len() != output.len() {
+                    fx_temp_buf.resize(output.len(), 0.0);
+                }
+                let mut uses_scratch = false;
+                {
+                    let mut current = &mut *temp;
+                    let mut scratch = &mut *fx_temp_buf;
+
+                    let bypass_guard = state.effect_bypass.try_lock();
+                    let bypass = bypass_guard.as_ref().map(|g| g.as_slice()).unwrap_or(&[]);
+
+                    let mut cin_peaks = Vec::new();
+                    let mut cout_peaks = Vec::new();
+
+                    for (fx_index, fx) in state.effect_hosts.iter().enumerate() {
+                        let is_bypassed = bypass.get(fx_index).copied().unwrap_or(false);
+                        if is_bypassed {
+                            cin_peaks.push(0.0);
+                            cout_peaks.push(0.0);
                             continue;
                         }
-                        scratch_slice.fill(0.0);
-                        let mut still_pending: Vec<PendingParamChange> = Vec::new();
-                        for pending in remaining_params.drain(..) {
-                            match pending.target {
-                                PendingParamTarget::Effect(target_index) if target_index == fx_index => {
-                                    fx_host.push_param_change(pending.param_id, pending.value);
+                        
+                        let mut in_peak = 0.0f32;
+                        for sample in current.iter() { in_peak = in_peak.max(sample.abs()); }
+                        cin_peaks.push(in_peak);
+
+                        for pending in &remaining_params {
+                            if let PendingParamTarget::Effect(target_fx) = pending.target {
+                                if target_fx == fx_index {
+                                    fx.push_param_change(pending.param_id, pending.value);
                                 }
-                                _ => still_pending.push(pending),
                             }
                         }
-                        remaining_params = still_pending;
                         for lane in &automation {
                             if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                                if lane.target == AutomationTarget::Effect(fx_index) {
-                                    fx_host.push_param_change(lane.param_id, value as f64);
+                                if let AutomationTarget::Effect(target_fx) = lane.target {
+                                    if target_fx == fx_index {
+                                        fx.push_param_change(lane.param_id, value as f64);
+                                    }
                                 }
                             }
                         }
-                        let mut in_peak = 0.0f32;
-                        for sample in current.iter() {
-                            in_peak = in_peak.max(sample.abs());
+
+                        scratch.fill(0.0);
+                        if fx.process_f32_with_input(current, scratch, channels, &[]).is_ok() {
+                            std::mem::swap(&mut current, &mut scratch);
+                            uses_scratch = !uses_scratch;
+                            track_processed = true;
                         }
-                        if fx_host
-                            .process_f32_with_input(current, scratch_slice, channels, &filtered_events)
-                            .is_ok()
-                        {
-                            let mut out_peak = 0.0f32;
-                            for sample in scratch_slice.iter() {
-                                out_peak = out_peak.max(sample.abs());
-                            }
-                            if let Some(levels) = fx_in_levels.get_mut(index) {
-                                if let Some(level) = levels.get_mut(fx_index) {
-                                    *level = (*level).max(in_peak);
-                                }
-                            }
-                            if let Some(levels) = fx_out_levels.get_mut(index) {
-                                if let Some(level) = levels.get_mut(fx_index) {
-                                    *level = (*level).max(out_peak);
-                                }
-                            }
-                            std::mem::swap(&mut current, &mut scratch_slice);
-                            use_temp = !use_temp;
-                        }
+                        
+                        let mut out_peak = 0.0f32;
+                        for sample in current.iter() { out_peak = out_peak.max(sample.abs()); }
+                        cout_peaks.push(out_peak);
                     }
-                    if !remaining_params.is_empty() {
-                        if let Ok(mut pending) = state.pending_param_changes.lock() {
-                            pending.extend(remaining_params);
-                        }
+                    
+                    if let Ok(mut cp) = state.fx_in_peaks.try_lock() {
+                        if cp.len() != cin_peaks.len() { cp.resize(cin_peaks.len(), 0.0); }
+                        cp.copy_from_slice(&cin_peaks);
                     }
-                    if !use_temp {
-                        temp.copy_from_slice(&scratch);
+                    if let Ok(mut cp) = state.fx_out_peaks.try_lock() {
+                        if cp.len() != cout_peaks.len() { cp.resize(cout_peaks.len(), 0.0); }
+                        cp.copy_from_slice(&cout_peaks);
                     }
                 }
 
-                let mut peak_l = 0.0f32;
-                let mut peak_r = 0.0f32;
-                if channels >= 2 {
-                    for frame in temp.chunks_exact(channels) {
+                if uses_scratch {
+                    temp.copy_from_slice(&fx_temp_buf);
+                }
+
+                let (mut peak_l, mut peak_r) = (0.0f32, 0.0f32);
+                for frame in temp.chunks(channels.max(1)) {
+                    if channels >= 2 {
                         peak_l = peak_l.max(frame[0].abs());
                         peak_r = peak_r.max(frame[1].abs());
-                    }
-                } else {
-                    for sample in temp.iter() {
-                        let v = sample.abs();
-                        peak_l = peak_l.max(v);
-                        peak_r = peak_r.max(v);
+                    } else if !frame.is_empty() {
+                        peak_l = peak_l.max(frame[0].abs());
+                        peak_r = peak_l;
                     }
                 }
                 state.peak_l_bits.store(peak_l.to_bits(), Ordering::Relaxed);
@@ -27941,17 +27741,21 @@ fn mix_track_hosts(
                 state.peak_bits.store(peak_l.max(peak_r).to_bits(), Ordering::Relaxed);
 
                 if track_processed {
-                    processed_any = true;
+                    processed_any_atomic.store(true, Ordering::Relaxed);
                 }
 
-                if let Some(track_out) = track_buffers.get_mut(index) {
-                    for (out, sample) in track_out.iter_mut().zip(temp.iter()) {
-                        *out += *sample * mix.level;
+                if let Ok(mut track_out_mutex) = state.track_buffer.try_lock() {
+                    track_out_mutex.resize(temp.len(), 0.0);
+                    for (out, sample) in track_out_mutex.iter_mut().zip(temp.iter()) {
+                        *out = *sample * mix.level;
                     }
                 }
             })
         });
-    }
+    });
+
+    let processed_any = processed_any_atomic.load(Ordering::Relaxed);
+    let track_host_outputs = track_host_outputs_shared.lock().map(|g| g.clone()).unwrap_or_default();
 
     for (route_index, route) in routes_snapshot.iter().enumerate() {
         if !route.enabled || route.kind != NodeRouteKind::AudioSidechain {
@@ -27969,59 +27773,62 @@ fn mix_track_hosts(
 
         let source_pair = route.source_output_pair;
 
-        let (source, target): (&[f32], &mut [f32]) = if route.from_track < route.to_track {
-            let (left, right) = track_buffers.split_at_mut(route.to_track);
-            (&left[route.from_track], &mut right[0])
-        } else {
-            let (left, right) = track_buffers.split_at_mut(route.from_track);
-            (&right[0], &mut left[route.to_track])
-        };
-
-        let mut gain = sidechain_states.get(route_index).copied().unwrap_or(1.0);
-        for frame in 0..frames {
-            let base = frame * channels;
-            let detector = if let Some((host_buf, host_channels)) =
-                track_host_outputs.get(route.from_track).and_then(|entry| entry.as_ref())
-            {
-                let src_base = frame * *host_channels;
-                let ch0 = (source_pair * 2).min(host_channels.saturating_sub(1));
-                let ch1 = (ch0 + 1).min(host_channels.saturating_sub(1));
-                host_buf.get(src_base + ch0).copied().unwrap_or(0.0).abs().max(
-                    host_buf.get(src_base + ch1).copied().unwrap_or(0.0).abs(),
-                )
-            } else {
-                let mut v = 0.0f32;
+        let from_state = &track_audio[route.from_track];
+        let to_state = &track_audio[route.to_track];
+        
+        // Locked access to buffers for sidechain processing
+        let from_buf_guard = from_state.track_buffer.try_lock();
+        let mut to_buf_guard = to_state.track_buffer.try_lock();
+        
+        if let (Ok(source), Ok(mut target)) = (from_buf_guard, to_buf_guard) {
+            let mut gain = sidechain_states.get(route_index).copied().unwrap_or(1.0);
+            for frame in 0..frames {
+                let base = frame * channels;
+                let detector = if let Some((host_buf, host_channels)) =
+                    track_host_outputs.get(route.from_track).and_then(|entry| entry.as_ref())
+                {
+                    let src_base = frame * *host_channels;
+                    let ch0 = (source_pair * 2).min(host_channels.saturating_sub(1));
+                    let ch1 = (ch0 + 1).min(host_channels.saturating_sub(1));
+                    host_buf.get(src_base + ch0).copied().unwrap_or(0.0).abs().max(
+                        host_buf.get(src_base + ch1).copied().unwrap_or(0.0).abs(),
+                    )
+                } else {
+                    let mut v = 0.0f32;
+                    for ch in 0..channels {
+                        v = v.max(source.get(base + ch).copied().unwrap_or(0.0).abs());
+                    }
+                    v
+                };
+                let target_gain = if detector > threshold {
+                    let over = ((detector - threshold) / (1.0 - threshold).max(1e-6)).clamp(0.0, 1.0);
+                    (1.0 - amount * over).clamp(0.05, 1.0)
+                } else {
+                    1.0
+                };
+                if target_gain < gain {
+                    gain = attack_coeff * (gain - target_gain) + target_gain;
+                } else {
+                    gain = release_coeff * (gain - target_gain) + target_gain;
+                }
                 for ch in 0..channels {
-                    v = v.max(source.get(base + ch).copied().unwrap_or(0.0).abs());
-                }
-                v
-            };
-            let target_gain = if detector > threshold {
-                let over = ((detector - threshold) / (1.0 - threshold).max(1e-6)).clamp(0.0, 1.0);
-                (1.0 - amount * over).clamp(0.05, 1.0)
-            } else {
-                1.0
-            };
-            if target_gain < gain {
-                gain = attack_coeff * (gain - target_gain) + target_gain;
-            } else {
-                gain = release_coeff * (gain - target_gain) + target_gain;
-            }
-            for ch in 0..channels {
-                if let Some(sample) = target.get_mut(base + ch) {
-                    *sample *= gain;
+                    if let Some(sample) = target.get_mut(base + ch) {
+                        *sample *= gain;
+                    }
                 }
             }
-        }
-        if let Some(state) = sidechain_states.get_mut(route_index) {
-            *state = gain;
+            if let Some(state) = sidechain_states.get_mut(route_index) {
+                *state = gain;
+            }
         }
     }
 
     output.fill(0.0);
-    for track_out in &track_buffers {
-        for (out, sample) in output.iter_mut().zip(track_out.iter()) {
-            *out += *sample;
+    for state in track_audio {
+        if let Ok(buf) = state.track_buffer.try_lock() {
+            for (out, sample) in output.iter_mut().zip(buf.iter()) {
+                *out += *sample;
+            }
         }
     }
 
@@ -28029,7 +27836,7 @@ fn mix_track_hosts(
         if activity.len() < track_count {
             activity.resize(track_count, TrackNodeActivity::default());
         }
-        for index in 0..track_count {
+        for (index, state) in track_audio.iter().enumerate() {
             let mut pair_peaks = [0.0f32; 8];
             if let Some((host_buf, host_channels)) = track_host_outputs.get(index).and_then(|v| v.as_ref()) {
                 let hc = (*host_channels).max(1);
@@ -28037,16 +27844,12 @@ fn mix_track_hosts(
                     let base = frame * hc;
                     for pair in 0..8 {
                         let ch0 = pair * 2;
-                        if ch0 >= hc {
-                            break;
+                        if ch0 < hc {
+                            pair_peaks[pair] = pair_peaks[pair].max(host_buf.get(base + ch0).copied().unwrap_or(0.0).abs());
                         }
-                        let ch1 = (ch0 + 1).min(hc - 1);
-                        let v0 = host_buf.get(base + ch0).copied().unwrap_or(0.0).abs();
-                        let v1 = host_buf.get(base + ch1).copied().unwrap_or(0.0).abs();
-                        pair_peaks[pair] = pair_peaks[pair].max(v0.max(v1));
                     }
                 }
-            } else if let Some(track_buf) = track_buffers.get(index) {
+            } else if let Ok(track_buf) = state.track_buffer.try_lock() {
                 for frame in 0..frames {
                     let base = frame * channels;
                     let mut detector = 0.0f32;
@@ -28061,33 +27864,22 @@ fn mix_track_hosts(
                 for pair in 0..8 {
                     slot.output_pair_peaks[pair] = (slot.output_pair_peaks[pair] * 0.82).max(pair_peaks[pair]);
                 }
-                let fx_count = fx_in_levels
-                    .get(index)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-                    .max(fx_out_levels.get(index).map(|v| v.len()).unwrap_or(0));
-                if slot.fx_input_peaks.len() != fx_count {
-                    slot.fx_input_peaks.resize(fx_count, 0.0);
+                
+                if let Ok(cin) = state.fx_in_peaks.try_lock() {
+                    if slot.fx_input_peaks.len() != cin.len() { slot.fx_input_peaks.resize(cin.len(), 0.0); }
+                    for (i, v) in cin.iter().enumerate() {
+                        slot.fx_input_peaks[i] = (slot.fx_input_peaks[i] * 0.82).max(*v);
+                    }
                 }
-                if slot.fx_output_peaks.len() != fx_count {
-                    slot.fx_output_peaks.resize(fx_count, 0.0);
+                if let Ok(cout) = state.fx_out_peaks.try_lock() {
+                    if slot.fx_output_peaks.len() != cout.len() { slot.fx_output_peaks.resize(cout.len(), 0.0); }
+                    for (i, v) in cout.iter().enumerate() {
+                        slot.fx_output_peaks[i] = (slot.fx_output_peaks[i] * 0.82).max(*v);
+                    }
                 }
-                for fx_index in 0..fx_count {
-                    let in_level = fx_in_levels
-                        .get(index)
-                        .and_then(|v| v.get(fx_index))
-                        .copied()
-                        .unwrap_or(0.0);
-                    let out_level = fx_out_levels
-                        .get(index)
-                        .and_then(|v| v.get(fx_index))
-                        .copied()
-                        .unwrap_or(0.0);
-                    slot.fx_input_peaks[fx_index] = (slot.fx_input_peaks[fx_index] * 0.82).max(in_level);
-                    slot.fx_output_peaks[fx_index] = (slot.fx_output_peaks[fx_index] * 0.82).max(out_level);
-                }
-                slot.midi_in = (slot.midi_in * 0.78).max(midi_in_levels[index]);
-                slot.midi_out = (slot.midi_out * 0.78).max(midi_out_levels[index]);
+                
+                slot.midi_in = (slot.midi_in * 0.78).max(f32::from_bits(state.midi_in_peak.load(Ordering::Relaxed)));
+                slot.midi_out = (slot.midi_out * 0.78).max(f32::from_bits(state.midi_out_peak.load(Ordering::Relaxed)));
             }
         }
     }
@@ -28298,58 +28090,7 @@ fn update_master_peak_u16(output: &[u16], peak_bits: &AtomicU32) {
     peak_bits.store(peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
 
-fn enqueue_clip_events(
-    frames: usize,
-    sample_rate: f32,
-    tempo_bits: &AtomicU32,
-    transport_samples: &AtomicU64,
-    clip_notes: &Arc<Mutex<Vec<PianoRollNote>>>,
-    midi_events: &Arc<Mutex<Vec<vst3::MidiEvent>>>,
-) {
-    if frames == 0 || sample_rate <= 0.0 {
-        return;
-    }
-    let bpm = f32::from_bits(tempo_bits.load(Ordering::Relaxed)).max(1.0);
-    let samples_per_beat = sample_rate as f64 * 60.0 / bpm as f64;
-    let block_start = transport_samples.fetch_add(frames as u64, Ordering::Relaxed);
-    let block_end = block_start + frames as u64;
 
-    let notes = match clip_notes.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => return,
-    };
-    let mut events = match midi_events.lock() {
-        Ok(guard) => guard,
-        Err(_) => return,
-    };
-
-    for note in notes {
-        let start_sample = (note.start_beats as f64 * samples_per_beat).round() as u64;
-        let mut end_sample = ((note.start_beats + note.length_beats) as f64 * samples_per_beat)
-            .round() as u64;
-        if end_sample <= start_sample {
-            end_sample = start_sample.saturating_add(1);
-        }
-        if start_sample >= block_start && start_sample < block_end {
-            let offset = (start_sample - block_start) as i32;
-            events.push(vst3::MidiEvent::note_on_at(
-                0,
-                note.midi_note,
-                100,
-                offset,
-            ));
-        }
-        if end_sample >= block_start && end_sample < block_end {
-            let offset = (end_sample - block_start) as i32;
-            events.push(vst3::MidiEvent::note_off_at(
-                0,
-                note.midi_note,
-                0,
-                offset,
-            ));
-        }
-    }
-}
 
 fn render_sine<T: cpal::Sample + cpal::FromSample<f32>>(
     output: &mut [T],

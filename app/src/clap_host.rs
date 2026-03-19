@@ -764,7 +764,11 @@ impl ClapHost {
         if self.output_buffers.len() != channels {
             self.output_buffers = vec![vec![0.0; frames]; channels];
         }
+        let max_frames = frames.max(8192); // Generous pre-allocation to prevent mid-playback resizing allocations
         for buffer in &mut self.output_buffers {
+            if buffer.capacity() < max_frames {
+                buffer.reserve(max_frames - buffer.len());
+            }
             if buffer.len() != frames {
                 buffer.resize(frames, 0.0);
             }
@@ -776,6 +780,9 @@ impl ClapHost {
                 self.input_buffers = vec![vec![0.0; frames]; channels];
             }
             for buffer in &mut self.input_buffers {
+                if buffer.capacity() < max_frames {
+                    buffer.reserve(max_frames - buffer.len());
+                }
                 if buffer.len() != frames {
                     buffer.resize(frames, 0.0);
                 }
