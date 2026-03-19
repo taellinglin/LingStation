@@ -1262,7 +1262,6 @@ impl RubberBandClipState {
             input_buffers: vec![Vec::new(); channels.max(1)],
             output_buffers: vec![Vec::new(); channels.max(1)],
             needs_reposition: false,
-            block_size: 256,
         }
     }
 
