@@ -54,7 +54,7 @@ const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
 const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
 const TREESYNTH_MAX_VOICES: usize = 64;
 const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 16;
-const MAX_CLAP_OUTPUT_CHANNELS: usize = 2;
+const MAX_CLAP_OUTPUT_CHANNELS: usize = 16;
 
 fn main() -> eframe::Result<()> {
     install_crash_logger();

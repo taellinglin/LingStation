@@ -405,16 +405,6 @@ impl ClapHost {
     }
 
     pub fn set_state_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // Vital is already handled in a restricted mode for param writes.
-        // Restoring serialized state has been observed to crash inside the plugin on some builds.
-        if self.block_param_changes || Self::is_plantsynth_id(&self.plugin_id) {
-            eprintln!(
-                "CLAP state restore skipped: id={} bytes={} blocked=true",
-                self.plugin_id,
-                bytes.len()
-            );
-            return Ok(());
-        }
         let Some(state) = self.state_ext else {
             return Ok(());
         };
@@ -446,7 +436,12 @@ impl ClapHost {
             parent_hwnd
         );
         let mut handle = self.instance.plugin_handle();
+        #[cfg(target_os = "windows")]
         let api = GuiApiType::WIN32;
+        #[cfg(target_os = "linux")]
+        let api = GuiApiType::X11;
+        #[cfg(target_os = "macos")]
+        let api = GuiApiType::COCOA;
         let embedded = GuiConfiguration {
             api_type: api,
             is_floating: false,
@@ -510,8 +505,14 @@ impl ClapHost {
             return false;
         };
         let mut handle = self.instance.plugin_handle();
+        #[cfg(target_os = "windows")]
+        let api = GuiApiType::WIN32;
+        #[cfg(target_os = "linux")]
+        let api = GuiApiType::X11;
+        #[cfg(target_os = "macos")]
+        let api = GuiApiType::COCOA;
         let config = GuiConfiguration {
-            api_type: GuiApiType::WIN32,
+            api_type: api,
             is_floating: false,
         };
         gui.is_api_supported(&mut handle, config)
@@ -618,8 +619,8 @@ impl ClapHost {
         id.to_ascii_lowercase().contains("plantsynth")
     }
 
-    fn has_restricted_runtime_params(id: &str) -> bool {
-        Self::is_vital_id(id) || Self::is_plantsynth_id(id)
+    fn has_restricted_runtime_params(_id: &str) -> bool {
+        false
     }
 
     fn process_internal(

@@ -899,18 +899,8 @@ unsafe impl Send for Vst3Host {}
 unsafe impl Sync for Vst3Host {}
 
 impl Vst3Host {
-    fn skips_host_context(plugin_path: &str) -> bool {
-        let path = plugin_path.to_ascii_lowercase();
-        [
-            "catsynth",
-            "dogsynth",
-            "fishsynth",
-            "lingsynth",
-            "micesynth",
-            "sannysynth",
-        ]
-        .iter()
-        .any(|name| path.contains(name))
+    fn skips_host_context(_plugin_path: &str) -> bool {
+        false
     }
 
     pub fn io_channels(&self) -> (usize, usize) {
@@ -1818,7 +1808,12 @@ impl Vst3Editor {
         if self.attached {
             return Ok(());
         }
+        #[cfg(target_os = "windows")]
         let type_str = b"HWND\0";
+        #[cfg(target_os = "linux")]
+        let type_str = b"X11EmbedWindowID\0";
+        #[cfg(target_os = "macos")]
+        let type_str = b"NSView\0";
         let supported = unsafe { self.view.isPlatformTypeSupported(type_str.as_ptr() as *const i8) };
         eprintln!("VST3 isPlatformTypeSupported(HWND) -> {supported}");
         if supported != kResultOk {
@@ -2147,7 +2142,12 @@ fn resolve_vst3_binary(plugin_path: &str) -> Result<PathBuf, String> {
         return Ok(path.to_path_buf());
     }
     if path.is_dir() {
+        #[cfg(target_os = "windows")]
         let binary_root = path.join("Contents").join("x86_64-win");
+        #[cfg(target_os = "linux")]
+        let binary_root = path.join("Contents").join("x86_64-linux");
+        #[cfg(target_os = "macos")]
+        let binary_root = path.join("Contents").join("MacOS");
         if binary_root.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&binary_root) {
                 let mut candidates: Vec<PathBuf> = Vec::new();
