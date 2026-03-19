@@ -1,6 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use rayon::prelude::*;
 use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
 use engine::timeline::PianoRollNote;
 use image::GenericImageView;
@@ -39,7 +38,8 @@ use node_editor::{
     default_sidechain_threshold_db, NodeRouteKind, NodeRouteLink, TrackNodeActivity,
 };
 use performance::{
-    collect_performance_block_events, performance_audio_clip_for_block,
+    collect_performance_block_events, collect_performance_block_events_into,
+    performance_audio_clip_for_block,
     performance_length_samples, PerformanceClipSettings, PerformanceRuntimeClip,
     PerformanceTriggerMode,
 };
@@ -56,6 +56,7 @@ const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
 const TREESYNTH_MAX_VOICES: usize = 64;
 const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 16;
 const MAX_CLAP_OUTPUT_CHANNELS: usize = 16;
+static PLUGIN_PROCESS_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> eframe::Result<()> {
     install_crash_logger();
@@ -1072,11 +1073,21 @@ impl TrackAudioState {
         }
     }
 
-    fn sync_treesynth(&self, track: &Track, enabled: bool) {
+    fn sync_treesynth(&self, track: &Track, enabled: bool, audio_cache: &Arc<Mutex<AudioClipCache>>) {
         if let (Some(state), Some(treesynth_arc)) = (track.treesynth.clone(), self.treesynth_state.as_ref()) {
             if !state.samples.is_empty() {
                 if let Ok(mut treesynth) = treesynth_arc.lock() {
-                    *treesynth = state;
+                    *treesynth = state.clone();
+                }
+                // Pre-load samples into cache from UI thread
+                if let Ok(mut cache) = audio_cache.lock() {
+                    for sample in &state.samples {
+                        if cache.get(&sample.path).is_none() {
+                            if let Some(data) = DawApp::load_audio_clip_data(Path::new(&sample.path)).map(Arc::new) {
+                                cache.insert(sample.path.clone(), data);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1380,8 +1391,13 @@ impl AudioClipCache {
         }
     }
 
-    fn get(&self, key: &str) -> Option<Arc<AudioClipData>> {
-        self.entries.get(key).cloned()
+    fn get(&mut self, key: &str) -> Option<Arc<AudioClipData>> {
+        if let Some(data) = self.entries.get(key).cloned() {
+            self.touch(key);
+            Some(data)
+        } else {
+            None
+        }
     }
 
     fn insert(&mut self, key: String, data: Arc<AudioClipData>) {
@@ -3664,7 +3680,7 @@ impl DawApp {
                         .as_deref()
                         .map(Self::is_treesynth_path)
                         .unwrap_or(false);
-                    state.sync_treesynth(track, enabled);
+                    state.sync_treesynth(track, enabled, &self.audio_clip_cache);
                 }
             }
         }
@@ -14769,7 +14785,7 @@ impl DawApp {
                                                     .as_deref()
                                                     .map(Self::is_treesynth_path)
                                                     .unwrap_or(false);
-                                                state.sync_treesynth(track, enabled);
+                                                state.sync_treesynth(track, enabled, &self.audio_clip_cache);
                                                 if let Ok(mut runtime) =
                                                     state.treesynth_runtime.lock()
                                                 {
@@ -19403,6 +19419,24 @@ impl DawApp {
         }
     }
 
+    fn safe_join_within_base(base: &Path, child: &str) -> Result<PathBuf, String> {
+        // Lexical containment check (no filesystem access): prevents `..` traversal from sneaking
+        // into output paths while still being deterministic in server environments.
+        let candidate = base.join(child);
+
+        let base_components: Vec<_> = base.components().collect();
+        let candidate_components: Vec<_> = candidate.components().collect();
+
+        let base_len = base_components.len();
+        if candidate_components.len() < base_len {
+            return Err("Output path escapes render base directory".to_string());
+        }
+        if candidate_components[..base_len] != base_components[..] {
+            return Err("Output path escapes render base directory".to_string());
+        }
+        Ok(candidate)
+    }
+
     fn render_base_name(&self) -> String {
         let artist = self.metadata_artist.trim();
         let title = self.metadata_title.trim();
@@ -20219,7 +20253,7 @@ impl DawApp {
         for (i, track) in self.tracks.iter().enumerate() {
             if let Some(audio_state) = self.track_audio.get(i) {
                 let enabled = track.treesynth.is_some();
-                audio_state.sync_treesynth(track, enabled);
+                audio_state.sync_treesynth(track, enabled, &self.audio_clip_cache);
             }
         }
         let license_comment = self.render_license_comment();
@@ -20246,7 +20280,7 @@ impl DawApp {
             RenderFormat::Ogg => format!("{base_name}.ogg"),
             RenderFormat::Flac => format!("{base_name}.flac"),
         };
-        let master_path = folder.join(master_name);
+        let master_path = Self::safe_join_within_base(&folder, &master_name)?;
         let master_plan = self.build_master_render_plan(
             &master_path,
             sample_rate,
@@ -20264,7 +20298,7 @@ impl DawApp {
                     RenderFormat::Flac => "flac",
                 };
                 let file_name = format!("{} - {:02}_{}.{}", base_name, index + 1, safe_name, ext);
-                let path = folder.join(file_name);
+                let path = Self::safe_join_within_base(&folder, &file_name)?;
                 plans.push(self.build_render_plan_for_track(
                     index,
                     &path,
@@ -23991,7 +24025,7 @@ impl DawApp {
             if let Some(state) = self.track_audio.get(index) {
                 let enabled = Self::is_treesynth_path(&plugin_path);
                 if let Some(track) = self.tracks.get(index) {
-                    state.sync_treesynth(track, enabled);
+                    state.sync_treesynth(track, enabled, &self.audio_clip_cache);
                 }
                 if let Ok(mut runtime) = state.treesynth_runtime.lock() {
                     runtime.voices.clear();
@@ -24962,7 +24996,7 @@ impl DawApp {
                     .as_deref()
                     .map(Self::is_treesynth_path)
                     .unwrap_or(false);
-                state.sync_treesynth(track, enabled);
+                state.sync_treesynth(track, enabled, &self.audio_clip_cache);
             }
         }
         if let Some(state) = self.track_audio.get_mut(index) {
@@ -25460,7 +25494,8 @@ fn render_plan_to_wav(
             return Err(format!("Render folder create failed: {err}"));
         }
     }
-    let file = std::fs::File::create(&plan.path).map_err(|e| e.to_string())?;
+    let tmp_path = format!("{}.tmp", plan.path);
+    let file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
     let mut writer = hound::WavWriter::new(file, spec).map_err(|e| e.to_string())?;
 
     let mut track_hosts: Vec<(RenderTrack, Option<RenderHost>, Vec<RenderHost>)> = Vec::new();
@@ -25575,16 +25610,38 @@ fn render_plan_to_wav(
     let routes_snapshot = plan.node_routes.clone();
     let mut sidechain_states = vec![1.0f32; routes_snapshot.len()];
     let mut cursor = 0usize;
+
+    // Reuse per-block buffers to avoid allocator churn during offline rendering.
+    let mut output: Vec<f32> = Vec::new();
+    let mut temp: Vec<f32> = Vec::new();
+    let mut fx_temp: Vec<f32> = Vec::new();
+    let mut track_buffers: Vec<Vec<f32>> =
+        (0..track_hosts.len()).map(|_| Vec::<f32>::new()).collect();
+    let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> =
+        vec![None; track_hosts.len()];
+
     while cursor < total_samples {
         let frames = (total_samples - cursor).min(plan.block_size);
         let block_start = start_samples + cursor as u64;
         let block_end = start_samples + (cursor + frames) as u64;
-        let mut output = vec![0.0f32; frames * channels as usize];
-        let mut temp = vec![0.0f32; frames * channels as usize];
-        let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        let mut track_buffers: Vec<Vec<f32>> =
-            (0..track_hosts.len()).map(|_| vec![0.0; output.len()]).collect();
-        let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_hosts.len()];
+
+        let block_samples = frames * channels as usize;
+        output.resize(block_samples, 0.0);
+        output.fill(0.0);
+        temp.resize(block_samples, 0.0);
+        temp.fill(0.0);
+        fx_temp.resize(block_samples, 0.0);
+        fx_temp.fill(0.0);
+
+        for buf in track_buffers.iter_mut() {
+            buf.resize(block_samples, 0.0);
+            buf.fill(0.0);
+        }
+
+        for slot in track_host_outputs.iter_mut() {
+            *slot = None;
+        }
+
         for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
@@ -25782,9 +25839,11 @@ fn render_plan_to_wav(
     }
 
     writer.finalize().map_err(|e| e.to_string())?;
+    drop(writer);
     if let Some(comment) = plan.license_comment.as_deref() {
-        let _ = append_wav_comment(&plan.path, comment);
+        let _ = append_wav_comment(&tmp_path, comment);
     }
+    std::fs::rename(&tmp_path, &plan.path).map_err(|e| e.to_string())?;
     done.store(total_samples_u64, Ordering::Relaxed);
     Ok(())
 }
@@ -26024,16 +26083,37 @@ where
     let routes_snapshot = plan.node_routes.clone();
     let mut sidechain_states = vec![1.0f32; routes_snapshot.len()];
     let mut cursor = 0usize;
+
+    // Reuse per-block buffers to avoid allocator churn during offline rendering.
+    let mut output: Vec<f32> = Vec::new();
+    let mut temp: Vec<f32> = Vec::new();
+    let mut fx_temp: Vec<f32> = Vec::new();
+    let mut track_buffers: Vec<Vec<f32>> =
+        (0..track_hosts.len()).map(|_| Vec::<f32>::new()).collect();
+    let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> =
+        vec![None; track_hosts.len()];
+
     while cursor < total_samples {
         let frames = (total_samples - cursor).min(plan.block_size);
         let block_start = start_samples + cursor as u64;
         let block_end = start_samples + (cursor + frames) as u64;
-        let mut output = vec![0.0f32; frames * channels as usize];
-        let mut temp = vec![0.0f32; frames * channels as usize];
-        let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        let mut track_buffers: Vec<Vec<f32>> =
-            (0..track_hosts.len()).map(|_| vec![0.0; output.len()]).collect();
-        let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_hosts.len()];
+        let block_samples = frames * channels as usize;
+
+        output.resize(block_samples, 0.0);
+        output.fill(0.0);
+        temp.resize(block_samples, 0.0);
+        temp.fill(0.0);
+        fx_temp.resize(block_samples, 0.0);
+        fx_temp.fill(0.0);
+
+        for buf in track_buffers.iter_mut() {
+            buf.resize(block_samples, 0.0);
+            buf.fill(0.0);
+        }
+
+        for slot in track_host_outputs.iter_mut() {
+            *slot = None;
+        }
         for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
@@ -26368,16 +26448,37 @@ fn render_plan_to_f32(
     let routes_snapshot = plan.node_routes.clone();
     let mut sidechain_states = vec![1.0f32; routes_snapshot.len()];
     let mut cursor = 0usize;
+
+    // Reuse per-block buffers to avoid allocator churn during offline rendering.
+    let mut output: Vec<f32> = Vec::new();
+    let mut temp: Vec<f32> = Vec::new();
+    let mut fx_temp: Vec<f32> = Vec::new();
+    let mut track_buffers: Vec<Vec<f32>> =
+        (0..track_hosts.len()).map(|_| Vec::<f32>::new()).collect();
+    let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> =
+        vec![None; track_hosts.len()];
+
     while cursor < total_samples {
         let frames = (total_samples - cursor).min(plan.block_size);
         let block_start = start_samples + cursor as u64;
         let block_end = start_samples + (cursor + frames) as u64;
-        let mut output = vec![0.0f32; frames * channels as usize];
-        let mut temp = vec![0.0f32; frames * channels as usize];
-        let mut fx_temp = vec![0.0f32; frames * channels as usize];
-        let mut track_buffers: Vec<Vec<f32>> =
-            (0..track_hosts.len()).map(|_| vec![0.0; output.len()]).collect();
-        let mut track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_hosts.len()];
+        let block_samples = frames * channels as usize;
+
+        output.resize(block_samples, 0.0);
+        output.fill(0.0);
+        temp.resize(block_samples, 0.0);
+        temp.fill(0.0);
+        fx_temp.resize(block_samples, 0.0);
+        fx_temp.fill(0.0);
+
+        for buf in track_buffers.iter_mut() {
+            buf.resize(block_samples, 0.0);
+            buf.fill(0.0);
+        }
+
+        for slot in track_host_outputs.iter_mut() {
+            *slot = None;
+        }
         for (track_index, (track, host, fx_hosts)) in track_hosts.iter_mut().enumerate() {
             if !track.active {
                 continue;
@@ -26621,10 +26722,13 @@ fn render_plan_to_ogg(
     let tail = encoder
         .flush()
         .map_err(|e| format!("Vorbis flush failed: {e}"))?;
-    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    let tmp_path = format!("{}.tmp", path);
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
     use std::io::Write;
     file.write_all(&data).map_err(|e| e.to_string())?;
     file.write_all(&tail).map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -26848,7 +26952,8 @@ fn render_plan_to_flac(
         .write(&mut sink)
         .map_err(|e| format!("FLAC header write failed: {e}"))?;
 
-    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    let tmp_path = format!("{}.tmp", path);
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
     use std::io::Write;
     if let Some(comment) = plan.license_comment.as_deref() {
         let mut header = sink.as_slice().to_vec();
@@ -26896,6 +27001,8 @@ fn render_plan_to_flac(
             Ok(())
         },
     )?;
+    drop(file);
+    std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -26971,6 +27078,13 @@ fn build_flac_comment_block(comment: &str) -> Vec<u8> {
 thread_local! {
     static MIX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
     static FX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static HOST_OUTPUT_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
+    static FILTERED_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
+    static PERF_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
+    static REMAINING_PARAMS_TMP: RefCell<Vec<PendingParamChange>> = RefCell::new(Vec::new());
+    static CIN_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static COUT_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
 fn treesynth_adsr_level(state: &TreeSynthState, elapsed: f32) -> f32 {
@@ -27072,7 +27186,8 @@ fn mix_treesynth_block(
     state: &TrackAudioState,
     audio_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> (bool, Vec<vst3::MidiEvent>) {
-    let treesynth_state = match state.treesynth_state.as_ref().and_then(|arc| arc.lock().ok()) {
+    let treesynth_state =
+        match state.treesynth_state.as_ref().and_then(|arc| arc.try_lock().ok()) {
         Some(guard) => guard.clone(),
         None => return (false, Vec::new()),
     };
@@ -27096,11 +27211,11 @@ fn mix_treesynth_block(
     if loop_wrapped {
         events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
     }
-    if let Ok(mut queued) = state.midi_events.lock() {
+    if let Ok(mut queued) = state.midi_events.try_lock() {
         events.extend(queued.drain(..));
     }
 
-    let mut runtime = match state.treesynth_runtime.lock() {
+    let mut runtime = match state.treesynth_runtime.try_lock() {
         Ok(guard) => guard,
         Err(_) => return (false, events),
     };
@@ -27110,16 +27225,7 @@ fn mix_treesynth_block(
         treesynth_state
             .samples
             .iter()
-            .map(|sample| {
-                if let Some(data) = cache.get(&sample.path) {
-                    return Some(data);
-                }
-                let loaded = DawApp::load_audio_clip_data(Path::new(&sample.path)).map(Arc::new);
-                if let Some(data) = loaded.as_ref() {
-                    cache.insert(sample.path.clone(), data.clone());
-                }
-                loaded
-            })
+            .map(|sample| cache.get(&sample.path))
             .collect()
     } else {
         vec![None; sample_count]
@@ -27392,7 +27498,7 @@ fn mix_track_hosts(
                 track_has_audio[clip.track_index] = true;
                 let data = {
                     let cache = match audio_cache.try_lock() {
-                        Ok(cache) => cache,
+                        Ok(mut cache) => cache,
                         Err(_) => continue,
                     };
                     cache.get(&clip.path)
@@ -27414,12 +27520,8 @@ fn mix_track_hosts(
 
     let processed_any_atomic = AtomicBool::new(false);
 
-    // Prepare track host outputs for sidechaining
-    let track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = vec![None; track_count];
-    let track_host_outputs_shared = Arc::new(Mutex::new(track_host_outputs));
-
-    // Parallel track processing with Rayon
-    (0..track_count).into_par_iter().for_each(|index| {
+    // Realtime-safe: keep track processing deterministic (no Rayon scheduling variance).
+    let track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = (0..track_count).into_iter().map(|index| {
         let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
             muted: false,
             solo: false,
@@ -27427,7 +27529,7 @@ fn mix_track_hosts(
         });
         let state = match track_audio.get(index) {
             Some(state) => state,
-            None => return,
+            None => return None,
         };
 
         if mix.muted || (any_solo && !mix.solo) {
@@ -27436,7 +27538,7 @@ fn mix_track_hosts(
             state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-            return;
+            return None;
         }
 
         let notes = if arrangement_playing {
@@ -27484,144 +27586,176 @@ fn mix_track_hosts(
                 state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-                return;
+                return None;
             }
         } else {
             state.silent_blocks.store(0, Ordering::Relaxed);
         }
 
         let mut track_processed = false;
+        let mut host_out_result = None;
 
         MIX_TEMP.with(|mix_cell| {
             FX_TEMP.with(|fx_cell| {
-                let mut temp = mix_cell.borrow_mut();
-                if temp.len() != output.len() {
-                    temp.resize(output.len(), 0.0);
-                }
-                temp.fill(0.0);
-
-                let learned_map = state
-                    .learned_cc
-                    .try_lock()
-                    .ok()
-                    .map(|map| map.clone())
-                    .unwrap_or_default();
-
-                let mut remaining_params: Vec<PendingParamChange> = Vec::new();
-                let mut filtered_events: Vec<vst3::MidiEvent> = Vec::new();
-                let performance_events = active_performance
-                    .as_ref()
-                    .map(|runtime| {
-                        collect_performance_block_events(
-                            runtime,
-                            block_start,
-                            block_end,
-                            samples_per_beat,
-                        )
-                    })
-                    .unwrap_or_default();
-
-                if state.treesynth_enabled.load(Ordering::Relaxed) {
-                    let (processed, events) = mix_treesynth_block(
-                        &mut temp,
-                        channels,
-                        sample_rate,
-                        block_start,
-                        block_end,
-                        samples_per_beat,
-                        panic_notes,
-                        loop_wrapped,
-                        &notes,
-                        &performance_events,
-                        state,
-                        audio_cache,
-                    );
-                    if processed {
-                        track_processed = true;
+                HOST_OUTPUT_TEMP.with(|host_out_cell| {
+                    let mut temp = mix_cell.borrow_mut();
+                    if temp.len() != output.len() {
+                        temp.resize(output.len(), 0.0);
                     }
-                    filtered_events = events;
-                }
+                    temp.fill(0.0);
 
-                if let Some(host) = state.host.as_ref() {
-                    let mut events = collect_block_events(&notes, block_start, block_end, samples_per_beat);
-                    events.extend(performance_events.iter().cloned());
-                    if panic_notes {
-                        for channel in 0u8..16 {
-                            events.push(vst3::MidiEvent::control_change(channel, 120, 0));
-                            events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+                    let learned_map = state.learned_cc.try_lock().ok();
+
+                    let mut remaining_params =
+                        REMAINING_PARAMS_TMP.with(|cell| cell.borrow_mut());
+                    remaining_params.clear();
+
+                    let mut filtered_events =
+                        FILTERED_EVENTS_TMP.with(|cell| cell.borrow_mut());
+                    filtered_events.clear();
+                    let mut has_note_on = false;
+
+                    PERF_EVENTS_TMP.with(|perf_cell| {
+                        let mut performance_events = perf_cell.borrow_mut();
+                        performance_events.clear();
+                        if let Some(runtime) = active_performance.as_ref() {
+                            collect_performance_block_events_into(
+                                runtime,
+                                block_start,
+                                block_end,
+                                samples_per_beat,
+                                &mut performance_events,
+                            );
                         }
-                        for channel in 0u8..16 {
-                            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)));
+
+                        if state.treesynth_enabled.load(Ordering::Relaxed) {
+                            let (processed, events) = mix_treesynth_block(
+                                &mut temp,
+                                channels,
+                                sample_rate,
+                                block_start,
+                                block_end,
+                                samples_per_beat,
+                                panic_notes,
+                                loop_wrapped,
+                                &notes,
+                                &performance_events,
+                                state,
+                                audio_cache,
+                            );
+                            if processed {
+                                track_processed = true;
+                            }
+                            filtered_events.extend(events);
                         }
-                        if frames > 1 {
-                            for event in events.iter_mut() {
-                                if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
-                                    if *sample_offset == 0 { *sample_offset = 1; }
+
+                        if let Some(host) = state.host.as_ref() {
+                            let mut events = EVENTS_TMP.with(|cell| cell.borrow_mut());
+                            collect_block_events_into(
+                                &notes,
+                                block_start,
+                                block_end,
+                                samples_per_beat,
+                                &mut events,
+                            );
+                            events.extend(performance_events.iter().copied());
+                        if panic_notes {
+                            for channel in 0u8..16 {
+                                events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+                                events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+                            }
+                            for channel in 0u8..16 {
+                                events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)));
+                            }
+                            if frames > 1 {
+                                for event in events.iter_mut() {
+                                    if let vst3::MidiEvent::NoteOn { sample_offset, .. } = event {
+                                        if *sample_offset == 0 { *sample_offset = 1; }
+                                    }
                                 }
                             }
                         }
-                    }
-                    if loop_wrapped {
-                        events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
-                    }
-                    if let Ok(mut queued) = state.midi_events.lock() {
-                        events.extend(queued.drain(..));
-                    }
-                    let has_note_on = events.iter().any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
-                    let pending_params = state
-                        .pending_param_changes
-                        .lock()
-                        .ok()
-                        .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    for pending in &pending_params {
-                        match pending.target {
-                            PendingParamTarget::Instrument => { host.push_param_change(pending.param_id, pending.value); }
-                            PendingParamTarget::Effect(_) => { remaining_params.push(*pending); }
+                        if loop_wrapped {
+                            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
                         }
-                    }
-                    for lane in &automation {
-                        if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
-                            if lane.target == AutomationTarget::Instrument {
-                                host.push_param_change(lane.param_id, value as f64);
-                            }
+                        if let Ok(mut queued) = state.midi_events.try_lock() {
+                            events.extend(queued.drain(..));
                         }
-                    }
-                    let mut filtered = Vec::with_capacity(events.len());
-                    for event in events {
-                        match event {
-                            vst3::MidiEvent::ControlChange { channel, controller, value } => {
-                                if controller >= 120 {
-                                    filtered.push(event);
-                                    continue;
-                                }
-                                if let Some(param_id) = learned_map.get(&(channel, controller)) {
-                                    let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
-                                    host.push_param_change(*param_id, norm);
-                                } else {
-                                    filtered.push(event);
+                        has_note_on = events.iter().any(|event| matches!(event, vst3::MidiEvent::NoteOn { .. }));
+                        if let Ok(mut pending) = state.pending_param_changes.try_lock() {
+                            for pending in pending.drain(..) {
+                                match pending.target {
+                                    PendingParamTarget::Instrument => {
+                                        host.push_param_change(pending.param_id, pending.value);
+                                    }
+                                    PendingParamTarget::Effect(_) => {
+                                        remaining_params.push(pending);
+                                    }
                                 }
                             }
-                            _ => filtered.push(event),
                         }
-                    }
-                    filtered_events = filtered;
-                    let host_out_channels = host.io_channels().1.max(channels).clamp(1, MAX_PLUGIN_OUTPUT_CHANNELS);
-                    let mut host_output = vec![0.0f32; frames * host_out_channels];
-                    if host.process_f32(&mut host_output, host_out_channels, &filtered_events).is_ok() {
-                        for frame in 0..frames {
-                            let src_base = frame * host_out_channels;
-                            let dst_base = frame * channels;
-                            for ch in 0..channels {
-                                let src_ch = if host_out_channels == 1 { 0 } else { ch.min(host_out_channels - 1) };
-                                temp[dst_base + ch] += host_output[src_base + src_ch];
+                        for lane in &automation {
+                            if let Some(value) = DawApp::automation_value_at(&lane.points, block_beat) {
+                                if lane.target == AutomationTarget::Instrument {
+                                    host.push_param_change(lane.param_id, value as f64);
+                                }
                             }
                         }
-                        if let Ok(mut shared) = track_host_outputs_shared.lock() {
-                            shared[index] = Some((host_output, host_out_channels));
+                        filtered_events.clear();
+                        for event in events.drain(..) {
+                            match event {
+                                vst3::MidiEvent::ControlChange { channel, controller, value } => {
+                                    if controller >= 120 {
+                                        filtered_events.push(event);
+                                        continue;
+                                    }
+                                    if let Some(learned_map) = learned_map.as_ref() {
+                                        if let Some(param_id) =
+                                            learned_map.get(&(channel, controller))
+                                        {
+                                            let norm = (value as f64 / 127.0).clamp(0.0, 1.0);
+                                            host.push_param_change(*param_id, norm);
+                                        } else {
+                                            filtered_events.push(event);
+                                        }
+                                    } else {
+                                        filtered_events.push(event);
+                                    }
+                                }
+                                _ => filtered_events.push(event),
+                            }
                         }
-                        track_processed = true;
-                    }
+                        let host_out_channels = host.io_channels().1.max(channels).clamp(1, MAX_PLUGIN_OUTPUT_CHANNELS);
+                        
+                        let mut host_output_temp = host_out_cell.borrow_mut();
+                        let total_samples = frames * host_out_channels;
+                        if host_output_temp.len() != total_samples {
+                            host_output_temp.resize(total_samples, 0.0);
+                        }
+                        
+                        let process_res =
+                            host.process_f32(&mut host_output_temp, host_out_channels, &filtered_events);
+                        if process_res.is_ok() {
+                            for frame in 0..frames {
+                                let src_base = frame * host_out_channels;
+                                let dst_base = frame * channels;
+                                for ch in 0..channels {
+                                    let src_ch = if host_out_channels == 1 { 0 } else { ch.min(host_out_channels - 1) };
+                                    temp[dst_base + ch] += host_output_temp[src_base + src_ch];
+                                }
+                            }
+                            let out = std::mem::take(&mut *host_output_temp);
+                            host_out_result = Some((out, host_out_channels));
+                            track_processed = true;
+                        } else {
+                            PLUGIN_PROCESS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if panic_notes && !has_note_on {
+                            temp.fill(0.0);
+                        }
+                        }
+                    });
+
                     if panic_notes && !has_note_on {
                         temp.fill(0.0);
                     }
@@ -27668,8 +27802,10 @@ fn mix_track_hosts(
                     let bypass_guard = state.effect_bypass.try_lock();
                     let bypass = bypass_guard.as_ref().map(|g| g.as_slice()).unwrap_or(&[]);
 
-                    let mut cin_peaks = Vec::new();
-                    let mut cout_peaks = Vec::new();
+                    let mut cin_peaks = CIN_PEAKS_TMP.with(|cell| cell.borrow_mut());
+                    cin_peaks.clear();
+                    let mut cout_peaks = COUT_PEAKS_TMP.with(|cell| cell.borrow_mut());
+                    cout_peaks.clear();
 
                     for (fx_index, fx) in state.effect_hosts.iter().enumerate() {
                         let is_bypassed = bypass.get(fx_index).copied().unwrap_or(false);
@@ -27749,13 +27885,14 @@ fn mix_track_hosts(
                     for (out, sample) in track_out_mutex.iter_mut().zip(temp.iter()) {
                         *out = *sample * mix.level;
                     }
-                }
+                    }
+                })
             })
         });
-    });
+        host_out_result
+    }).collect();
 
     let processed_any = processed_any_atomic.load(Ordering::Relaxed);
-    let track_host_outputs = track_host_outputs_shared.lock().map(|g| g.clone()).unwrap_or_default();
 
     for (route_index, route) in routes_snapshot.iter().enumerate() {
         if !route.enabled || route.kind != NodeRouteKind::AudioSidechain {
@@ -28146,6 +28283,32 @@ fn collect_block_events(
     events
 }
 
+fn collect_block_events_into(
+    notes: &[PianoRollNote],
+    block_start: u64,
+    block_end: u64,
+    samples_per_beat: f64,
+    out: &mut Vec<vst3::MidiEvent>,
+) {
+    out.clear();
+    for note in notes {
+        let start_sample = (note.start_beats as f64 * samples_per_beat).round() as u64;
+        let mut end_sample =
+            ((note.start_beats + note.length_beats) as f64 * samples_per_beat).round() as u64;
+        if end_sample <= start_sample {
+            end_sample = start_sample.saturating_add(1);
+        }
+        if start_sample >= block_start && start_sample < block_end {
+            let offset = (start_sample - block_start) as i32;
+            out.push(vst3::MidiEvent::note_on_at(0, note.midi_note, note.velocity, offset));
+        }
+        if end_sample >= block_start && end_sample < block_end {
+            let offset = (end_sample - block_start) as i32;
+            out.push(vst3::MidiEvent::note_off_at(0, note.midi_note, 0, offset));
+        }
+    }
+}
+
 fn db_to_gain(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
@@ -28413,4 +28576,18 @@ fn default_instrument_params() -> Vec<String> {
         "Attack".to_string(),
         "Release".to_string(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_rejects_traversal() {
+        let base = Path::new("/tmp/lingstation_base");
+        assert!(DawApp::safe_join_within_base(base, "../x").is_err());
+
+        let child = DawApp::safe_join_within_base(base, "render").unwrap();
+        assert!(child.starts_with(base));
+    }
 }

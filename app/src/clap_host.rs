@@ -326,8 +326,9 @@ impl ClapHost {
             output_buffers: Vec::new(),
             input_ports: AudioPorts::with_capacity(input_channels.max(1), 1),
             output_ports: AudioPorts::with_capacity(output_channels.max(1), 1),
-            input_events: EventBuffer::with_capacity(64),
-            output_events: EventBuffer::with_capacity(64),
+            // Preallocate a larger event buffer to avoid mid-playback allocations when dense MIDI/automation is present.
+            input_events: EventBuffer::with_capacity(2048),
+            output_events: EventBuffer::with_capacity(2048),
             pending_params: Vec::new(),
             gui_parent: None,
             gui_open: false,

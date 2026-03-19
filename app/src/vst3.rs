@@ -850,6 +850,7 @@ pub struct Vst3Host {
     _deinit_module: Option<unsafe extern "C" fn() -> bool>,
     _host_app: ComWrapper<HostApplication>,
     pub plugin_path: String,
+    max_block_size: usize,
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: Option<ComPtr<IEditController>>,
@@ -1332,12 +1333,21 @@ impl Vst3Host {
                 last_param_change,
                 last_process_param_count: AtomicUsize::new(0),
                 process_context: std::mem::zeroed(),
-                input_buffers: Vec::new(),
-                input_ptrs: Vec::new(),
+                input_buffers: if input_channels > 0 {
+                    vec![vec![0.0; max_block_size]; input_channels]
+                } else {
+                    Vec::new()
+                },
+                input_ptrs: if input_channels > 0 {
+                    vec![std::ptr::null_mut(); input_channels]
+                } else {
+                    Vec::new()
+                },
                 input_channels,
-                output_buffers: Vec::new(),
-                output_ptrs: Vec::new(),
+                output_buffers: vec![vec![0.0; max_block_size]; output_channels],
+                output_ptrs: vec![std::ptr::null_mut(); output_channels],
                 output_channels,
+                max_block_size,
             })
         }
     }

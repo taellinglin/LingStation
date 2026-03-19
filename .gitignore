@@ -1,5 +1,24 @@
-target
-**/target
-Cargo.lock
+# Rust
+target/
+**/target/
+
+# IDEs
+.cursor/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+crash.dmp
+crash.log
+settings.ling.json
+*.tmp
+
+# Synths
 synths/PlantSynth/PlantSynth.vst3/samples/
 synths/PlantSynth/PlantSynth.vst3/sample_kits/

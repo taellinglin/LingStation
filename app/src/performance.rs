@@ -63,10 +63,28 @@ pub(super) fn collect_performance_block_events(
     block_end: u64,
     samples_per_beat: f64,
 ) -> Vec<vst3::MidiEvent> {
-    if !runtime.clip.is_midi || runtime.clip.midi_notes.is_empty() {
-        return Vec::new();
-    }
     let mut events = Vec::new();
+    collect_performance_block_events_into(
+        runtime,
+        block_start,
+        block_end,
+        samples_per_beat,
+        &mut events,
+    );
+    events
+}
+
+pub(super) fn collect_performance_block_events_into(
+    runtime: &PerformanceRuntimeClip,
+    block_start: u64,
+    block_end: u64,
+    samples_per_beat: f64,
+    out: &mut Vec<vst3::MidiEvent>,
+) {
+    out.clear();
+    if !runtime.clip.is_midi || runtime.clip.midi_notes.is_empty() {
+        return;
+    }
     let launch_sample = runtime.launch_samples;
     let block_len = block_end.saturating_sub(block_start);
     let recovering_launch_edge = block_start > launch_sample
@@ -133,7 +151,6 @@ pub(super) fn collect_performance_block_events(
             }
         }
     }
-    events
 }
 
 pub(super) fn performance_audio_clip_for_block(
@@ -147,7 +164,8 @@ pub(super) fn performance_audio_clip_for_block(
         return None;
     }
     let path = runtime.resolved_audio_path.as_ref()?.clone();
-    let data = audio_cache.lock().ok().and_then(|cache| cache.get(&path))?;
+    // Use try_lock in the realtime callback path to avoid blocking the audio thread.
+    let data = audio_cache.try_lock().ok().and_then(|cache| cache.get(&path))?;
     let clip = &runtime.clip;
     let length_samples = if runtime.loop_enabled {
         u64::MAX / 4
