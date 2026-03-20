@@ -123,7 +123,7 @@ pub(super) fn collect_performance_block_events_into(
                 && end_sample > block_start
                 && start_sample >= launch_sample
             {
-                events.push(vst3::MidiEvent::note_on_at(
+                out.push(vst3::MidiEvent::note_on_at(
                     0,
                     note.midi_note,
                     note.velocity,
@@ -131,7 +131,7 @@ pub(super) fn collect_performance_block_events_into(
                 ));
             }
             if start_sample >= block_start && start_sample < block_end {
-                events.push(vst3::MidiEvent::note_on_at(
+                out.push(vst3::MidiEvent::note_on_at(
                     0,
                     note.midi_note,
                     note.velocity,
@@ -139,7 +139,7 @@ pub(super) fn collect_performance_block_events_into(
                 ));
             }
             if end_sample >= block_start && end_sample < block_end {
-                events.push(vst3::MidiEvent::note_off_at(
+                out.push(vst3::MidiEvent::note_off_at(
                     0,
                     note.midi_note,
                     0,
@@ -165,7 +165,10 @@ pub(super) fn performance_audio_clip_for_block(
     }
     let path = runtime.resolved_audio_path.as_ref()?.clone();
     // Use try_lock in the realtime callback path to avoid blocking the audio thread.
-    let data = audio_cache.try_lock().ok().and_then(|cache| cache.get(&path))?;
+    let data = audio_cache
+        .try_lock()
+        .ok()
+        .and_then(|mut cache| cache.get(&path))?;
     let clip = &runtime.clip;
     let length_samples = if runtime.loop_enabled {
         u64::MAX / 4
