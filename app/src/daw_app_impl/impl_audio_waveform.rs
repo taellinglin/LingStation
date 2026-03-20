@@ -655,14 +655,14 @@ impl DawApp {
         self.default_project_dir().map(|dir| dir.join(rel))
     }
 
-    pub(crate) fn touch_cache_key(order: &mut VecDeque<String>, key: &str) {
-        order.retain(|entry| entry != key);
-        order.push_back(key.to_string());
+    pub(crate) fn touch_cache_key(order: &mut VecDeque<Arc<str>>, key: &str) {
+        order.retain(|entry| entry.as_ref() != key);
+        order.push_back(Arc::from(key));
     }
 
     pub(crate) fn trim_cache_entries<T>(
-        cache: &mut HashMap<String, T>,
-        order: &mut VecDeque<String>,
+        cache: &mut HashMap<Arc<str>, T>,
+        order: &mut VecDeque<Arc<str>>,
         max_entries: usize,
     ) {
         if max_entries == 0 {
@@ -681,17 +681,17 @@ impl DawApp {
         let key = path.to_string_lossy().to_string();
         {
             let mut cache = self.waveform_cache.borrow_mut();
-            if !cache.contains_key(&key) {
+            if !cache.contains_key(key.as_str()) {
                 if let Some(data) = Self::build_waveform(&path, 768) {
-                    cache.insert(key.clone(), data);
+                    cache.insert(key.clone().into(), data);
                 }
             }
-            if cache.contains_key(&key) {
+            if cache.contains_key(key.as_str()) {
                 let mut order = self.waveform_cache_order.borrow_mut();
                 Self::touch_cache_key(&mut order, &key);
                 Self::trim_cache_entries(&mut cache, &mut order, WAVEFORM_CACHE_MAX_ENTRIES);
             }
-            cache.get(&key).cloned()
+            cache.get(key.as_str()).cloned()
         }
     }
 
@@ -700,12 +700,12 @@ impl DawApp {
         let key = path.to_string_lossy().to_string();
         {
             let mut cache = self.waveform_color_cache.borrow_mut();
-            if !cache.contains_key(&key) {
+            if !cache.contains_key(key.as_str()) {
                 if let Some(data) = Self::build_waveform_color(&path, 768) {
-                    cache.insert(key.clone(), data);
+                    cache.insert(key.clone().into(), data);
                 }
             }
-            if cache.contains_key(&key) {
+            if cache.contains_key(key.as_str()) {
                 let mut order = self.waveform_color_cache_order.borrow_mut();
                 Self::touch_cache_key(&mut order, &key);
                 Self::trim_cache_entries(
@@ -714,7 +714,7 @@ impl DawApp {
                     WAVEFORM_COLOR_CACHE_MAX_ENTRIES,
                 );
             }
-            cache.get(&key).cloned()
+            cache.get(key.as_str()).cloned()
         }
     }
 
@@ -723,12 +723,12 @@ impl DawApp {
         let key = path.to_string_lossy().to_string();
         {
             let mut cache = self.waveform_len_seconds_cache.borrow_mut();
-            if !cache.contains_key(&key) {
+            if !cache.contains_key(key.as_str()) {
                 if let Some(seconds) = Self::audio_length_seconds(&path) {
-                    cache.insert(key.clone(), seconds);
+                    cache.insert(key.clone().into(), seconds);
                 }
             }
-            if cache.contains_key(&key) {
+            if cache.contains_key(key.as_str()) {
                 let mut order = self.waveform_len_seconds_cache_order.borrow_mut();
                 Self::touch_cache_key(&mut order, &key);
                 Self::trim_cache_entries(
@@ -737,7 +737,7 @@ impl DawApp {
                     WAVEFORM_LEN_CACHE_MAX_ENTRIES,
                 );
             }
-            cache.get(&key).copied()
+            cache.get(key.as_str()).copied()
         }
     }
 
@@ -745,22 +745,25 @@ impl DawApp {
         if points.is_empty() {
             return None;
         }
-        if points.len() == 1 {
+        
+        // Binary search for the segment containing 'beat'
+        let idx = points.partition_point(|p| p.beat < beat);
+        
+        if idx == 0 {
             return Some(points[0].value);
         }
-        let mut prev: Option<&AutomationPoint> = None;
-        for point in points {
-            if point.beat >= beat {
-                if let Some(prev) = prev {
-                    let span = (point.beat - prev.beat).max(0.0001);
-                    let t = ((beat - prev.beat) / span).clamp(0.0, 1.0);
-                    return Some(prev.value + (point.value - prev.value) * t);
-                }
-                return Some(point.value);
-            }
-            prev = Some(point);
+        
+        if idx >= points.len() {
+            return Some(points[points.len() - 1].value);
         }
-        prev.map(|p| p.value)
+        
+        let prev = &points[idx - 1];
+        let next = &points[idx];
+        
+        let span = (next.beat - prev.beat).max(0.0001);
+        let t = ((beat - prev.beat) / span).clamp(0.0, 1.0);
+        
+        Some(prev.value + (next.value - prev.value) * t)
     }
 
     pub(crate) fn build_waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
@@ -952,7 +955,7 @@ impl DawApp {
                 let pitch = self.clip_effective_pitch_semitones(clip);
                 renders.push(AudioClipRender {
                     clip_id: clip.id,
-                    path: path_str,
+                    path: path_str.into(),
                     track_index,
                     start_samples,
                     length_samples,
@@ -972,7 +975,7 @@ impl DawApp {
         &self,
         sample_rate: u32,
         track_filter: Option<usize>,
-    ) -> (Vec<AudioClipRender>, HashMap<String, Arc<AudioClipData>>) {
+    ) -> (Vec<AudioClipRender>, HashMap<Arc<str>, Arc<AudioClipData>>) {
         let mut renders = Vec::new();
         let mut cache = HashMap::new();
         for (track_index, track) in self.tracks.iter().enumerate() {
@@ -996,7 +999,7 @@ impl DawApp {
                 let pitch = self.clip_effective_pitch_semitones(clip);
                 renders.push(AudioClipRender {
                     clip_id: clip.id,
-                    path: path_str.clone(),
+                    path: path_str.clone().into(),
                     track_index: render_track_index,
                     start_samples,
                     length_samples,
@@ -1007,9 +1010,9 @@ impl DawApp {
                     stretch_mode: clip.audio_stretch_mode,
                     formant_scale: clip.audio_formant_scale,
                 });
-                if !cache.contains_key(&path_str) {
+                if !cache.contains_key(path_str.as_str()) {
                     if let Some(data) = Self::load_audio_clip_data(&path) {
-                        cache.insert(path_str.clone(), Arc::new(data));
+                        cache.insert(path_str.clone().into(), Arc::new(data));
                     }
                 }
             }
@@ -1031,11 +1034,11 @@ impl DawApp {
                     Ok(guard) => guard,
                     Err(_) => continue,
                 };
-                if guard.get(&key).is_some() {
+                if guard.get(key.as_str()).is_some() {
                     continue;
                 }
                 if let Some(data) = Self::load_audio_clip_data(&path) {
-                    guard.insert(key, Arc::new(data));
+                    guard.insert(key.into(), Arc::new(data));
                 }
             }
             if let Some(treesynth) = track.treesynth.as_ref() {
@@ -1045,11 +1048,11 @@ impl DawApp {
                         Ok(guard) => guard,
                         Err(_) => continue,
                     };
-                    if guard.get(&key).is_some() {
+                    if guard.get(key.as_str()).is_some() {
                         continue;
                     }
                     if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
-                        guard.insert(key, Arc::new(data));
+                        guard.insert(key.into(), Arc::new(data));
                     }
                 }
             }

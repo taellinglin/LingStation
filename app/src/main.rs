@@ -37,6 +37,7 @@ mod audio;
 mod render;
 mod daw_app;
 mod daw_app_impl;
+mod error;
 
 use daw_app::DawApp;
 use models::{

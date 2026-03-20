@@ -403,7 +403,7 @@ impl DawApp {
                     Self::load_audio_clip_data(&path)
                         .ok_or_else(|| format!("Unsupported audio file: {}", path.display()))?,
                 );
-                local_cache.insert(path_str.clone(), data.clone());
+                local_cache.insert(path_str.clone().into(), data.clone());
                 data
             };
             channels = channels.max(data.channels.max(1));
@@ -411,7 +411,7 @@ impl DawApp {
             renders.push((
                 AudioClipRender {
                     clip_id: clip.id,
-                    path: path_str,
+                    path: path_str.into(),
                     track_index: 0,
                     start_samples: self.beats_to_samples((clip.start_beats - start).max(0.0), sample_rate),
                     length_samples: self.beats_to_samples(clip.length_beats, sample_rate).max(1),
@@ -516,7 +516,7 @@ impl DawApp {
 
         if let Some(data) = Self::load_audio_clip_data(&target) {
             if let Ok(mut cache) = self.audio_clip_cache.lock() {
-                cache.insert(target.to_string_lossy().to_string(), Arc::new(data));
+                cache.insert(target.to_string_lossy().to_string().into(), Arc::new(data));
             }
         }
 

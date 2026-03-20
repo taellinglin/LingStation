@@ -159,18 +159,18 @@ impl DawApp {
 
     pub(crate) fn invalidate_audio_caches_for_path(&self, path: &Path) {
         let key = path.to_string_lossy().to_string();
-        self.waveform_cache.borrow_mut().remove(&key);
-        self.waveform_color_cache.borrow_mut().remove(&key);
-        self.waveform_len_seconds_cache.borrow_mut().remove(&key);
-        self.waveform_cache_order.borrow_mut().retain(|entry| entry != &key);
+        self.waveform_cache.borrow_mut().remove(key.as_str());
+        self.waveform_color_cache.borrow_mut().remove(key.as_str());
+        self.waveform_len_seconds_cache.borrow_mut().remove(key.as_str());
+        self.waveform_cache_order.borrow_mut().retain(|entry| entry.as_ref() != key);
         self.waveform_color_cache_order
             .borrow_mut()
-            .retain(|entry| entry != &key);
+            .retain(|entry| entry.as_ref() != key);
         self.waveform_len_seconds_cache_order
             .borrow_mut()
-            .retain(|entry| entry != &key);
+            .retain(|entry| entry.as_ref() != key);
         if let Ok(mut cache) = self.audio_clip_cache.lock() {
-            cache.remove(&key);
+            cache.remove(key.as_str());
         }
     }
 

@@ -26,6 +26,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::IPluginFactory3_iid;
 use vst3::Steinberg::IBStream_::IStreamSeekMode_;
+use crate::error::{LingError, Result as LingResult};
 
 type GetPluginFactoryFn = unsafe extern "system" fn() -> *mut IPluginFactory;
 
@@ -918,7 +919,7 @@ impl Vst3Host {
         sample_rate: f64,
         max_block_size: usize,
         channels: usize,
-    ) -> Result<Self, String> {
+    ) -> LingResult<Self> {
         Self::load_with_input(plugin_path, sample_rate, max_block_size, channels, 0)
     }
 
@@ -928,10 +929,10 @@ impl Vst3Host {
         max_block_size: usize,
         channels: usize,
         input_channels: usize,
-    ) -> Result<Self, String> {
+    ) -> LingResult<Self> {
         init_windows_com_for_thread();
         let module_path = resolve_vst3_binary(plugin_path)?;
-        eprintln!("VST3 load: {plugin_path}");
+        log::info!("VST3 loading: {plugin_path}");
         if let Ok(meta) = std::fs::metadata(&module_path) {
             let modified = meta
                 .modified()
@@ -939,14 +940,14 @@ impl Vst3Host {
                 .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            eprintln!(
+            log::info!(
                 "VST3 resolved binary: {} (size={} modified_unix={})",
                 module_path.display(),
                 meta.len(),
                 modified
             );
         } else {
-            eprintln!("VST3 resolved binary: {}", module_path.display());
+            log::info!("VST3 resolved binary: {}", module_path.display());
         }
         unsafe {
             let lib = Library::new(&module_path).map_err(|e| e.to_string())?;
@@ -960,16 +961,16 @@ impl Vst3Host {
                 .map(|s: libloading::Symbol<unsafe extern "C" fn() -> bool>| *s);
             if let Some(init) = init_module {
                 let ok = init();
-                eprintln!("VST3 InitModule -> {ok}");
+                log::info!("VST3 InitModule -> {ok}");
             }
             let get_factory: libloading::Symbol<GetPluginFactoryFn> = lib
                 .get(b"GetPluginFactory")
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| LingError::Plugin(e.to_string()))?;
             let factory = get_factory();
             if factory.is_null() {
-                return Err("GetPluginFactory returned null".to_string());
+                return Err(LingError::Plugin("GetPluginFactory returned null".to_string()));
             }
-            eprintln!("VST3 factory ok");
+            log::info!("VST3 factory ok");
 
             let host_app = ComWrapper::new(HostApplication::new("LingStation"));
             let host_ptr = host_app
@@ -977,7 +978,7 @@ impl Vst3Host {
                 .ok_or_else(|| "Host application unavailable".to_string())?;
 
             if Self::skips_host_context(plugin_path) {
-                eprintln!("VST3 setHostContext skipped for {plugin_path}");
+                log::info!("VST3 setHostContext skipped for {plugin_path}");
             } else {
                 let mut factory3_ptr: *mut IPluginFactory3 = std::ptr::null_mut();
                 let qi_result = ((*(*factory).vtbl).base.queryInterface)(
@@ -988,7 +989,7 @@ impl Vst3Host {
                 if qi_result == kResultOk && !factory3_ptr.is_null() {
                     if let Some(factory3) = ComPtr::from_raw(factory3_ptr) {
                         let result = factory3.setHostContext(host_ptr.as_ptr() as *mut FUnknown);
-                        eprintln!("VST3 setHostContext -> {result}");
+                        log::info!("VST3 setHostContext -> {result}");
                     }
                 }
             }
@@ -1006,7 +1007,7 @@ impl Vst3Host {
                 if category != "Audio Module Class" {
                     continue;
                 }
-                eprintln!("VST3 create component class index {index} name={name}");
+                log::info!("VST3 create component class index {index} name={name}");
                 let result = ((*(*factory).vtbl).createInstance)(
                     factory,
                     class_info.cid.as_ptr(),
@@ -1018,8 +1019,8 @@ impl Vst3Host {
                 }
             }
             let component = ComPtr::from_raw(component_ptr)
-                .ok_or_else(|| "No VST3 component created".to_string())?;
-            eprintln!("VST3 component created");
+                .ok_or_else(|| LingError::Plugin("No VST3 component created".to_string()))?;
+            log::info!("VST3 component created");
 
             let plugin_base = component.as_ptr() as *mut IPluginBase;
             let init_result = ((*(*plugin_base).vtbl).initialize)(
@@ -1027,9 +1028,9 @@ impl Vst3Host {
                 host_ptr.as_ptr() as *mut FUnknown,
             );
             if init_result != kResultOk {
-                return Err("VST3 initialize failed".to_string());
+                return Err(LingError::Plugin("VST3 initialize failed".to_string()));
             }
-            eprintln!("VST3 component initialize ok");
+            log::info!("VST3 component initialize ok");
 
             let _ = component.setIoMode(IoModes_::kAdvanced as i32);
 
@@ -1064,7 +1065,7 @@ impl Vst3Host {
             if controller.is_none() {
                 controller = component.cast::<IEditController>();
             }
-            eprintln!("VST3 controller ok: {}", controller.is_some());
+            log::info!("VST3 controller ok: {}", controller.is_some());
 
             let mut host_cp_to_controller: Option<ComWrapper<HostConnectionPoint>> = None;
             let mut host_cp_to_component: Option<ComWrapper<HostConnectionPoint>> = None;
@@ -1084,13 +1085,13 @@ impl Vst3Host {
                     }
                     host_cp_to_controller = Some(host_to_controller);
                     host_cp_to_component = Some(host_to_component);
-                    eprintln!("VST3 connection point bridge ok");
+                    log::info!("VST3 connection point bridge ok");
                 }
 
                 let stream = ComWrapper::new(MemoryStream::new());
                 if let Some(stream_ptr) = stream.to_com_ptr::<IBStream>() {
                     let get_state_result = component.getState(stream_ptr.as_ptr());
-                    eprintln!("VST3 component getState -> {get_state_result}");
+                    log::info!("VST3 component getState -> {get_state_result}");
                     if get_state_result == kResultOk {
                         let bytes = stream.bytes();
                         if !bytes.is_empty() {
@@ -1100,7 +1101,7 @@ impl Vst3Host {
                                 std::ptr::null_mut(),
                             );
                             let _ = controller.setComponentState(stream_ptr.as_ptr());
-                            eprintln!("VST3 controller setComponentState ok");
+                            log::info!("VST3 controller setComponentState ok");
                         }
                     }
                 }
@@ -1140,7 +1141,7 @@ impl Vst3Host {
             let processor = component
                 .cast::<IAudioProcessor>()
                 .ok_or_else(|| "VST3 has no audio processor".to_string())?;
-            eprintln!("VST3 audio processor ok");
+            log::info!("VST3 audio processor ok");
 
             let _ = component.setIoMode(IoModes_::kAdvanced as i32);
 
@@ -1153,10 +1154,10 @@ impl Vst3Host {
                 BusDirections_::kOutput as i32,
             );
             if audio_out_count <= 0 {
-                return Err("VST3 has no audio output buses".to_string());
+                return Err(LingError::Plugin("VST3 has no audio output buses".to_string()));
             }
             if audio_in_count > 1 {
-                return Err("VST3 multiple input buses not supported".to_string());
+                return Err(LingError::Plugin("VST3 multiple input buses not supported".to_string()));
             }
             let mut output_channels = if channels <= 1 { 1 } else { 2 };
             let mut input_channels = if input_channels == 0 {
@@ -1206,11 +1207,11 @@ impl Vst3Host {
                     );
                 }
                 if bus_result != kResultOk {
-                    eprintln!(
+                    log::warn!(
                         "VST3 setBusArrangements failed: {bus_result} (continuing with defaults)"
                     );
                 } else {
-                    eprintln!("VST3 bus arrangement result: {bus_result}");
+                    log::info!("VST3 bus arrangement result: {bus_result}");
                     bus_negotiated = true;
                 }
             }
@@ -1289,7 +1290,7 @@ impl Vst3Host {
             }
 
             let active_result = component.setActive(1);
-            eprintln!("VST3 setActive -> {active_result}");
+            log::info!("VST3 setActive -> {active_result}");
 
             let mut setup = ProcessSetup {
                 processMode: ProcessModes_::kRealtime as i32,
@@ -1299,17 +1300,17 @@ impl Vst3Host {
             };
             let setup_result = processor.setupProcessing(&mut setup as *mut _);
             if setup_result != kResultOk {
-                return Err("VST3 setupProcessing failed".to_string());
+                return Err(LingError::Plugin("VST3 setupProcessing failed".to_string()));
             }
-            eprintln!("VST3 setupProcessing ok");
+            log::info!("VST3 setupProcessing ok");
             if active_result != kResultOk {
                 let _ = component.setActive(1);
             }
             let processing_result = processor.setProcessing(1);
             if processing_result != kResultOk {
-                return Err("VST3 setProcessing failed".to_string());
+                return Err(LingError::Plugin("VST3 setProcessing failed".to_string()));
             }
-            eprintln!("VST3 setProcessing ok");
+            log::info!("VST3 setProcessing ok");
 
             let event_list = ComWrapper::new(EventList::new());
             let event_list_ptr = event_list
@@ -1381,7 +1382,7 @@ impl Vst3Host {
     }
 
     pub fn prepare_for_drop(&mut self) {
-        eprintln!("VST3 unload prepare: {}", self.plugin_path);
+        log::info!("VST3 unload prepare: {}", self.plugin_path);
         unsafe {
             let _ = self.processor.setProcessing(0);
             let _ = self.component.setActive(0);
@@ -1437,7 +1438,7 @@ impl Vst3Host {
         &mut self,
         component_state: Option<&[u8]>,
         controller_state: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         if let Some(bytes) = component_state {
             if !bytes.is_empty() {
                 let stream = ComWrapper::new(MemoryStream::from_bytes(bytes));
@@ -1473,7 +1474,7 @@ impl Vst3Host {
         &mut self,
         component_state: Option<&[u8]>,
         controller_state: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         let _ = unsafe { self.processor.setProcessing(0) };
         let result = self.set_state_bytes(component_state, controller_state);
         let _ = unsafe { self.processor.setProcessing(1) };
@@ -1485,7 +1486,7 @@ impl Vst3Host {
         output: &mut [f32],
         channels: usize,
         midi_events: &[MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         if channels == 0 {
             return Ok(());
         }
@@ -1558,7 +1559,7 @@ impl Vst3Host {
 
         let result = unsafe { self.processor.process(&mut process_data as *mut _) };
         if result != kResultOk {
-            return Err("VST3 process failed".to_string());
+            return Err(LingError::Plugin("VST3 process failed".to_string()));
         }
 
         for frame in 0..frames {
@@ -1590,7 +1591,7 @@ impl Vst3Host {
         output: &mut [f32],
         channels: usize,
         midi_events: &[MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         if channels == 0 {
             return Ok(());
         }
@@ -1599,7 +1600,7 @@ impl Vst3Host {
             return Ok(());
         }
         if input.len() < frames * channels {
-            return Err("VST3 input buffer too small".to_string());
+            return Err(LingError::Plugin("VST3 input buffer too small".to_string()));
         }
         if self.input_channels == 0 {
             output[..frames * channels].copy_from_slice(&input[..frames * channels]);
@@ -1693,7 +1694,7 @@ impl Vst3Host {
 
         let result = unsafe { self.processor.process(&mut process_data as *mut _) };
         if result != kResultOk {
-            return Err("VST3 process failed".to_string());
+            return Err(LingError::Plugin("VST3 process failed".to_string()));
         }
 
         for frame in 0..frames {
@@ -1731,7 +1732,7 @@ impl Vst3Host {
         let controller = self.controller.as_ref()?;
         let view = unsafe { controller.createView(ViewType::kEditor) };
         if view.is_null() {
-            eprintln!("VST3 createView returned null");
+            log::error!("VST3 createView returned null");
             return None;
         }
         let view = unsafe { ComPtr::from_raw(view)? };
@@ -1802,7 +1803,7 @@ impl Vst3Host {
 
 impl Drop for Vst3Host {
     fn drop(&mut self) {
-        eprintln!("VST3 unload drop: {}", self.plugin_path);
+        log::info!("VST3 unload drop: {}", self.plugin_path);
         unsafe {
             let _ = self.processor.setProcessing(0);
             let _ = self.component.setActive(0);
@@ -1816,7 +1817,7 @@ impl Drop for Vst3Host {
 }
 
 impl Vst3Editor {
-    pub fn attach_hwnd(&mut self, hwnd: isize) -> Result<(), String> {
+    pub fn attach_hwnd(&mut self, hwnd: isize) -> LingResult<()> {
         if self.attached {
             return Ok(());
         }
@@ -1827,9 +1828,9 @@ impl Vst3Editor {
         #[cfg(target_os = "macos")]
         let type_str = b"NSView\0";
         let supported = unsafe { self.view.isPlatformTypeSupported(type_str.as_ptr() as *const i8) };
-        eprintln!("VST3 isPlatformTypeSupported(HWND) -> {supported}");
+        log::info!("VST3 isPlatformTypeSupported(HWND) -> {supported}");
         if supported != kResultOk {
-            return Err("VST3 view does not support HWND".to_string());
+            return Err(LingError::Plugin("VST3 view does not support HWND".to_string()));
         }
         if self.frame.is_none() {
             let frame = ComWrapper::new(PlugFrame);
@@ -1846,9 +1847,9 @@ impl Vst3Editor {
             self.view
                 .attached(hwnd as *mut _, type_str.as_ptr() as *const i8)
         };
-        eprintln!("VST3 view attached(HWND) -> {result}");
+        log::info!("VST3 view attached(HWND) -> {result}");
         if result != kResultOk {
-            return Err("VST3 view attach failed".to_string());
+            return Err(LingError::Plugin("VST3 view attach failed".to_string()));
         }
         self.attached = true;
         Ok(())
@@ -1893,7 +1894,7 @@ impl Vst3Editor {
     }
 }
 
-pub fn enumerate_params(plugin_path: &str) -> Result<Vec<ParamInfo>, String> {
+pub fn enumerate_params(plugin_path: &str) -> LingResult<Vec<ParamInfo>> {
     let module_path = resolve_vst3_binary(plugin_path)?;
     unsafe {
         let lib = Library::new(&module_path).map_err(|e| e.to_string())?;
@@ -1902,7 +1903,7 @@ pub fn enumerate_params(plugin_path: &str) -> Result<Vec<ParamInfo>, String> {
             .map_err(|e| e.to_string())?;
         let factory = get_factory();
         if factory.is_null() {
-            return Err("GetPluginFactory returned null".to_string());
+            return Err(LingError::Plugin("GetPluginFactory returned null".to_string()));
         }
 
         let count = ((*(*factory).vtbl).countClasses)(factory);
@@ -2057,7 +2058,7 @@ pub fn enumerate_params(plugin_path: &str) -> Result<Vec<ParamInfo>, String> {
         }
 
         if params.is_empty() {
-            Err("No parameters found".to_string())
+            Err(LingError::Plugin("No parameters found".to_string()))
         } else {
             Ok(params)
         }
@@ -2148,7 +2149,7 @@ fn build_param_cc_map(mapping: &ComPtr<IMidiMapping>) -> HashMap<ParamID, (u8, u
     map
 }
 
-fn resolve_vst3_binary(plugin_path: &str) -> Result<PathBuf, String> {
+fn resolve_vst3_binary(plugin_path: &str) -> LingResult<PathBuf> {
     let path = Path::new(plugin_path);
     if path.is_file() {
         return Ok(path.to_path_buf());
@@ -2198,15 +2199,15 @@ fn resolve_vst3_binary(plugin_path: &str) -> Result<PathBuf, String> {
                         .max_by_key(|candidate| rank(candidate))
                         .cloned();
                     if candidates.len() > 1 {
-                        eprintln!(
-                            "VST3 resolve: multiple binaries under {} ({} candidates), selected {}",
-                            binary_root.display(),
-                            candidates.len(),
-                            selected
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "(none)".to_string())
-                        );
+                    log::debug!(
+                        "VST3 resolve: multiple binaries under {} ({} candidates), selected {}",
+                        binary_root.display(),
+                        candidates.len(),
+                        selected
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(none)".to_string())
+                    );
                     }
                     if let Some(selected) = selected {
                         return Ok(selected);
@@ -2215,7 +2216,7 @@ fn resolve_vst3_binary(plugin_path: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    Err(format!("VST3 binary not found at {plugin_path}"))
+    Err(LingError::Plugin(format!("VST3 binary not found at {plugin_path}")))
 }
 
 fn string128_to_string(value: &vst3::Steinberg::Vst::String128) -> String {

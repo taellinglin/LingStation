@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use super::*;
 
 pub(crate) fn wav_spec_for_depth(
@@ -73,7 +74,7 @@ pub(crate) fn render_plan_to_wav(
     total.store(total_samples_u64.max(1), Ordering::Relaxed);
 
     let spec = wav_spec_for_depth(plan.sample_rate, channels, plan.wav_bit_depth);
-    if let Some(parent) = Path::new(&plan.path).parent() {
+    if let Some(parent) = Path::new(&*plan.path).parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             return Err(format!("Render folder create failed: {err}"));
         }
@@ -426,7 +427,7 @@ pub(crate) fn render_plan_to_wav(
     if let Some(comment) = plan.license_comment.as_deref() {
         let _ = append_wav_comment(&tmp_path, comment);
     }
-    std::fs::rename(&tmp_path, &plan.path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &*plan.path).map_err(|e| e.to_string())?;
     done.store(total_samples_u64, Ordering::Relaxed);
     Ok(())
 }
@@ -1286,7 +1287,7 @@ pub(crate) fn render_plan_to_ogg(
         1.0
     };
     if gain < 1.0 {
-        eprintln!(
+        log::info!(
             "OGG pre-gain applied: peak={:.4} gain={:.4}",
             peak,
             gain
@@ -1311,7 +1312,7 @@ pub(crate) fn render_plan_to_ogg(
     file.write_all(&data).map_err(|e| e.to_string())?;
     file.write_all(&tail).map_err(|e| e.to_string())?;
     drop(file);
-    std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &*path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1585,7 +1586,7 @@ pub(crate) fn render_plan_to_flac(
         },
     )?;
     drop(file);
-    std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &*path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1659,15 +1660,15 @@ pub(crate) fn build_flac_comment_block(comment: &str) -> Vec<u8> {
 }
 
 thread_local! {
-    static MIX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static FX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static HOST_OUTPUT_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
-    static FILTERED_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
-    static PERF_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::new());
-    static REMAINING_PARAMS_TMP: RefCell<Vec<PendingParamChange>> = RefCell::new(Vec::new());
-    static CIN_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static COUT_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static MIX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(2048));
+    static FX_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(2048));
+    static HOST_OUTPUT_TEMP: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(2048));
+    static EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::with_capacity(512));
+    static FILTERED_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::with_capacity(512));
+    static PERF_EVENTS_TMP: RefCell<Vec<vst3::MidiEvent>> = RefCell::new(Vec::with_capacity(512));
+    static REMAINING_PARAMS_TMP: RefCell<Vec<PendingParamChange>> = RefCell::new(Vec::with_capacity(128));
+    static CIN_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(64));
+    static COUT_PEAKS_TMP: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(64));
 }
 
 pub(crate) fn treesynth_adsr_level(state: &TreeSynthState, elapsed: f32) -> f32 {
@@ -1691,6 +1692,21 @@ pub(crate) fn treesynth_spawn_voice(
     state: &TreeSynthState,
     sample_index: usize,
     sample: &TreeSynthSample,
+    data: &AudioClipData,
+    note: u8,
+    velocity: u8,
+    start_sample: u64,
+    sample_rate: f32,
+) {
+    treesynth_spawn_voice_with_gain(runtime, state, sample_index, sample, 1.0, data, note, velocity, start_sample, sample_rate);
+}
+
+pub(crate) fn treesynth_spawn_voice_with_gain(
+    runtime: &mut TreeSynthRuntime,
+    state: &TreeSynthState,
+    sample_index: usize,
+    sample: &TreeSynthSample,
+    gain_mul: f32,
     data: &AudioClipData,
     note: u8,
     velocity: u8,
@@ -1733,8 +1749,8 @@ pub(crate) fn treesynth_spawn_voice(
             }
         }
     }
-    let velocity_gain = (velocity as f32 / 127.0).clamp(0.0, 1.0);
-    let gain = state.gain * sample.gain * velocity_gain;
+    let velocity_gain = (velocity as f32 / 127.0).powf(2.0).clamp(0.0, 1.0);
+    let gain = state.gain * sample.gain * velocity_gain * gain_mul;
     if runtime.voices.len() >= 32 {
         runtime.voices.remove(0);
     }
@@ -1833,16 +1849,16 @@ pub(crate) fn mix_treesynth_block(
                     TreeSynthMode::Random => {
                         let idx = (runtime.next_rand() as usize) % sample_count;
                         if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
-                            let sample = treesynth_state.samples[idx].clone();
-                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            let sample = &treesynth_state.samples[idx];
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
                     }
                     TreeSynthMode::Sequential => {
                         let idx = runtime.sequence_index % sample_count;
                         runtime.sequence_index = runtime.sequence_index.wrapping_add(1);
                         if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
-                            let sample = treesynth_state.samples[idx].clone();
-                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            let sample = &treesynth_state.samples[idx];
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
                     }
                     TreeSynthMode::Reorder => {
@@ -1850,8 +1866,8 @@ pub(crate) fn mix_treesynth_block(
                         let idx = (pos * sample_count as f32).floor() as usize;
                         let idx = idx.min(sample_count.saturating_sub(1));
                         if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
-                            let sample = treesynth_state.samples[idx].clone();
-                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            let sample = &treesynth_state.samples[idx];
+                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, sample, &data, *note, *velocity, start_sample, sample_rate);
                         }
                     }
                     TreeSynthMode::Morph => {
@@ -1864,21 +1880,22 @@ pub(crate) fn mix_treesynth_block(
                         if let Some(data) = sample_data.get(idx0).and_then(|d| d.as_ref()) {
                             let mut sample = treesynth_state.samples[idx0].clone();
                             sample.gain *= weight0;
-                            treesynth_spawn_voice(&mut runtime, &treesynth_state, idx0, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                            // Still cloning here because we modify the gain
+                            // However, we only do this in Morph mode.
+                            // Better way: pass an explicit gain override to spawn_voice
+                            treesynth_spawn_voice_with_gain(&mut runtime, &treesynth_state, idx0, &treesynth_state.samples[idx0], weight0, &data, *note, *velocity, start_sample, sample_rate);
                         }
                         if idx1 != idx0 {
                             if let Some(data) = sample_data.get(idx1).and_then(|d| d.as_ref()) {
-                                let mut sample = treesynth_state.samples[idx1].clone();
-                                sample.gain *= weight1;
-                                treesynth_spawn_voice(&mut runtime, &treesynth_state, idx1, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                                treesynth_spawn_voice_with_gain(&mut runtime, &treesynth_state, idx1, &treesynth_state.samples[idx1], weight1, &data, *note, *velocity, start_sample, sample_rate);
                             }
                         }
                     }
                     TreeSynthMode::Layer => {
                         for idx in 0..sample_count {
                             if let Some(data) = sample_data.get(idx).and_then(|d| d.as_ref()) {
-                                let sample = treesynth_state.samples[idx].clone();
-                                treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, &sample, &data, *note, *velocity, start_sample, sample_rate);
+                                let sample = &treesynth_state.samples[idx];
+                                treesynth_spawn_voice(&mut runtime, &treesynth_state, idx, sample, &data, *note, *velocity, start_sample, sample_rate);
                             }
                         }
                     }
@@ -2057,13 +2074,22 @@ pub(crate) fn mix_track_hosts(
     }
     let block_beat = (block_start as f64 / samples_per_beat) as f32;
 
-    let mix_snapshot = track_mix.try_lock().ok().map(|m| m.clone()).unwrap_or_default();
-    let any_solo = mix_snapshot.iter().any(|m| m.solo);
-    let performance_snapshot = performance_runtime
-        .try_lock()
-        .ok()
-        .map(|runtime| runtime.clone())
-        .unwrap_or_default();
+    if let Ok(m) = track_mix.try_lock() {
+        if runtime_buffers.track_mix_snapshot.len() != m.len() {
+            runtime_buffers.track_mix_snapshot.resize(m.len(), TrackMixState::default());
+        }
+        runtime_buffers.track_mix_snapshot.copy_from_slice(&m);
+    }
+    let any_solo = runtime_buffers.track_mix_snapshot.iter().any(|m| m.solo);
+
+    if let Ok(runtime) = performance_runtime.try_lock() {
+        if runtime_buffers.performance_snapshot.len() != runtime.len() {
+            runtime_buffers.performance_snapshot.resize(runtime.len(), None);
+        }
+        for (i, slot) in runtime.iter().enumerate() {
+            runtime_buffers.performance_snapshot[i] = slot.clone();
+        }
+    }
     let track_count = track_audio.len();
     
     runtime_buffers.resize(track_count, frames);
@@ -2098,26 +2124,42 @@ pub(crate) fn mix_track_hosts(
         }
     }
 
-    let routes_snapshot = node_routes.try_lock().ok().map(|r| r.clone()).unwrap_or_default();
-    if runtime_buffers.sidechain_states.len() < routes_snapshot.len() {
-        runtime_buffers.sidechain_states.resize(routes_snapshot.len(), 1.0);
-    } else if runtime_buffers.sidechain_states.len() > routes_snapshot.len() {
-        runtime_buffers.sidechain_states.truncate(routes_snapshot.len());
+    if let Ok(r) = node_routes.try_lock() {
+        if runtime_buffers.routes_snapshot.len() != r.len() {
+            runtime_buffers.routes_snapshot.resize(r.len(), NodeRouteLink::default());
+        }
+        for (i, route) in r.iter().enumerate() {
+            runtime_buffers.routes_snapshot[i] = route.clone();
+        }
+    }
+    if runtime_buffers.sidechain_states.len() < runtime_buffers.routes_snapshot.len() {
+        runtime_buffers.sidechain_states.resize(runtime_buffers.routes_snapshot.len(), 1.0);
+    } else if runtime_buffers.sidechain_states.len() > runtime_buffers.routes_snapshot.len() {
+        runtime_buffers.sidechain_states.truncate(runtime_buffers.routes_snapshot.len());
     }
 
     let processed_any_atomic = AtomicBool::new(false);
-    runtime_buffers.track_host_output_active.fill(false);
+    
+    let h_audio_slice = &mut runtime_buffers.track_has_audio[..track_count];
+    let p_clips_slice = &mut runtime_buffers.per_track_clips[..track_count];
+    let h_outputs_slice = &mut runtime_buffers.track_host_outputs[..track_count];
+    let h_chans_slice = &mut runtime_buffers.track_host_output_channels[..track_count];
+    let h_active_slice = &mut runtime_buffers.track_host_output_active[..track_count];
+    let mix_snap_slice = &runtime_buffers.track_mix_snapshot[..track_count];
+    let perf_snap_slice = &runtime_buffers.performance_snapshot[..track_count];
 
-    for index in 0..track_count {
-        let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
-            muted: false,
-            solo: false,
-            level: 1.0,
-        });
-        let state = match track_audio.get(index) {
-            Some(state) => state,
-            None => continue,
-        };
+    h_audio_slice.par_iter_mut()
+        .zip(p_clips_slice.par_iter_mut())
+        .zip(h_outputs_slice.par_iter_mut())
+        .zip(h_chans_slice.par_iter_mut())
+        .zip(h_active_slice.par_iter_mut())
+        .zip(mix_snap_slice.par_iter())
+        .zip(perf_snap_slice.par_iter())
+        .zip(track_audio.par_iter())
+        .for_each(|(((((((has_audio_from_clips, clips), _host_out_buf), _host_out_ch), host_out_active), mix), active_performance), state)| {
+            let mix = *mix;
+            let active_performance = active_performance.clone();
+            let has_audio_from_clips = *has_audio_from_clips;
 
         if mix.muted || (any_solo && !mix.solo) {
             state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
@@ -2125,7 +2167,7 @@ pub(crate) fn mix_track_hosts(
             state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-            continue;
+            return;
         }
 
         let notes = if arrangement_playing {
@@ -2136,13 +2178,12 @@ pub(crate) fn mix_track_hosts(
         } else {
             Vec::new()
         };
-        let active_performance = performance_snapshot.get(index).and_then(|slot| slot.clone());
         let has_notes = !notes.is_empty()
             || active_performance
                 .as_ref()
                 .map(|runtime| runtime.clip.is_midi)
                 .unwrap_or(false);
-        let has_audio = runtime_buffers.track_has_audio.get(index).copied().unwrap_or(false)
+        let has_audio = has_audio_from_clips
             || active_performance
                 .as_ref()
                 .map(|runtime| !runtime.clip.is_midi)
@@ -2173,7 +2214,7 @@ pub(crate) fn mix_track_hosts(
                 state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-                continue;
+                return;
             }
         } else {
             state.silent_blocks.store(0, Ordering::Relaxed);
@@ -2369,11 +2410,9 @@ pub(crate) fn mix_track_hosts(
                                             }
                                         }
                                         
-                                        if let Some(rt_buf) = runtime_buffers.track_host_outputs.get_mut(index) {
-                                            rt_buf[..total_samples].copy_from_slice(&host_output_temp[..total_samples]);
-                                            runtime_buffers.track_host_output_channels[index] = host_out_channels;
-                                            runtime_buffers.track_host_output_active[index] = true;
-                                        }
+                                        _host_out_buf[..total_samples].copy_from_slice(&host_output_temp[..total_samples]);
+                                        *_host_out_ch = host_out_channels;
+                                        *host_out_active = true;
                                         track_processed = true;
                                     } else {
                                         PLUGIN_PROCESS_FAILURES.fetch_add(
@@ -2415,11 +2454,9 @@ pub(crate) fn mix_track_hosts(
                     }
                 });
 
-                if let Some(clips) = runtime_buffers.per_track_clips.get(index) {
-                    for (clip, data) in clips {
-                        mix_clip_resample(&mut temp, channels, clip, data, block_start, block_end, sample_rate);
-                        track_processed = true;
-                    }
+                for (clip, data) in clips {
+                    mix_clip_resample(&mut temp, channels, clip, data, block_start, block_end, sample_rate);
+                    track_processed = true;
                 }
 
                 if let Some(runtime) = active_performance {
@@ -2554,15 +2591,15 @@ pub(crate) fn mix_track_hosts(
                     for (out, sample) in track_out_mutex.iter_mut().zip(temp.iter()) {
                         *out = *sample * mix.level;
                     }
-                    }
-                })
+                }
             })
-        });
-    }
+        })
+    });
+});
 
     let processed_any = processed_any_atomic.load(Ordering::Relaxed);
 
-    for (route_index, route) in routes_snapshot.iter().enumerate() {
+    for (route_index, route) in runtime_buffers.routes_snapshot.iter().enumerate() {
         if !route.enabled || route.kind != NodeRouteKind::AudioSidechain {
             continue;
         }
@@ -2573,8 +2610,8 @@ pub(crate) fn mix_track_hosts(
         let amount = route.sidechain_amount.clamp(0.0, 1.0);
         let attack = (route.sidechain_attack_ms.max(0.1) / 1000.0).max(0.0001);
         let release = (route.sidechain_release_ms.max(0.1) / 1000.0).max(0.0001);
-        let attack_coeff = (-1.0 / (attack * sample_rate.max(1.0))).exp();
-        let release_coeff = (-1.0 / (release * sample_rate.max(1.0))).exp();
+        let attack_coeff = (-1.0f32 / (attack * sample_rate.max(1.0))).exp();
+        let release_coeff = (-1.0f32 / (release * sample_rate.max(1.0))).exp();
 
         let source_pair = route.source_output_pair;
 
@@ -2601,13 +2638,13 @@ pub(crate) fn mix_track_hosts(
                 } else {
                     let mut v = 0.0f32;
                     for ch in 0..channels {
-                        v = v.max(source.get(base + ch).copied().unwrap_or(0.0).abs());
+                        v = v.max(source.as_slice().get(base + ch).copied().unwrap_or(0.0).abs());
                     }
                     v
                 };
                 let target_gain = if detector > threshold {
                     let over = ((detector - threshold) / (1.0 - threshold).max(1e-6)).clamp(0.0, 1.0);
-                    (1.0 - amount * over).clamp(0.05, 1.0)
+                    (1.0 - amount * over).clamp(0.05f32, 1.0f32)
                 } else {
                     1.0
                 };
@@ -2617,7 +2654,7 @@ pub(crate) fn mix_track_hosts(
                     gain = release_coeff * (gain - target_gain) + target_gain;
                 }
                 for ch in 0..channels {
-                    if let Some(sample) = target.get_mut(base + ch) {
+                    if let Some(sample) = target.as_mut_slice().get_mut(base + ch) {
                         *sample *= gain;
                     }
                 }
@@ -2641,32 +2678,42 @@ pub(crate) fn mix_track_hosts(
         if activity.len() < track_count {
             activity.resize(track_count, TrackNodeActivity::default());
         }
-        for (index, state) in track_audio.iter().enumerate() {
-            let mut pair_peaks = [0.0f32; 8];
-            if runtime_buffers.track_host_output_active[index] {
-                let host_buf = &runtime_buffers.track_host_outputs[index];
-                let hc = runtime_buffers.track_host_output_channels[index].max(1);
-                for frame in 0..frames {
-                    let base = frame * hc;
-                    for pair in 0..8 {
-                        let ch0 = pair * 2;
-                        if ch0 < hc {
-                            pair_peaks[pair] = pair_peaks[pair].max(host_buf.get(base + ch0).copied().unwrap_or(0.0).abs());
+        let activity_slice = &mut activity[..track_count];
+        let h_active_slice = &runtime_buffers.track_host_output_active[..track_count];
+        let h_outputs_slice = &runtime_buffers.track_host_outputs[..track_count];
+        let h_chans_slice = &runtime_buffers.track_host_output_channels[..track_count];
+
+        activity_slice.par_iter_mut()
+            .zip(track_audio.par_iter())
+            .zip(h_active_slice.par_iter())
+            .zip(h_outputs_slice.par_iter())
+            .zip(h_chans_slice.par_iter())
+            .for_each(|((((slot, state), host_active), host_buf), hc)| {
+                let host_active = *host_active;
+                let hc = (*hc).max(1);
+                let mut pair_peaks = [0.0f32; 8];
+
+                if host_active {
+                    for frame in 0..frames {
+                        let base = frame * hc;
+                        for pair in 0..8 {
+                            let ch0 = pair * 2;
+                            if ch0 < hc {
+                                pair_peaks[pair] = pair_peaks[pair].max(host_buf.get(base + ch0).copied().unwrap_or(0.0).abs());
+                            }
                         }
                     }
-                }
-            } else if let Ok(track_buf) = state.track_buffer.try_lock() {
-                for frame in 0..frames {
-                    let base = frame * channels;
-                    let mut detector = 0.0f32;
-                    for ch in 0..channels {
-                        detector = detector.max(track_buf.get(base + ch).copied().unwrap_or(0.0).abs());
+                } else if let Ok(track_buf) = state.track_buffer.try_lock() {
+                    for frame in 0..frames {
+                        let base = frame * channels;
+                        let mut detector = 0.0f32;
+                        for ch in 0..channels {
+                            detector = detector.max(track_buf.get(base + ch).copied().unwrap_or(0.0).abs());
+                        }
+                        pair_peaks[0] = pair_peaks[0].max(detector);
                     }
-                    pair_peaks[0] = pair_peaks[0].max(detector);
                 }
-            }
 
-            if let Some(slot) = activity.get_mut(index) {
                 for pair in 0..8 {
                     slot.output_pair_peaks[pair] = (slot.output_pair_peaks[pair] * 0.82).max(pair_peaks[pair]);
                 }
@@ -2686,8 +2733,7 @@ pub(crate) fn mix_track_hosts(
                 
                 slot.midi_in = (slot.midi_in * 0.78).max(f32::from_bits(state.midi_in_peak.load(Ordering::Relaxed)));
                 slot.midi_out = (slot.midi_out * 0.78).max(f32::from_bits(state.midi_out_peak.load(Ordering::Relaxed)));
-            }
-        }
+            });
     }
     processed_any
 }

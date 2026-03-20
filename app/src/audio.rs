@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use crate::error::{LingError, Result as LingResult};
 
 pub(crate) struct AudioRuntimeBuffers {
     pub(crate) track_has_audio: Vec<bool>,
@@ -9,6 +10,9 @@ pub(crate) struct AudioRuntimeBuffers {
     pub(crate) track_host_output_channels: Vec<usize>,
     pub(crate) track_host_output_active: Vec<bool>,
     pub(crate) sidechain_states: Vec<f32>,
+    pub(crate) track_mix_snapshot: Vec<TrackMixState>,
+    pub(crate) performance_snapshot: Vec<Option<PerformanceRuntimeClip>>,
+    pub(crate) routes_snapshot: Vec<NodeRouteLink>,
 }
 
 impl AudioRuntimeBuffers {
@@ -24,6 +28,9 @@ impl AudioRuntimeBuffers {
             track_host_output_channels: vec![0; track_count],
             track_host_output_active: vec![false; track_count],
             sidechain_states: Vec::with_capacity(32),
+            track_mix_snapshot: Vec::with_capacity(track_count),
+            performance_snapshot: Vec::with_capacity(track_count),
+            routes_snapshot: Vec::with_capacity(32),
         }
     }
 
@@ -45,6 +52,8 @@ impl AudioRuntimeBuffers {
         }
         self.track_host_output_channels.resize(track_count, 0);
         self.track_host_output_active.resize(track_count, false);
+        self.track_mix_snapshot.resize(track_count, TrackMixState::default());
+        self.performance_snapshot.resize(track_count, None);
         if self.sidechain_states.len() < 32 {
             self.sidechain_states.resize(32, 1.0);
         }
@@ -203,16 +212,16 @@ impl PluginHostHandle {
         &self,
         component_state: Option<&[u8]>,
         controller_state: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             PluginHostHandle::Vst3(host) => host
                 .lock()
-                .map_err(|_| "Plugin lock failed".to_string())?
+                .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                 .set_state_bytes(component_state, controller_state),
             PluginHostHandle::Clap(host) => {
                 let bytes = component_state.unwrap_or(&[]);
                 host.lock()
-                    .map_err(|_| "Plugin lock failed".to_string())?
+                    .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                     .set_state_bytes(bytes)
             }
         }
@@ -253,15 +262,15 @@ impl PluginHostHandle {
         output: &mut [f32],
         channels: usize,
         midi_events: &[vst3::MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             PluginHostHandle::Vst3(host) => host
                 .try_lock()
-                .map_err(|_| "Plugin lock failed".to_string())?
+                .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                 .process_f32(output, channels, midi_events),
             PluginHostHandle::Clap(host) => host
                 .try_lock()
-                .map_err(|_| "Plugin lock failed".to_string())?
+                .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                 .process_f32(output, channels, midi_events),
         }
     }
@@ -272,15 +281,15 @@ impl PluginHostHandle {
         output: &mut [f32],
         channels: usize,
         midi_events: &[vst3::MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             PluginHostHandle::Vst3(host) => host
                 .try_lock()
-                .map_err(|_| "Plugin lock failed".to_string())?
+                .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                 .process_f32_with_input(input, output, channels, midi_events),
             PluginHostHandle::Clap(host) => host
                 .try_lock()
-                .map_err(|_| "Plugin lock failed".to_string())?
+                .map_err(|_| LingError::Plugin("Plugin lock failed".to_string()))?
                 .process_f32_with_input(input, output, channels, midi_events),
         }
     }
@@ -347,7 +356,7 @@ impl TrackAudioState {
                     for sample in &state.samples {
                         if cache.get(&sample.path).is_none() {
                             if let Some(data) = DawApp::load_audio_clip_data(Path::new(&sample.path)).map(Arc::new) {
-                                cache.insert(sample.path.clone(), data);
+                                cache.insert(sample.path.clone().into(), data);
                             }
                         }
                     }
@@ -364,7 +373,7 @@ impl TrackAudioState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct TrackMixState {
     pub(crate) muted:  bool,
     pub(crate) solo:  bool,
@@ -634,12 +643,14 @@ impl Drop for RubberBandClipState {
 }
 
 pub(crate) struct AudioClipCache {
-    pub(crate) entries:  HashMap<String, Arc<AudioClipData>>,
-    pub(crate) order:  VecDeque<String>,
+    pub(crate) entries:  HashMap<Arc<str>, Arc<AudioClipData>>,
+    pub(crate) order:  VecDeque<Arc<str>>,
     pub(crate) bytes:  usize,
     pub(crate) max_bytes:  usize,
     pub(crate) max_entries:  usize,
     pub(crate) stretchers:  HashMap<usize, Arc<Mutex<RubberBandClipState>>>,
+    pub(crate) stretcher_order: VecDeque<usize>,
+    pub(crate) max_stretchers: usize,
 }
 
 impl AudioClipCache {
@@ -651,6 +662,8 @@ impl AudioClipCache {
             max_bytes,
             max_entries,
             stretchers: HashMap::new(),
+            stretcher_order: VecDeque::new(),
+            max_stretchers: 32, // Reasonable default for active clips
         }
     }
 
@@ -663,7 +676,7 @@ impl AudioClipCache {
         }
     }
 
-    pub(crate) fn insert(&mut self, key: String, data: Arc<AudioClipData>) {
+    pub(crate) fn insert(&mut self, key: Arc<str>, data: Arc<AudioClipData>) {
         let new_size = Self::clip_bytes(&data);
         if let Some(existing) = self.entries.get(&key) {
             let old_size = Self::clip_bytes(existing);
@@ -680,7 +693,7 @@ impl AudioClipCache {
             let size = Self::clip_bytes(&data);
             self.bytes = self.bytes.saturating_sub(size);
         }
-        self.order.retain(|entry| entry != key);
+        self.order.retain(|entry| entry.as_ref() != key);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -699,6 +712,9 @@ impl AudioClipCache {
         formant_preserve: bool,
         formant_scale: f64,
     ) -> Arc<Mutex<RubberBandClipState>> {
+        self.stretcher_order.retain(|&id| id != clip_id);
+        self.stretcher_order.push_back(clip_id);
+        
         let entry = self.stretchers.entry(clip_id).or_insert_with(|| {
             Arc::new(Mutex::new(RubberBandClipState::new(
                 sample_rate,
@@ -717,7 +733,19 @@ impl AudioClipCache {
                 formant_scale,
             );
         }
-        entry.clone()
+        let res = entry.clone();
+        self.trim_stretchers();
+        res
+    }
+
+    pub(crate) fn trim_stretchers(&mut self) {
+        while self.stretchers.len() > self.max_stretchers {
+            if let Some(oldest) = self.stretcher_order.pop_front() {
+                self.stretchers.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -729,8 +757,8 @@ impl AudioClipCache {
     }
 
     pub(crate) fn touch(&mut self, key: &str) {
-        self.order.retain(|entry| entry != key);
-        self.order.push_back(key.to_string());
+        self.order.retain(|entry| entry.as_ref() != key);
+        self.order.push_back(Arc::from(key));
     }
 
     pub(crate) fn trim_to_limits(&mut self) {
@@ -796,7 +824,7 @@ impl AudioRuntimeStats {
 #[derive(Clone)]
 pub(crate) struct AudioClipRender {
     pub(crate) clip_id:  usize,
-    pub(crate) path:  String,
+    pub(crate) path:  Arc<str>,
     pub(crate) track_index:  usize,
     pub(crate) start_samples:  u64,
     pub(crate) length_samples:  u64,
@@ -810,7 +838,7 @@ pub(crate) struct AudioClipRender {
 
 #[derive(Clone)]
 pub(crate) struct RenderPlan {
-    pub(crate) path:  String,
+    pub(crate) path:  Arc<str>,
     pub(crate) sample_rate:  u32,
     pub(crate) block_size:  usize,
     pub(crate) tempo_bpm:  f32,
@@ -829,7 +857,7 @@ pub(crate) struct RenderPlan {
     pub(crate) plugin_state_component:  Option<Vec<u8>>,
     pub(crate) plugin_state_controller:  Option<Vec<u8>>,
     pub(crate) audio_clips:  Vec<AudioClipRender>,
-    pub(crate) audio_cache:  HashMap<String, Arc<AudioClipData>>,
+    pub(crate) audio_cache:  HashMap<Arc<str>, Arc<AudioClipData>>,
     pub(crate) master_settings:  MasterCompSettings,
     pub(crate) license_comment:  Option<String>,
 }
@@ -876,7 +904,7 @@ impl RenderHost {
         &mut self,
         component_state: Option<&[u8]>,
         controller_state: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             RenderHost::Vst3(host) => host.set_state_bytes(component_state, controller_state),
             RenderHost::Clap(host) => host.set_state_bytes(component_state.unwrap_or(&[])),
@@ -887,7 +915,7 @@ impl RenderHost {
         &mut self,
         component_state: Option<&[u8]>,
         controller_state: Option<&[u8]>,
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             RenderHost::Vst3(host) => host.apply_state_for_render(component_state, controller_state),
             RenderHost::Clap(host) => host.set_state_bytes(component_state.unwrap_or(&[])),
@@ -899,7 +927,7 @@ impl RenderHost {
         output: &mut [f32],
         channels: usize,
         midi_events: &[vst3::MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             RenderHost::Vst3(host) => host.process_f32(output, channels, midi_events),
             RenderHost::Clap(host) => host.process_f32(output, channels, midi_events),
@@ -912,7 +940,7 @@ impl RenderHost {
         output: &mut [f32],
         channels: usize,
         midi_events: &[vst3::MidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         match self {
             RenderHost::Vst3(host) => host.process_f32_with_input(input, output, channels, midi_events),
             RenderHost::Clap(host) => host.process_f32_with_input(input, output, channels, midi_events),

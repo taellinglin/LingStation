@@ -372,9 +372,11 @@ impl DawApp {
             } else {
                 (major_step / draw_step).round() as i32
             };
-            let mut minor_index = 0;
             let mut x = row_left;
             let step_px = beat_width * draw_step;
+            let skip_steps = ((grid_left - row_left) / step_px).floor() as i32;
+            let mut minor_index = skip_steps.max(0);
+            x += minor_index as f32 * step_px;
             while x <= grid_right {
                 let major = major_div > 0 && minor_index % major_div == 0;
                 let line_x = x.round() + 0.5;
@@ -558,7 +560,13 @@ impl DawApp {
             let mut switch_to_move = false;
 
             let mut pending_lane_edit: Vec<(usize, usize, f32, f32)> = Vec::new();
-            for (row_index, row) in rows.iter().enumerate() {
+            let row_start_index = ((-self.arranger_pan.y) / row_height).floor() as i32;
+            let row_start_index = row_start_index.max(0) as usize;
+            let row_end_index = ((-self.arranger_pan.y + rect.height()) / row_height).ceil() as i32;
+            let row_end_index = (row_end_index + 1).min(rows.len() as i32) as usize;
+
+            for row_index in row_start_index..row_end_index {
+                let row = &rows[row_index];
                 let y = rect.top() + row_top_offset + row_index as f32 * row_height;
                 let label_rect = egui::Rect::from_min_max(
                     egui::pos2(rect.left(), y),

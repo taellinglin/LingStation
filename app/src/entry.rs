@@ -8,6 +8,7 @@ use crate::{DawApp, RenderFormat};
 use eframe::egui;
 
 pub fn main() -> eframe::Result<()> {
+    env_logger::init();
     install_crash_logger();
     install_runtime_working_directory();
     init_windows_com();
@@ -15,7 +16,7 @@ pub fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "render" {
         if let Err(err) = run_cli_render(&args[2..]) {
-            eprintln!("Render failed: {err}");
+            log::error!("Render failed: {err}");
             std::process::exit(1);
         }
         return Ok(());
@@ -68,16 +69,16 @@ fn init_windows_com() {
 
 fn install_runtime_working_directory() {
     if let Ok(cwd) = std::env::current_dir() {
-        eprintln!("runtime cwd(before): {}", cwd.display());
+        log::info!("runtime cwd(before): {}", cwd.display());
     }
     let Some(root) = detect_runtime_root() else {
-        eprintln!("runtime root: (not found)");
+        log::warn!("runtime root: (not found)");
         return;
     };
-    eprintln!("runtime root(selected): {}", root.display());
+    log::info!("runtime root(selected): {}", root.display());
     let _ = std::env::set_current_dir(&root);
     if let Ok(cwd) = std::env::current_dir() {
-        eprintln!("runtime cwd(after): {}", cwd.display());
+        log::info!("runtime cwd(after): {}", cwd.display());
     }
 }
 
@@ -169,6 +170,7 @@ fn install_crash_logger() {
             let _ = writeln!(file, "{info}");
             let bt = Backtrace::force_capture();
             let _ = writeln!(file, "{bt:?}");
+            log::error!("CRASH: {info}\n{bt:?}");
         }
         default_hook(info);
     }));

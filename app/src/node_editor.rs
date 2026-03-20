@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct TrackNodeActivity {
+pub(crate) struct TrackNodeActivity {
     pub(super) output_pair_peaks: [f32; 8],
     pub(super) fx_input_peaks: Vec<f32>,
     pub(super) fx_output_peaks: Vec<f32>,
@@ -21,8 +21,9 @@ impl Default for TrackNodeActivity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) enum NodeRouteKind {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum NodeRouteKind {
+    #[default]
     AudioSidechain,
     MidiToFx,
     AudioSend,
@@ -48,8 +49,8 @@ pub(super) fn default_route_output_pair() -> usize {
     0
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct NodeRouteLink {
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct NodeRouteLink {
     pub(super) from_track: usize,
     #[serde(default = "default_route_output_pair")]
     pub(super) source_output_pair: usize,

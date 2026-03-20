@@ -1902,7 +1902,7 @@ impl DawApp {
             })
             .collect::<Vec<_>>();
         RenderPlan {
-            path: path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string().into(),
             sample_rate,
             block_size,
             tempo_bpm: self.tempo_bpm.max(1.0),
@@ -1981,7 +1981,7 @@ impl DawApp {
             active: true,
         };
         RenderPlan {
-            path: path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string().into(),
             sample_rate,
             block_size,
             tempo_bpm: self.tempo_bpm.max(1.0),
@@ -2367,7 +2367,7 @@ impl DawApp {
                     }
                 },
                 move |err| {
-                    eprintln!("audio input error: {err}");
+                    log::error!("audio input error: {err}");
                 },
                 None,
             ),
@@ -2384,7 +2384,7 @@ impl DawApp {
                     }
                 },
                 move |err| {
-                    eprintln!("audio input error: {err}");
+                    log::error!("audio input error: {err}");
                 },
                 None,
             ),
@@ -2838,7 +2838,7 @@ impl DawApp {
             if cache.get(path_str).is_none() {
                 let path = PathBuf::from(path_str);
                 if let Some(data) = Self::load_audio_clip_data(&path) {
-                    cache.insert(path_str.to_string(), Arc::new(data));
+                    cache.insert(path_str.to_string().into(), Arc::new(data));
                 }
             }
         }
@@ -3262,7 +3262,7 @@ impl DawApp {
                                     }
                                 }
                             } else if has_state && kind == PluginKind::Clap {
-                                eprintln!(
+                                log::warn!(
                                     "CLAP state restore skipped for track {} during runtime init",
                                     index
                                 );
@@ -3514,7 +3514,7 @@ impl DawApp {
                         }
                     },
                     move |err| {
-                        eprintln!("audio error: {err}");
+                        log::error!("audio error: {err}");
                     },
                     None,
                 )
@@ -3609,7 +3609,7 @@ impl DawApp {
                         }
                     },
                     move |err| {
-                        eprintln!("audio error: {err}");
+                        log::error!("audio error: {err}");
                     },
                     None,
                 )
@@ -5165,7 +5165,7 @@ impl DawApp {
     ) -> Result<Vec<vst3::ParamInfo>, String> {
         match Self::plugin_kind_from_path(path) {
             PluginKind::Native => Ok(Vec::new()),
-            PluginKind::Vst3 => vst3::enumerate_params(path),
+            PluginKind::Vst3 => vst3::enumerate_params(path).map_err(|e| e.to_string()),
             PluginKind::Clap => {
                 let clap_id = self
                     .tracks
@@ -5689,14 +5689,14 @@ impl DawApp {
             if key.contains("fmratio") || (key.contains("fm") && key.contains("ratio")) {
                 let id = param_ids.get(index).copied().unwrap_or(0);
                 let value = param_values.get(index).copied().unwrap_or(0.0);
-                eprintln!(
+                log::debug!(
                     "[param-debug] {stage} track={track_index} name={name} id={id} value={value}"
                 );
                 found = true;
             }
         }
         if !found {
-            eprintln!("[param-debug] {stage} track={track_index} fm_ratio not found");
+            log::debug!("[param-debug] {stage} track={track_index} fm_ratio not found");
         }
     }
 
@@ -6149,7 +6149,7 @@ impl DawApp {
                                 continue;
                             }
                             if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
-                                cache.insert(sample.path.clone(), Arc::new(data));
+                                cache.insert(sample.path.clone().into(), Arc::new(data));
                             }
                         }
                     }
@@ -6168,7 +6168,7 @@ impl DawApp {
                                     continue;
                                 }
                                 if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
-                                    cache.insert(sample.path.clone(), Arc::new(data));
+                                    cache.insert(sample.path.clone().into(), Arc::new(data));
                                 }
                             }
                         }

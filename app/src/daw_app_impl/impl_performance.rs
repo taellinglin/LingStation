@@ -307,7 +307,7 @@ impl DawApp {
             None
         } else {
             self.resolve_clip_audio_path(&clip)
-                .map(|path| path.to_string_lossy().to_string())
+                .map(|path| Arc::from(path.to_string_lossy().to_string().as_str()))
         };
         if let Some(path) = resolved_audio_path.as_deref() {
             self.preload_performance_audio_clip(path);
@@ -396,7 +396,7 @@ impl DawApp {
                     None
                 } else {
                     self.resolve_clip_audio_path(&clip)
-                        .map(|path| path.to_string_lossy().to_string())
+                        .map(|path| Arc::from(path.to_string_lossy().to_string().as_str()))
                 },
                 clip,
             };

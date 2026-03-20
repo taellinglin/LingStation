@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::vst3::MidiEvent as VstMidiEvent;
+use crate::error::{LingError, Result as LingResult};
 
 #[derive(Clone, Debug)]
 pub struct ParamInfo {
@@ -100,7 +101,7 @@ impl HostGuiImpl for ClapHostShared {
 
 impl HostLogImpl for ClapHostShared {
     fn log(&self, severity: LogSeverity, message: &str) {
-        eprintln!("[CLAP {severity:?}] {message}");
+        log::info!("[CLAP {:?}] {}", severity, message);
     }
 }
 
@@ -200,8 +201,8 @@ impl ClapHost {
         block_size: u32,
         input_channels: usize,
         output_channels: usize,
-    ) -> Result<Self, String> {
-        eprintln!(
+    ) -> LingResult<Self> {
+        log::info!(
             "CLAP load start: path={} id={} sr={} block={} in_ch={} out_ch={}",
             path,
             plugin_id,
@@ -213,10 +214,10 @@ impl ClapHost {
         let host_info = HostInfo::new("LingStation", "LingStation", "", "0.1")
             .map_err(|e| e.to_string())?;
         let module_path = resolve_clap_binary(path).map_err(|e| {
-            eprintln!("CLAP load fail: resolve binary failed path={} err={}", path, e);
+            log::error!("CLAP load fail: resolve binary failed path={} err={}", path, e);
             e
         })?;
-        eprintln!("clap_plugin->init begin id={} module={}", plugin_id, module_path.display());
+        log::info!("clap_plugin->init begin id={} module={}", plugin_id, module_path.display());
         if let Ok(meta) = std::fs::metadata(&module_path) {
             let modified = meta
                 .modified()
@@ -224,14 +225,14 @@ impl ClapHost {
                 .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            eprintln!(
+            log::info!(
                 "CLAP resolved binary: {} (size={} modified_unix={})",
                 module_path.display(),
                 meta.len(),
                 modified
             );
         } else {
-            eprintln!("CLAP resolved binary: {}", module_path.display());
+            log::info!("CLAP resolved binary: {}", module_path.display());
         }
         let entry = unsafe { PluginEntry::load(&module_path) }.map_err(|e| {
             let err = e.to_string();
@@ -242,7 +243,7 @@ impl ClapHost {
             );
             err
         })?;
-        eprintln!("clap_plugin->init ok id={}", plugin_id);
+        log::info!("clap_plugin->init ok id={}", plugin_id);
         let plugin_id_str = plugin_id.to_string();
         let plugin_id = CString::new(plugin_id).map_err(|e| e.to_string())?;
 
@@ -285,7 +286,7 @@ impl ClapHost {
             min_frames_count: safe_block_size,
             max_frames_count: safe_block_size,
         };
-        eprintln!("clap_plugin->activate begin id={} block={}", plugin_id_str, safe_block_size);
+        log::info!("clap_plugin->activate begin id={} block={}", plugin_id_str, safe_block_size);
         let processor = instance
             .activate(|_, _| (), audio_config)
             .map_err(|e| {
@@ -297,7 +298,7 @@ impl ClapHost {
                 );
                 err
             })?;
-            eprintln!("clap_plugin->activate ok id={}", plugin_id_str);
+            log::info!("clap_plugin->activate ok id={}", plugin_id_str);
 
         let params_ext = instance.access_shared_handler(|h| h.params_ext.get().copied().flatten());
         let state_ext = instance.access_shared_handler(|h| h.state_ext.get().copied().flatten());
@@ -380,7 +381,7 @@ impl ClapHost {
         output: &mut [f32],
         channels: usize,
         midi_events: &[VstMidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         self.process_internal(None, output, channels, midi_events)
     }
 
@@ -390,7 +391,7 @@ impl ClapHost {
         output: &mut [f32],
         channels: usize,
         midi_events: &[VstMidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         self.process_internal(Some(input), output, channels, midi_events)
     }
 
@@ -407,13 +408,13 @@ impl ClapHost {
         }
     }
 
-    pub fn set_state_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub fn set_state_bytes(&mut self, bytes: &[u8]) -> LingResult<()> {
         let Some(state) = self.state_ext else {
             return Ok(());
         };
         let mut handle = self.instance.plugin_handle();
         let mut cursor = std::io::Cursor::new(bytes);
-        state.load(&mut handle, &mut cursor).map_err(|e| e.to_string())
+        Ok(state.load(&mut handle, &mut cursor).map_err(|e| e.to_string())?)
     }
 
     pub fn io_channels(&self) -> (usize, usize) {
@@ -428,12 +429,12 @@ impl ClapHost {
         latency.get(&mut handle)
     }
 
-    pub fn open_gui(&mut self, parent_hwnd: isize) -> Result<(), String> {
+    pub fn open_gui(&mut self, parent_hwnd: isize) -> LingResult<()> {
         let Some(gui) = self.gui_ext else {
-            eprintln!("CLAP GUI open fail: id={} reason=no_gui_ext", self.plugin_id);
-            return Err("CLAP GUI not supported".to_string());
+            log::error!("CLAP GUI open fail: id={} reason=no_gui_ext", self.plugin_id);
+            return Err(LingError::Plugin("CLAP GUI not supported".to_string()));
         };
-        eprintln!(
+        log::info!(
             "CLAP GUI open start: id={} parent_hwnd={}",
             self.plugin_id,
             parent_hwnd
@@ -455,16 +456,16 @@ impl ClapHost {
         };
         let can_embed = parent_hwnd != 0 && gui.is_api_supported(&mut handle, embedded);
         if can_embed {
-            eprintln!("clap_plugin_gui->create begin id={} mode=embedded", self.plugin_id);
+            log::info!("clap_plugin_gui->create begin id={} mode=embedded", self.plugin_id);
             if gui.create(&mut handle, embedded).is_ok() {
                 self.gui_created = true;
                 let window = Window::from_win32_hwnd(parent_hwnd as *mut _);
-                eprintln!("clap_plugin_gui->set_parent begin id={}", self.plugin_id);
+                    log::info!("clap_plugin_gui->set_parent begin id={}", self.plugin_id);
                 if unsafe { gui.set_parent(&mut handle, window) }.is_ok() {
                     if let Some(size) = gui.get_size(&mut handle) {
                         self.gui_size = Some(size);
                     }
-                    eprintln!("clap_plugin_gui->show begin id={}", self.plugin_id);
+                    log::info!("clap_plugin_gui->show begin id={}", self.plugin_id);
                     gui.show(&mut handle).map_err(|e| e.to_string())?;
                     self.gui_parent = Some(window);
                     self.gui_open = true;
@@ -481,17 +482,17 @@ impl ClapHost {
         }
 
         if !gui.is_api_supported(&mut handle, floating) {
-            eprintln!("CLAP GUI open fail: id={} reason=win32_unsupported", self.plugin_id);
-            return Err("CLAP GUI does not support Win32".to_string());
+            log::error!("CLAP GUI open fail: id={} reason=win32_unsupported", self.plugin_id);
+            return Err(LingError::Plugin("CLAP GUI does not support Win32".to_string()));
         }
-        eprintln!("clap_plugin_gui->create begin id={} mode=floating", self.plugin_id);
+        log::info!("clap_plugin_gui->create begin id={} mode=floating", self.plugin_id);
         gui.create(&mut handle, floating).map_err(|e| e.to_string())?;
         self.gui_created = true;
         if let Some(size) = gui.get_size(&mut handle) {
             self.gui_size = Some(size);
         }
-        eprintln!("clap_plugin_gui->set_window begin id={}", self.plugin_id);
-        eprintln!("clap_plugin_gui->show begin id={}", self.plugin_id);
+        log::info!("clap_plugin_gui->set_window begin id={}", self.plugin_id);
+        log::info!("clap_plugin_gui->show begin id={}", self.plugin_id);
         gui.show(&mut handle).map_err(|e| e.to_string())?;
         self.gui_parent = None;
         self.gui_open = true;
@@ -531,7 +532,7 @@ impl ClapHost {
         let mut handle = self.instance.plugin_handle();
         let _ = gui.hide(&mut handle);
         self.gui_open = false;
-        eprintln!("CLAP GUI hide: id={}", self.plugin_id);
+        log::info!("CLAP GUI hide: id={}", self.plugin_id);
     }
 
     pub fn show_gui(&mut self) {
@@ -544,7 +545,7 @@ impl ClapHost {
         let mut handle = self.instance.plugin_handle();
         let _ = gui.show(&mut handle);
         self.gui_open = true;
-        eprintln!("CLAP GUI show: id={}", self.plugin_id);
+        log::info!("CLAP GUI show: id={}", self.plugin_id);
     }
 
     pub fn destroy_gui(&mut self) {
@@ -560,7 +561,7 @@ impl ClapHost {
         self.gui_open = false;
         self.gui_parent = None;
         self.gui_size = None;
-        eprintln!("CLAP GUI destroy: id={}", self.plugin_id);
+        log::info!("CLAP GUI destroy: id={}", self.plugin_id);
     }
 
     pub fn gui_size(&self) -> Option<(i32, i32)> {
@@ -608,7 +609,7 @@ impl ClapHost {
     }
 
     pub fn prepare_for_drop(&mut self) {
-        eprintln!("CLAP unload prepare: id={}", self.plugin_id);
+        log::info!("CLAP unload prepare: id={}", self.plugin_id);
         let _ = self.audio_processor.ensure_processing_stopped();
         let _ = self.instance.try_deactivate();
         self.destroy_gui();
@@ -632,7 +633,7 @@ impl ClapHost {
         output: &mut [f32],
         channels: usize,
         midi_events: &[VstMidiEvent],
-    ) -> Result<(), String> {
+    ) -> LingResult<()> {
         if channels == 0 {
             return Ok(());
         }
@@ -642,7 +643,7 @@ impl ClapHost {
         }
         if let Some(input) = input {
             if input.len() < frames * channels {
-                return Err("CLAP input buffer too small".to_string());
+                return Err(LingError::Plugin("CLAP input buffer too small".to_string()));
             }
         }
 
@@ -825,20 +826,20 @@ impl ClapHost {
 
 impl Drop for ClapHost {
     fn drop(&mut self) {
-        eprintln!("CLAP unload drop: id={}", self.plugin_id);
+        log::info!("CLAP unload drop: id={}", self.plugin_id);
     }
 }
 
-pub fn default_plugin_id(path: &str) -> Result<String, String> {
+pub fn default_plugin_id(path: &str) -> LingResult<String> {
     let plugins = enumerate_plugins(path)?;
-    plugins
+    Ok(plugins
         .into_iter()
         .next()
         .map(|p| p.id)
-        .ok_or_else(|| "No CLAP plugins found".to_string())
+        .ok_or_else(|| "No CLAP plugins found".to_string())?)
 }
 
-pub fn enumerate_plugins(path: &str) -> Result<Vec<ClapPluginDescriptor>, String> {
+pub fn enumerate_plugins(path: &str) -> LingResult<Vec<ClapPluginDescriptor>> {
     let module_path = resolve_clap_binary(path)?;
     unsafe {
         let lib = Library::new(&module_path).map_err(|e| e.to_string())?;
@@ -846,14 +847,14 @@ pub fn enumerate_plugins(path: &str) -> Result<Vec<ClapPluginDescriptor>, String
             lib.get(b"clap_entry\0").map_err(|e| e.to_string())?;
         let entry_ptr = *entry_symbol;
         if entry_ptr.is_null() {
-            return Err("CLAP entry is null".to_string());
+            return Err(LingError::Plugin("CLAP entry is null".to_string()));
         }
         let entry = &*entry_ptr;
         let c_path = CString::new(module_path.to_string_lossy().to_string())
             .map_err(|e| e.to_string())?;
         if let Some(init) = entry.init {
             if !init(c_path.as_ptr()) {
-                return Err("CLAP init failed".to_string());
+                return Err(LingError::Plugin("CLAP init failed".to_string()));
             }
         }
         let get_factory = entry
@@ -861,7 +862,7 @@ pub fn enumerate_plugins(path: &str) -> Result<Vec<ClapPluginDescriptor>, String
             .ok_or_else(|| "CLAP get_factory missing".to_string())?;
         let factory_ptr = get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr());
         if factory_ptr.is_null() {
-            return Err("CLAP factory not found".to_string());
+            return Err(LingError::Plugin("CLAP factory not found".to_string()));
         }
         let factory = factory_ptr as *const clap_plugin_factory;
         let get_count = (*factory)
@@ -897,13 +898,13 @@ pub fn enumerate_plugins(path: &str) -> Result<Vec<ClapPluginDescriptor>, String
     }
 }
 
-fn resolve_clap_binary(path: &str) -> Result<std::path::PathBuf, String> {
+fn resolve_clap_binary(path: &str) -> LingResult<std::path::PathBuf> {
     let input = std::path::Path::new(path);
     if input.is_file() {
         return Ok(input.to_path_buf());
     }
     if !input.is_dir() {
-        return Err("CLAP path not found".to_string());
+        return Err(LingError::Plugin("CLAP path not found".to_string()));
     }
 
     #[cfg(target_os = "macos")]
@@ -953,7 +954,7 @@ fn resolve_clap_binary(path: &str) -> Result<std::path::PathBuf, String> {
         }
     }
     if candidates.is_empty() {
-        return Err("CLAP binary not found".to_string());
+        return Err(LingError::Plugin("CLAP binary not found".to_string()));
     }
     let rank = |candidate: &std::path::PathBuf| {
         let stem_match = preferred_stem

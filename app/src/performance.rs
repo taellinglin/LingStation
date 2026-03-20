@@ -28,13 +28,13 @@ pub(super) struct PerformanceClipSettings {
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(super) struct PerformanceRuntimeClip {
+pub(crate) struct PerformanceRuntimeClip {
     pub(super) track_index: usize,
     pub(super) launch_samples: u64,
     pub(super) clip: Clip,
     pub(super) loop_enabled: bool,
     pub(super) trigger_mode: PerformanceTriggerMode,
-    pub(super) resolved_audio_path: Option<String>,
+    pub(super) resolved_audio_path: Option<Arc<str>>,
 }
 
 pub(super) fn performance_clip_loop_beats(runtime: &PerformanceRuntimeClip) -> f32 {
