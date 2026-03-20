@@ -100,7 +100,7 @@ fn detect_runtime_root() -> Option<PathBuf> {
     }
     candidates
         .into_iter()
-        .find(|dir| dir.join("synths").exists() || dir.join("sample_kits").exists())
+        .find(|dir| dir.join("synths").exists() || dir.join("assets").join("sample_kits").exists())
 }
 
 fn load_app_icon() -> Option<egui::IconData> {
@@ -111,7 +111,7 @@ fn configure_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     let mut fonts = FontDefinitions::default();
     // フォントファイルを読み込む
-    if let Ok(font_bytes) = std::fs::read("./font.ttf") {
+    if let Ok(font_bytes) = std::fs::read("./assets/font.ttf") {
         fonts.font_data.insert(
             "custom_font".to_owned(),
             FontData::from_owned(font_bytes),

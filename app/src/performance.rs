@@ -27,6 +27,7 @@ pub(super) struct PerformanceClipSettings {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(super) struct PerformanceRuntimeClip {
     pub(super) track_index: usize,
     pub(super) launch_samples: u64,
@@ -57,6 +58,7 @@ pub(super) fn performance_length_samples(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn collect_performance_block_events(
     runtime: &PerformanceRuntimeClip,
     block_start: u64,

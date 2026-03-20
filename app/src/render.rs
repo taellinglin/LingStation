@@ -2032,9 +2032,9 @@ pub(crate) fn mix_track_hosts(
     performance_runtime: &Arc<Mutex<Vec<Option<PerformanceRuntimeClip>>>>,
     audio_clips: &Arc<Mutex<Vec<AudioClipRender>>>,
     audio_cache: &Arc<Mutex<AudioClipCache>>,
-    smart_disable_plugins: bool,
+    _smart_disable_plugins: bool,
     smart_suspend_tracks: bool,
-    sidechain_states: &mut Vec<f32>,
+    runtime_buffers: &mut AudioRuntimeBuffers,
 ) -> bool {
     let frames = output.len() / channels;
     if frames == 0 || channels == 0 {
@@ -2065,9 +2065,13 @@ pub(crate) fn mix_track_hosts(
         .map(|runtime| runtime.clone())
         .unwrap_or_default();
     let track_count = track_audio.len();
-    let mut track_has_audio = vec![false; track_count];
-    let mut per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>> =
-        vec![Vec::new(); track_count];
+    
+    runtime_buffers.resize(track_count, frames);
+    runtime_buffers.track_has_audio.fill(false);
+    for clips in runtime_buffers.per_track_clips.iter_mut() {
+        clips.clear();
+    }
+    
     if arrangement_playing {
         if let Ok(clips) = audio_clips.try_lock() {
             for clip in clips.iter() {
@@ -2078,7 +2082,7 @@ pub(crate) fn mix_track_hosts(
                 if block_end <= clip.start_samples || block_start >= clip_end {
                     continue;
                 }
-                track_has_audio[clip.track_index] = true;
+                runtime_buffers.track_has_audio[clip.track_index] = true;
                 let data = {
                     let mut cache = match audio_cache.try_lock() {
                         Ok(cache) => cache,
@@ -2089,22 +2093,22 @@ pub(crate) fn mix_track_hosts(
                 let Some(data) = data else {
                     continue;
                 };
-                per_track_clips[clip.track_index].push((clip.clone(), data));
+                runtime_buffers.per_track_clips[clip.track_index].push((clip.clone(), data));
             }
         }
     }
 
     let routes_snapshot = node_routes.try_lock().ok().map(|r| r.clone()).unwrap_or_default();
-    if sidechain_states.len() < routes_snapshot.len() {
-        sidechain_states.resize(routes_snapshot.len(), 1.0);
-    } else if sidechain_states.len() > routes_snapshot.len() {
-        sidechain_states.truncate(routes_snapshot.len());
+    if runtime_buffers.sidechain_states.len() < routes_snapshot.len() {
+        runtime_buffers.sidechain_states.resize(routes_snapshot.len(), 1.0);
+    } else if runtime_buffers.sidechain_states.len() > routes_snapshot.len() {
+        runtime_buffers.sidechain_states.truncate(routes_snapshot.len());
     }
 
     let processed_any_atomic = AtomicBool::new(false);
+    runtime_buffers.track_host_output_active.fill(false);
 
-    // Realtime-safe: keep track processing deterministic (no Rayon scheduling variance).
-    let track_host_outputs: Vec<Option<(Vec<f32>, usize)>> = (0..track_count).into_iter().map(|index| {
+    for index in 0..track_count {
         let mix = mix_snapshot.get(index).copied().unwrap_or(TrackMixState {
             muted: false,
             solo: false,
@@ -2112,7 +2116,7 @@ pub(crate) fn mix_track_hosts(
         });
         let state = match track_audio.get(index) {
             Some(state) => state,
-            None => return None,
+            None => continue,
         };
 
         if mix.muted || (any_solo && !mix.solo) {
@@ -2121,7 +2125,7 @@ pub(crate) fn mix_track_hosts(
             state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
             state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-            return None;
+            continue;
         }
 
         let notes = if arrangement_playing {
@@ -2138,7 +2142,7 @@ pub(crate) fn mix_track_hosts(
                 .as_ref()
                 .map(|runtime| runtime.clip.is_midi)
                 .unwrap_or(false);
-        let has_audio = track_has_audio.get(index).copied().unwrap_or(false)
+        let has_audio = runtime_buffers.track_has_audio.get(index).copied().unwrap_or(false)
             || active_performance
                 .as_ref()
                 .map(|runtime| !runtime.clip.is_midi)
@@ -2169,14 +2173,13 @@ pub(crate) fn mix_track_hosts(
                 state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_in_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.midi_out_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-                return None;
+                continue;
             }
         } else {
             state.silent_blocks.store(0, Ordering::Relaxed);
         }
 
         let mut track_processed = false;
-        let mut host_out_result = None;
 
         MIX_TEMP.with(|mix_cell| {
             FX_TEMP.with(|fx_cell| {
@@ -2365,9 +2368,12 @@ pub(crate) fn mix_track_hosts(
                                                     host_output_temp[src_base + src_ch];
                                             }
                                         }
-                                        let out =
-                                            std::mem::take(&mut *host_output_temp);
-                                        host_out_result = Some((out, host_out_channels));
+                                        
+                                        if let Some(rt_buf) = runtime_buffers.track_host_outputs.get_mut(index) {
+                                            rt_buf[..total_samples].copy_from_slice(&host_output_temp[..total_samples]);
+                                            runtime_buffers.track_host_output_channels[index] = host_out_channels;
+                                            runtime_buffers.track_host_output_active[index] = true;
+                                        }
                                         track_processed = true;
                                     } else {
                                         PLUGIN_PROCESS_FAILURES.fetch_add(
@@ -2409,7 +2415,7 @@ pub(crate) fn mix_track_hosts(
                     }
                 });
 
-                if let Some(clips) = per_track_clips.get(index) {
+                if let Some(clips) = runtime_buffers.per_track_clips.get(index) {
                     for (clip, data) in clips {
                         mix_clip_resample(&mut temp, channels, clip, data, block_start, block_end, sample_rate);
                         track_processed = true;
@@ -2542,7 +2548,9 @@ pub(crate) fn mix_track_hosts(
                 }
 
                 if let Ok(mut track_out_mutex) = state.track_buffer.try_lock() {
-                    track_out_mutex.resize(temp.len(), 0.0);
+                    if track_out_mutex.len() != temp.len() {
+                        track_out_mutex.resize(temp.len(), 0.0);
+                    }
                     for (out, sample) in track_out_mutex.iter_mut().zip(temp.iter()) {
                         *out = *sample * mix.level;
                     }
@@ -2550,8 +2558,7 @@ pub(crate) fn mix_track_hosts(
                 })
             })
         });
-        host_out_result
-    }).collect();
+    }
 
     let processed_any = processed_any_atomic.load(Ordering::Relaxed);
 
@@ -2576,16 +2583,16 @@ pub(crate) fn mix_track_hosts(
         
         // Locked access to buffers for sidechain processing
         let from_buf_guard = from_state.track_buffer.try_lock();
-        let mut to_buf_guard = to_state.track_buffer.try_lock();
+        let to_buf_guard = to_state.track_buffer.try_lock();
         
         if let (Ok(source), Ok(mut target)) = (from_buf_guard, to_buf_guard) {
-            let mut gain = sidechain_states.get(route_index).copied().unwrap_or(1.0);
+            let mut gain = runtime_buffers.sidechain_states.get(route_index).copied().unwrap_or(1.0);
             for frame in 0..frames {
                 let base = frame * channels;
-                let detector = if let Some((host_buf, host_channels)) =
-                    track_host_outputs.get(route.from_track).and_then(|entry| entry.as_ref())
-                {
-                    let src_base = frame * *host_channels;
+                let detector = if runtime_buffers.track_host_output_active[route.from_track] {
+                    let host_buf = &runtime_buffers.track_host_outputs[route.from_track];
+                    let host_channels = runtime_buffers.track_host_output_channels[route.from_track];
+                    let src_base = frame * host_channels;
                     let ch0 = (source_pair * 2).min(host_channels.saturating_sub(1));
                     let ch1 = (ch0 + 1).min(host_channels.saturating_sub(1));
                     host_buf.get(src_base + ch0).copied().unwrap_or(0.0).abs().max(
@@ -2615,7 +2622,7 @@ pub(crate) fn mix_track_hosts(
                     }
                 }
             }
-            if let Some(state) = sidechain_states.get_mut(route_index) {
+            if let Some(state) = runtime_buffers.sidechain_states.get_mut(route_index) {
                 *state = gain;
             }
         }
@@ -2630,14 +2637,15 @@ pub(crate) fn mix_track_hosts(
         }
     }
 
-    if let Ok(mut activity) = node_activity.lock() {
+    if let Ok(mut activity) = node_activity.try_lock() {
         if activity.len() < track_count {
             activity.resize(track_count, TrackNodeActivity::default());
         }
         for (index, state) in track_audio.iter().enumerate() {
             let mut pair_peaks = [0.0f32; 8];
-            if let Some((host_buf, host_channels)) = track_host_outputs.get(index).and_then(|v| v.as_ref()) {
-                let hc = (*host_channels).max(1);
+            if runtime_buffers.track_host_output_active[index] {
+                let host_buf = &runtime_buffers.track_host_outputs[index];
+                let hc = runtime_buffers.track_host_output_channels[index].max(1);
                 for frame in 0..frames {
                     let base = frame * hc;
                     for pair in 0..8 {
@@ -2681,7 +2689,6 @@ pub(crate) fn mix_track_hosts(
             }
         }
     }
-
     processed_any
 }
 

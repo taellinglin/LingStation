@@ -1,0 +1,18 @@
+use super::*;
+
+include!("eframe_app.rs");
+include!("drop.rs");
+include!("impl_sync_undo.rs");
+include!("impl_clip_editing.rs");
+include!("impl_performance.rs");
+include!("impl_theme_params.rs");
+include!("impl_audio_waveform.rs");
+include!("impl_chrome.rs");
+include!("impl_sidebar_fs.rs");
+include!("impl_panels.rs");
+include!("impl_center_arranger.rs");
+include!("impl_center_views.rs");
+include!("impl_center_performance.rs");
+include!("impl_params_roll.rs");
+include!("impl_modals.rs");
+include!("impl_project_tail.rs");

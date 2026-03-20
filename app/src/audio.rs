@@ -1,4 +1,55 @@
+#![allow(dead_code)]
+
 use super::*;
+
+pub(crate) struct AudioRuntimeBuffers {
+    pub(crate) track_has_audio: Vec<bool>,
+    pub(crate) per_track_clips: Vec<Vec<(AudioClipRender, Arc<AudioClipData>)>>,
+    pub(crate) track_host_outputs: Vec<Vec<f32>>,
+    pub(crate) track_host_output_channels: Vec<usize>,
+    pub(crate) track_host_output_active: Vec<bool>,
+    pub(crate) sidechain_states: Vec<f32>,
+}
+
+impl AudioRuntimeBuffers {
+    pub(crate) fn new(track_count: usize, block_size: usize) -> Self {
+        let mut track_host_outputs = Vec::with_capacity(track_count);
+        for _ in 0..track_count {
+            track_host_outputs.push(vec![0.0f32; block_size * MAX_PLUGIN_OUTPUT_CHANNELS]);
+        }
+        Self {
+            track_has_audio: vec![false; track_count],
+            per_track_clips: vec![Vec::with_capacity(16); track_count],
+            track_host_outputs,
+            track_host_output_channels: vec![0; track_count],
+            track_host_output_active: vec![false; track_count],
+            sidechain_states: Vec::with_capacity(32),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, track_count: usize, block_size: usize) {
+        self.track_has_audio.resize(track_count, false);
+        while self.per_track_clips.len() < track_count {
+            self.per_track_clips.push(Vec::with_capacity(16));
+        }
+        self.per_track_clips.truncate(track_count);
+        
+        while self.track_host_outputs.len() < track_count {
+            self.track_host_outputs.push(vec![0.0f32; block_size * MAX_PLUGIN_OUTPUT_CHANNELS]);
+        }
+        self.track_host_outputs.truncate(track_count);
+        for buf in self.track_host_outputs.iter_mut() {
+            if buf.len() < block_size * MAX_PLUGIN_OUTPUT_CHANNELS {
+                buf.resize(block_size * MAX_PLUGIN_OUTPUT_CHANNELS, 0.0);
+            }
+        }
+        self.track_host_output_channels.resize(track_count, 0);
+        self.track_host_output_active.resize(track_count, false);
+        if self.sidechain_states.len() < 32 {
+            self.sidechain_states.resize(32, 1.0);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct TreeSynthVoice {

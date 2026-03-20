@@ -9,7 +9,7 @@ fn main() {
     #[cfg(windows)]
     {
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-        let icon_png = manifest_dir.join("..").join("icon.png");
+        let icon_png = manifest_dir.join("..").join("assets").join("icon.png");
         if icon_png.exists() {
             let icon_ico = out_dir.join("icon.ico");
             if let Ok(img) = image::open(&icon_png) {

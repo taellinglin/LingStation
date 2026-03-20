@@ -413,7 +413,7 @@ impl HostMessage {
     fn new() -> Self {
         Self {
             message_id: Mutex::new(String::new()),
-            message_id_c: Mutex::new(std::ffi::CString::new("").unwrap()),
+            message_id_c: Mutex::new(std::ffi::CString::new("").expect("Empty CString creation failed")),
             attributes: ComWrapper::new(AttributeList::new()),
         }
     }
@@ -845,6 +845,7 @@ impl Class for HostApplication {
     type Interfaces = (IHostApplication, IPlugInterfaceSupport);
 }
 
+#[allow(dead_code)]
 pub struct Vst3Host {
     _lib: Library,
     _deinit_module: Option<unsafe extern "C" fn() -> bool>,
@@ -899,6 +900,7 @@ impl Class for PlugFrame {
 unsafe impl Send for Vst3Host {}
 unsafe impl Sync for Vst3Host {}
 
+#[allow(dead_code)]
 impl Vst3Host {
     fn skips_host_context(_plugin_path: &str) -> bool {
         false

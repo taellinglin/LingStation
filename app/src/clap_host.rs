@@ -161,6 +161,7 @@ impl HostHandlers for ClapHostHandlers {
     }
 }
 
+#[allow(dead_code)]
 pub struct ClapHost {
     entry: PluginEntry,
     instance: PluginInstance<ClapHostHandlers>,
@@ -190,6 +191,7 @@ pub struct ClapHost {
 unsafe impl Send for ClapHost {}
 unsafe impl Sync for ClapHost {}
 
+#[allow(dead_code)]
 impl ClapHost {
     pub fn load(
         path: &str,

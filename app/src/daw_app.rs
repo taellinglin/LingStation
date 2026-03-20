@@ -128,7 +128,7 @@ pub(super) struct DawApp {
     pub(super) arranger_select_add: bool,
     pub(super) arranger_draw: Option<ArrangerDrawState>,
     pub(super) arranger_slice_drag: Option<ArrangerSliceDragState>,
-    pub(super) clip_clipboard: Option<Clip>,
+    pub(super) _clip_clipboard: Option<Clip>,
     pub(super) waveform_cache: RefCell<HashMap<String, Vec<f32>>>,
     pub(super) waveform_color_cache: RefCell<HashMap<String, Vec<[f32; 3]>>>,
     pub(super) waveform_len_seconds_cache: RefCell<HashMap<String, f32>>,

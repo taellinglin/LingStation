@@ -14,12 +14,11 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::backtrace::Backtrace;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::TAU;
 use std::fs;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -54,7 +53,7 @@ use node_editor::{
     default_sidechain_threshold_db, NodeRouteKind, NodeRouteLink, TrackNodeActivity,
 };
 use performance::{
-    collect_performance_block_events, collect_performance_block_events_into,
+    collect_performance_block_events_into,
     performance_audio_clip_for_block,
     performance_length_samples, PerformanceClipSettings, PerformanceRuntimeClip,
     PerformanceTriggerMode,
@@ -77,6 +76,8 @@ static PLUGIN_PROCESS_FAILURES: AtomicU64 = AtomicU64::new(0);
 fn main() -> eframe::Result<()> {
     entry::main()
 }
+
+#[allow(dead_code)]
 struct ClipDragState {
     clip_id: usize,
     source_track: usize,
@@ -95,6 +96,7 @@ struct ClipDragState {
     group: Option<Vec<ClipDragGroupItem>>,
 }
 
+#[allow(dead_code)]
 struct ClipDragGroupItem {
     clip_id: usize,
     source_track: usize,
@@ -182,6 +184,7 @@ impl AutoPerformanceBuildSummary {
     }
 }
 
+#[allow(dead_code)]
 struct ArrangerDrawState {
     track_index: usize,
     start_beats: f32,
@@ -796,7 +799,7 @@ impl Default for DawApp {
             arranger_select_add: false,
             arranger_draw: None,
             arranger_slice_drag: None,
-            clip_clipboard: None,
+            _clip_clipboard: None,
             waveform_cache: RefCell::new(HashMap::new()),
             waveform_color_cache: RefCell::new(HashMap::new()),
             waveform_len_seconds_cache: RefCell::new(HashMap::new()),
@@ -1201,6 +1204,7 @@ fn clear_plugin_close_flag(hwnd: isize) {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn get_plugin_close_flag(_hwnd: isize) -> Option<&'static AtomicBool> {
     None
 }
