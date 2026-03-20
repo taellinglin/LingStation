@@ -15,4 +15,7 @@ include!("impl_center_views.rs");
 include!("impl_center_performance.rs");
 include!("impl_params_roll.rs");
 include!("impl_modals.rs");
+include!("impl_midi_io.rs");
+include!("impl_render_plan.rs");
+include!("impl_treesynth_presets.rs");
 include!("impl_project_tail.rs");
