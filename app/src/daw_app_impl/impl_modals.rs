@@ -526,9 +526,12 @@ impl DawApp {
                             }
                         });
                         egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                            for (index, track_data) in state.tracks.iter().enumerate() {
-                                let enabled = state.enabled.get_mut(index).unwrap();
-                                let apply_program = state.apply_program.get_mut(index).unwrap();
+                            for ((track_data, enabled), apply_program) in state
+                                .tracks
+                                .iter()
+                                .zip(state.enabled.iter_mut())
+                                .zip(state.apply_program.iter_mut())
+                            {
                                 let track_name = match track_data.program {
                                     Some(program) if track_data.has_drums => gm_drum_kit_name(program)
                                         .unwrap_or("Drum Kit")

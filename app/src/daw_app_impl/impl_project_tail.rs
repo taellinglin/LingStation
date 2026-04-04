@@ -1050,7 +1050,13 @@ impl DawApp {
                 midi_source_beats: None,
                 link_id: None,
                 name: safe_stem.clone(),
-                audio_path: Some(format!("audio/{}", target.file_name().unwrap().to_string_lossy())),
+                audio_path: Some(format!(
+                    "audio/{}",
+                    target
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| safe_stem.clone())
+                )),
                 audio_source_beats: source_beats,
                 audio_offset_beats: 0.0,
                 audio_gain: 1.0,
@@ -1396,6 +1402,7 @@ impl DawApp {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn active_track_snapshot(
         &self,
     ) -> Option<(
@@ -2382,7 +2389,7 @@ impl DawApp {
                             channels,
                         )
                         .ok()
-                        .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                        .map(|host| PluginHostHandle::Vst3(Arc::new(ParkingMutex::new(host)))),
                         PluginKind::Clap => {
                             let clap_id = self
                                 .tracks
@@ -2402,7 +2409,7 @@ impl DawApp {
                                     channels.min(MAX_CLAP_OUTPUT_CHANNELS),
                                 )
                                 .ok()
-                                .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                                .map(|host| PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
                             })
                         }
                     };
@@ -2496,7 +2503,7 @@ impl DawApp {
                             channels,
                         )
                         .ok()
-                        .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                        .map(|host| PluginHostHandle::Vst3(Arc::new(ParkingMutex::new(host)))),
                         PluginKind::Clap => {
                             let clap_id = self
                                 .tracks
@@ -2519,7 +2526,7 @@ impl DawApp {
                                     channels.min(MAX_CLAP_OUTPUT_CHANNELS),
                                 )
                                 .ok()
-                                .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                                .map(|host| PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
                             })
                         }
                     };

@@ -76,7 +76,7 @@ impl DawApp {
         let Some(PluginHostHandle::Clap(host)) = self.selected_track_host() else {
             return;
         };
-        let params = if let Ok(mut host) = host.try_lock() {
+        let params = if let Some(mut host) = host.try_lock() {
             let flags = host.take_param_rescan();
             if flags == 0 {
                 return;
@@ -109,8 +109,8 @@ impl DawApp {
                 continue;
             };
             let mut host = match host.try_lock() {
-                Ok(host) => host,
-                Err(_) => continue,
+                Some(host) => host,
+                None => continue,
             };
             let Some((param_id, value)) = host.take_last_param_change() else {
                 continue;

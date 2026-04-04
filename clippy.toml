@@ -1,0 +1,2 @@
+# Relax defaults for DSP/UI code paths with many parameters.
+too-many-arguments-threshold = 20

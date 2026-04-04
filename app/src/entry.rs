@@ -123,16 +123,12 @@ fn configure_fonts(ctx: &egui::Context) {
             .font_data
             .insert("custom_font".to_owned(), FontData::from_owned(font_bytes));
         // プロポーショナル/モノスペース両方に割り当て
-        fonts
-            .families
-            .get_mut(&FontFamily::Proportional)
-            .unwrap()
-            .insert(0, "custom_font".to_owned());
-        fonts
-            .families
-            .get_mut(&FontFamily::Monospace)
-            .unwrap()
-            .insert(0, "custom_font".to_owned());
+        if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
+            family.insert(0, "custom_font".to_owned());
+        }
+        if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
+            family.insert(0, "custom_font".to_owned());
+        }
         ctx.set_fonts(fonts);
     }
 }

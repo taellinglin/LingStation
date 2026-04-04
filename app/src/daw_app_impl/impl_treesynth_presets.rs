@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 impl DawApp {
     pub(crate) fn plugin_display_name(path: &str) -> String {
         if Self::is_treesynth_path(path) {
@@ -200,13 +199,13 @@ impl DawApp {
         if !Self::is_treesynth_path(plugin_path) {
             return Err("TreeSynth preset requires native TreeSynth".to_string());
         }
-        if track.treesynth.is_none() {
-            return Err("[TreeSynth] サンプル未ロード: プリセット保存不可".to_string());
-        }
+        let mut state = track
+            .treesynth
+            .clone()
+            .ok_or_else(|| "[TreeSynth] サンプル未ロード: プリセット保存不可".to_string())?;
         if let Some(parent) = preset_path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let mut state = track.treesynth.clone().unwrap();
         let samples_dir_name = Self::treesynth_samples_dir_name(preset_name);
         let samples_dir = preset_path
             .parent()
@@ -223,7 +222,7 @@ impl DawApp {
             let target_name = Self::treesynth_unique_filename(&mut used_names, file_name);
             let target_path = samples_dir.join(&target_name);
             if !target_path.exists() {
-                let _ = fs::copy(source, &target_path);
+                fs::copy(source, &target_path).map_err(|e| e.to_string())?;
             }
             sample.path = format!("{}/{}", samples_dir_name, target_name);
             sample.name = target_name.clone();
@@ -735,10 +734,6 @@ impl DawApp {
         if let Some(track) = self.tracks.get_mut(index) {
             track.param_values = param_values;
         }
-    }
-
-    pub(crate) fn scan_dir(&self, dir: &Path, out: &mut Vec<String>) {
-        self.scan_dir_for_exts(dir, out, &["vst3"]);
     }
 
     pub(crate) fn scan_dir_for_exts(&self, dir: &Path, out: &mut Vec<String>, exts: &[&str]) {

@@ -639,7 +639,7 @@ impl DawApp {
                     channels.max(1),
                 )
                 .ok()?;
-                Some(PluginHostHandle::Vst3(Arc::new(Mutex::new(host))))
+                Some(PluginHostHandle::Vst3(Arc::new(ParkingMutex::new(host))))
             }
             PluginKind::Clap => {
                 let clap_id = self
@@ -659,7 +659,7 @@ impl DawApp {
                     channels.clamp(1, MAX_CLAP_OUTPUT_CHANNELS),
                 )
                 .ok()?;
-                Some(PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                Some(PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
             }
         };
         let host = host?;
@@ -732,7 +732,7 @@ impl DawApp {
                         channels,
                     )
                     .ok()
-                    .map(|host| PluginHostHandle::Vst3(Arc::new(Mutex::new(host)))),
+                    .map(|host| PluginHostHandle::Vst3(Arc::new(ParkingMutex::new(host)))),
                     PluginKind::Clap => {
                         let clap_id = clap_ids
                             .get(slot)
@@ -754,7 +754,7 @@ impl DawApp {
                                 channels.min(MAX_CLAP_OUTPUT_CHANNELS),
                             )
                             .ok()
-                            .map(|host| PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
+                            .map(|host| PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
                         })
                     }
                 };
@@ -790,7 +790,8 @@ impl DawApp {
         } else {
             return;
         };
-        let mut fx_updates: Vec<(usize, Vec<String>, Vec<u32>, Vec<f32>)> = Vec::new();
+        type FxParamSnapshot = (usize, Vec<String>, Vec<u32>, Vec<f32>);
+        let mut fx_updates: Vec<FxParamSnapshot> = Vec::new();
         for (fx_index, _) in effect_paths.iter().enumerate() {
             if !needs_params.get(fx_index).copied().unwrap_or(true) {
                 continue;
@@ -867,8 +868,8 @@ impl DawApp {
                         .get(fx_index)
                         .cloned()
                         .unwrap_or_default();
-                    for param_index in 0..params.len() {
-                        let label = params[param_index].clone();
+                    for (param_index, label) in params.iter().enumerate() {
+                        let label = label.clone();
                         let value = track
                             .effect_param_values
                             .get_mut(fx_index)

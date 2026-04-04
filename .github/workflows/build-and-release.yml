@@ -5,17 +5,23 @@ on:
     branches:
       - master
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build and release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,9 +43,23 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        if: runner.os == 'Linux'
+        run: cargo test --workspace
 
       - name: Resolve version
         shell: bash
@@ -130,9 +150,11 @@ jobs:
         with:
           name: dist-${{ runner.os }}
           path: dist/*
+          retention-days: 30
 
   release:
     name: Create release
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -169,6 +191,18 @@ jobs:
           )
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
+      - name: Validate tag matches workspace version
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          expected="v${VERSION}"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' must match workspace version '${expected}' (from Cargo.toml [workspace.package])."
+            exit 1
+          fi
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -194,10 +228,6 @@ jobs:
           echo "Found ${#files[@]} archive(s) for upload."
           cat "$GITHUB_WORKSPACE/release-asset-paths.txt"
 
-      # Use `gh release create` (not a third-party action) so each run always gets a new
-      # tag + release at $GITHUB_SHA. Updating one release in place leaves published_at and
-      # the auto "Source code" snapshots tied to the old date while only uploaded binaries look new.
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,9 +241,11 @@ jobs:
               exit 1
             fi
           done
-          TAG="v${VERSION}-r${GITHUB_RUN_ID}"
+          TAG="${GITHUB_REF_NAME}"
           NOTES=$(mktemp)
           cat > "$NOTES" << EOF
+          **Tag:** \`${TAG}\`
+
           **Version:** ${VERSION} (from workspace \`Cargo.toml\`)
 
           **Commit:** [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
@@ -224,8 +256,7 @@ jobs:
           EOF
           gh release create "$TAG" \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --title "LingStation ${VERSION} (run ${GITHUB_RUN_ID})" \
+            --title "LingStation ${VERSION}" \
             --notes-file "$NOTES" \
             --latest \
             "${assets[@]}"

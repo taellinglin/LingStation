@@ -617,7 +617,7 @@ impl DawApp {
                 ui.label(&self.status);
                 if self.show_hitboxes {
                     if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
-                        if let Ok(host) = host.try_lock() {
+                        if let Some(host) = host.try_lock() {
                             let last = host.debug_last_param_change();
                             let count = host.debug_last_process_param_count();
                             let (param_count, id_count) = self
@@ -732,7 +732,7 @@ impl DawApp {
                     }
                     if let PluginUiEditor::Clap(_) = &ui_host.editor {
                         if let PluginHostHandle::Clap(host) = &ui_host.host {
-                            if let Ok(mut host) = host.try_lock() {
+                            if let Some(mut host) = host.try_lock() {
                                 host.hide_gui();
                                 eprintln!("UI close_requested: CLAP hide_gui");
                             }
@@ -768,7 +768,7 @@ impl DawApp {
                 }
                 if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
-                        if let Ok(mut host) = host.try_lock() {
+                        if let Some(mut host) = host.try_lock() {
                             host.hide_gui();
                             eprintln!("UI should_close_hidden: CLAP hide_gui");
                         }
@@ -866,7 +866,7 @@ impl DawApp {
                 }
                 PluginUiEditor::Clap(_) => {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
-                        if let Ok(mut host) = host.try_lock() {
+                        if let Some(mut host) = host.try_lock() {
                             let request_hide = host.take_gui_request_hide();
                             let request_show = host.take_gui_request_show();
                             if let Some((gw, gh)) = host.take_gui_resize() {
@@ -947,7 +947,7 @@ impl DawApp {
                 }
                 if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
-                        if let Ok(mut host) = host.try_lock() {
+                        if let Some(mut host) = host.try_lock() {
                             host.hide_gui();
                             eprintln!("UI close_editor: CLAP hide_gui");
                         }
@@ -975,7 +975,7 @@ impl DawApp {
                     }
                     if let PluginUiEditor::Clap(_) = &ui_host.editor {
                         if let PluginHostHandle::Clap(host) = &ui_host.host {
-                            if let Ok(mut host) = host.try_lock() {
+                            if let Some(mut host) = host.try_lock() {
                                 host.hide_gui();
                             }
                         }
@@ -1029,8 +1029,8 @@ impl DawApp {
             PluginHostHandle::Vst3(vst_host) => {
                 let mut editor = {
                     let host_guard = match vst_host.try_lock() {
-                        Ok(host) => host,
-                        Err(_) => {
+                        Some(host) => host,
+                        None => {
                             self.status = "Plugin busy; try again".to_string();
                             return;
                         }
@@ -1094,11 +1094,7 @@ impl DawApp {
                 });
             }
             PluginHostHandle::Clap(clap_host) => {
-                let (w, h) = clap_host
-                    .lock()
-                    .ok()
-                    .and_then(|host| host.gui_size())
-                    .unwrap_or((520, 360));
+                let (w, h) = clap_host.lock().gui_size().unwrap_or((520, 360));
                 eprintln!("CLAP UI size hint: {w}x{h}");
                 let hwnd = match create_plugin_top_window(w, h) {
                     Some(hwnd) => hwnd,
@@ -1119,8 +1115,8 @@ impl DawApp {
                 move_plugin_child_window(child_hwnd, 0, 0, w.max(200), h.max(120));
                 let mut is_embedded = true;
                 let mut clap_guard = match clap_host.try_lock() {
-                    Ok(host) => host,
-                    Err(_) => {
+                    Some(host) => host,
+                    None => {
                         self.status = "CLAP plugin busy; try opening UI again".to_string();
                         destroy_plugin_child_window(hwnd);
                         self.show_plugin_ui = false;
@@ -1184,7 +1180,7 @@ impl DawApp {
             }
             PluginUiEditor::Clap(_) => {
                 if let PluginHostHandle::Clap(host) = &ui_host.host {
-                    if let Ok(mut host) = host.try_lock() {
+                    if let Some(mut host) = host.try_lock() {
                         host.hide_gui();
                     }
                 }

@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 impl DawApp {
     pub(crate) fn load_midi_from_folder(&mut self, folder: &Path) -> Result<(), String> {
         let midi_dir = folder.join("midi");

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use parking_lot::Mutex as PluginHostMutex;
+
 use crate::hosts;
 pub use crate::render::util::{RenderFormat, RenderTailMode, RenderWavBitDepth};
 
@@ -781,8 +783,8 @@ impl Default for MasterCompState {
 
 #[derive(Clone)]
 pub enum PluginHostHandle {
-    Vst3(Arc<Mutex<hosts::vst3::Vst3Host>>),
-    Clap(Arc<Mutex<hosts::clap::ClapHost>>),
+    Vst3(Arc<PluginHostMutex<hosts::vst3::Vst3Host>>),
+    Clap(Arc<PluginHostMutex<hosts::clap::ClapHost>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -796,7 +798,7 @@ pub enum ClipDragKind {
 
 pub enum PluginUiEditor {
     Vst3(hosts::vst3::Vst3Editor),
-    Clap(Arc<Mutex<hosts::clap::ClapHost>>),
+    Clap(Arc<PluginHostMutex<hosts::clap::ClapHost>>),
 }
 
 pub struct PluginUiHost {

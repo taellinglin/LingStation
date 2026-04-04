@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 impl DawApp {
     fn render_track_model(
         track_index: usize,

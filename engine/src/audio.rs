@@ -266,12 +266,12 @@ impl PluginHostHandle {
     pub fn prepare_for_drop(&mut self) {
         match self {
             PluginHostHandle::Vst3(h) => {
-                if let Ok(mut g) = h.try_lock() {
+                if let Some(mut g) = h.try_lock() {
                     g.prepare_for_drop();
                 }
             }
             PluginHostHandle::Clap(h) => {
-                if let Ok(mut g) = h.try_lock() {
+                if let Some(mut g) = h.try_lock() {
                     g.prepare_for_drop();
                 }
             }
@@ -281,12 +281,12 @@ impl PluginHostHandle {
     pub fn push_param_change(&self, param_id: u32, value: f64) {
         match self {
             PluginHostHandle::Vst3(h) => {
-                if let Ok(mut h) = h.try_lock() {
+                if let Some(mut h) = h.try_lock() {
                     h.push_param_change(param_id, value);
                 }
             }
             PluginHostHandle::Clap(h) => {
-                if let Ok(mut h) = h.try_lock() {
+                if let Some(mut h) = h.try_lock() {
                     h.push_param_change(param_id, value);
                 }
             }
@@ -295,8 +295,8 @@ impl PluginHostHandle {
 
     pub fn io_channels(&self) -> (usize, usize) {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().io_channels(),
-            PluginHostHandle::Clap(h) => h.lock().unwrap().io_channels(),
+            PluginHostHandle::Vst3(h) => h.lock().io_channels(),
+            PluginHostHandle::Clap(h) => h.lock().io_channels(),
         }
     }
 
@@ -307,8 +307,8 @@ impl PluginHostHandle {
         midi: &[vst3::MidiEvent],
     ) -> LingResult<()> {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().process_f32(output, channels, midi),
-            PluginHostHandle::Clap(h) => h.lock().unwrap().process_f32(output, channels, midi),
+            PluginHostHandle::Vst3(h) => h.lock().process_f32(output, channels, midi),
+            PluginHostHandle::Clap(h) => h.lock().process_f32(output, channels, midi),
         }
     }
 
@@ -322,21 +322,18 @@ impl PluginHostHandle {
         match self {
             PluginHostHandle::Vst3(h) => h
                 .lock()
-                .unwrap()
                 .process_f32_with_input(input, output, channels, midi),
             PluginHostHandle::Clap(h) => h
                 .lock()
-                .unwrap()
                 .process_f32_with_input(input, output, channels, midi),
         }
     }
 
     pub fn enumerate_params(&self) -> Vec<vst3::ParamInfo> {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().enumerate_params(),
+            PluginHostHandle::Vst3(h) => h.lock().enumerate_params(),
             PluginHostHandle::Clap(h) => h
                 .lock()
-                .unwrap()
                 .enumerate_params()
                 .into_iter()
                 .map(|p| vst3::ParamInfo {
@@ -351,15 +348,15 @@ impl PluginHostHandle {
     pub fn clap_blocks_params(&self) -> bool {
         match self {
             PluginHostHandle::Vst3(_) => false,
-            PluginHostHandle::Clap(h) => h.lock().unwrap().param_changes_blocked(),
+            PluginHostHandle::Clap(h) => h.lock().param_changes_blocked(),
         }
     }
 
     pub fn get_state_bytes(&self) -> (Vec<u8>, Vec<u8>) {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().get_state_bytes(),
+            PluginHostHandle::Vst3(h) => h.lock().get_state_bytes(),
             PluginHostHandle::Clap(h) => {
-                let mut g = h.lock().unwrap();
+                let mut g = h.lock();
                 let b = g.get_state_bytes();
                 (b, Vec::new())
             }
@@ -372,9 +369,9 @@ impl PluginHostHandle {
         controller: Option<&[u8]>,
     ) -> LingResult<()> {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().set_state_bytes(component, controller),
+            PluginHostHandle::Vst3(h) => h.lock().set_state_bytes(component, controller),
             PluginHostHandle::Clap(h) => {
-                let mut g = h.lock().unwrap();
+                let mut g = h.lock();
                 if let Some(bytes) = component.or(controller) {
                     if !bytes.is_empty() {
                         g.set_state_bytes(bytes)?;
@@ -387,7 +384,7 @@ impl PluginHostHandle {
 
     pub fn get_param_normalized(&self, param_id: u32) -> Option<f64> {
         match self {
-            PluginHostHandle::Vst3(h) => h.lock().unwrap().get_param_normalized(param_id),
+            PluginHostHandle::Vst3(h) => h.lock().get_param_normalized(param_id),
             PluginHostHandle::Clap(_) => None,
         }
     }

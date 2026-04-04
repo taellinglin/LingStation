@@ -565,8 +565,12 @@ impl DawApp {
             let row_end_index = ((-self.arranger_pan.y + rect.height()) / row_height).ceil() as i32;
             let row_end_index = (row_end_index + 1).min(rows.len() as i32) as usize;
 
-            for row_index in row_start_index..row_end_index {
-                let row = &rows[row_index];
+            for (row_index, row) in rows
+                .iter()
+                .enumerate()
+                .skip(row_start_index)
+                .take(row_end_index.saturating_sub(row_start_index))
+            {
                 let y = rect.top() + row_top_offset + row_index as f32 * row_height;
                 let label_rect = egui::Rect::from_min_max(
                     egui::pos2(rect.left(), y),

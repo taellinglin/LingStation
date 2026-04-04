@@ -262,6 +262,7 @@ impl DawApp {
             }
             fft.process(&mut buffer);
             let half = fft_size / 2;
+            #[allow(clippy::needless_range_loop)]
             for bin in 1..half {
                 let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
                 if !(30.0..=5000.0).contains(&freq) {
@@ -346,6 +347,7 @@ impl DawApp {
             }
             fft.process(&mut buffer);
             let half = fft_size / 2;
+            #[allow(clippy::needless_range_loop)]
             for bin in 1..half {
                 let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
                 if !(50.0..=2000.0).contains(&freq) {

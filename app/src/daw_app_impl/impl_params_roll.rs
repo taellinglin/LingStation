@@ -634,7 +634,7 @@ impl DawApp {
                             self.refresh_clap_params_if_needed();
                             self.ensure_live_params();
                             let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
-                                if let Ok(mut host) = host.try_lock() {
+                                if let Some(mut host) = host.try_lock() {
                                     host.take_last_param_change()
                                 } else {
                                     None
@@ -856,7 +856,7 @@ impl DawApp {
                                                 if let Some(PluginHostHandle::Vst3(host)) =
                                                     state.host.as_ref()
                                                 {
-                                                    if let Ok(host) = host.try_lock() {
+                                                    if let Some(host) = host.try_lock() {
                                                         if let Some((channel, controller)) =
                                                             host.param_to_cc(param_id)
                                                         {
@@ -1419,7 +1419,7 @@ impl DawApp {
                                 self.refresh_clap_params_if_needed();
                                 self.ensure_live_params();
                                 let host_change = if let Some(PluginHostHandle::Vst3(host)) = self.selected_track_host() {
-                                    if let Ok(mut host) = host.try_lock() {
+                                    if let Some(mut host) = host.try_lock() {
                                         host.take_last_param_change()
                                     } else {
                                         None
@@ -1538,7 +1538,7 @@ impl DawApp {
                                                     if let Some(PluginHostHandle::Vst3(host)) =
                                                         state.host.as_ref()
                                                     {
-                                                        if let Ok(host) = host.try_lock() {
+                                                        if let Some(host) = host.try_lock() {
                                                             if let Some((channel, controller)) =
                                                                 host.param_to_cc(param_id)
                                                             {
@@ -2266,7 +2266,7 @@ impl DawApp {
                                             8.0 / 3.0,
                                             4.0,
                                         ];
-                                        let len = note.length_beats.max(1.0 / 32.0).min(4.0);
+                                        let len = note.length_beats.clamp(1.0 / 32.0, 4.0);
                                         let mut nearest = 0usize;
                                         let mut best = f32::MAX;
                                         for (idx, value) in durations.iter().enumerate() {

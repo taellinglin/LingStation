@@ -1,6 +1,8 @@
 use crate::audio::{
     AudioClipCache, AudioClipData, TrackAudioState, TreeSynthRuntime, TreeSynthVoice,
+    PLUGIN_PROCESS_FAILURES,
 };
+use crate::error::LingError;
 use crate::hosts::vst3;
 use crate::models::PluginHostHandle;
 use crate::models::*;
@@ -667,16 +669,20 @@ pub fn mix_track_hosts(
                                     if pending.target == PendingParamTarget::Instrument {
                                         match host {
                                             PluginHostHandle::Vst3(h) => {
-                                                h.lock().unwrap().push_param_change(
-                                                    pending.param_id,
-                                                    pending.value,
-                                                );
+                                                if let Some(mut g) = h.try_lock() {
+                                                    g.push_param_change(
+                                                        pending.param_id,
+                                                        pending.value,
+                                                    );
+                                                }
                                             }
                                             PluginHostHandle::Clap(h) => {
-                                                h.lock().unwrap().push_param_change(
-                                                    pending.param_id,
-                                                    pending.value,
-                                                );
+                                                if let Some(mut g) = h.try_lock() {
+                                                    g.push_param_change(
+                                                        pending.param_id,
+                                                        pending.value,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -687,16 +693,20 @@ pub fn mix_track_hosts(
                                         if lane.target == AutomationTarget::Instrument {
                                             match host {
                                                 PluginHostHandle::Vst3(h) => {
-                                                    h.lock().unwrap().push_param_change(
-                                                        lane.param_id,
-                                                        value as f64,
-                                                    );
+                                                    if let Some(mut g) = h.try_lock() {
+                                                        g.push_param_change(
+                                                            lane.param_id,
+                                                            value as f64,
+                                                        );
+                                                    }
                                                 }
                                                 PluginHostHandle::Clap(h) => {
-                                                    h.lock().unwrap().push_param_change(
-                                                        lane.param_id,
-                                                        value as f64,
-                                                    );
+                                                    if let Some(mut g) = h.try_lock() {
+                                                        g.push_param_change(
+                                                            lane.param_id,
+                                                            value as f64,
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -705,17 +715,32 @@ pub fn mix_track_hosts(
 
                                 FILTERED_EVENTS_TMP.with(|filtered_cell| {
                                     let filtered = filtered_cell.borrow();
-                                    let result =
-                                        match host {
-                                            PluginHostHandle::Vst3(h) => h
-                                                .lock()
-                                                .unwrap()
-                                                .process_f32(&mut host_out, channels, &filtered),
-                                            PluginHostHandle::Clap(h) => h
-                                                .lock()
-                                                .unwrap()
-                                                .process_f32(&mut host_out, channels, &filtered),
-                                        };
+                                    let result = match host {
+                                        PluginHostHandle::Vst3(h) => match h.try_lock() {
+                                            Some(mut g) => {
+                                                g.process_f32(&mut host_out, channels, &filtered)
+                                            }
+                                            None => {
+                                                PLUGIN_PROCESS_FAILURES
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                Err(LingError::Plugin(
+                                                    "instrument host lock unavailable".to_string(),
+                                                ))
+                                            }
+                                        },
+                                        PluginHostHandle::Clap(h) => match h.try_lock() {
+                                            Some(mut g) => {
+                                                g.process_f32(&mut host_out, channels, &filtered)
+                                            }
+                                            None => {
+                                                PLUGIN_PROCESS_FAILURES
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                Err(LingError::Plugin(
+                                                    "instrument host lock unavailable".to_string(),
+                                                ))
+                                            }
+                                        },
+                                    };
                                     if result.is_ok() {
                                         for (t, h) in temp.iter_mut().zip(host_out.iter()) {
                                             *t += *h;
@@ -790,16 +815,20 @@ pub fn mix_track_hosts(
                                         if target_fx == fx_index {
                                             match fx {
                                                 PluginHostHandle::Vst3(h) => {
-                                                    h.lock().unwrap().push_param_change(
-                                                        lane.param_id,
-                                                        value as f64,
-                                                    );
+                                                    if let Some(mut g) = h.try_lock() {
+                                                        g.push_param_change(
+                                                            lane.param_id,
+                                                            value as f64,
+                                                        );
+                                                    }
                                                 }
                                                 PluginHostHandle::Clap(h) => {
-                                                    h.lock().unwrap().push_param_change(
-                                                        lane.param_id,
-                                                        value as f64,
-                                                    );
+                                                    if let Some(mut g) = h.try_lock() {
+                                                        g.push_param_change(
+                                                            lane.param_id,
+                                                            value as f64,
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -809,14 +838,28 @@ pub fn mix_track_hosts(
 
                             scratch.fill(0.0);
                             let result = match fx {
-                                PluginHostHandle::Vst3(h) => h
-                                    .lock()
-                                    .unwrap()
-                                    .process_f32_with_input(current, scratch, channels, &[]),
-                                PluginHostHandle::Clap(h) => h
-                                    .lock()
-                                    .unwrap()
-                                    .process_f32_with_input(current, scratch, channels, &[]),
+                                PluginHostHandle::Vst3(h) => match h.try_lock() {
+                                    Some(mut g) => {
+                                        g.process_f32_with_input(current, scratch, channels, &[])
+                                    }
+                                    None => {
+                                        PLUGIN_PROCESS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                                        Err(LingError::Plugin(
+                                            "effect host lock unavailable".to_string(),
+                                        ))
+                                    }
+                                },
+                                PluginHostHandle::Clap(h) => match h.try_lock() {
+                                    Some(mut g) => {
+                                        g.process_f32_with_input(current, scratch, channels, &[])
+                                    }
+                                    None => {
+                                        PLUGIN_PROCESS_FAILURES.fetch_add(1, Ordering::Relaxed);
+                                        Err(LingError::Plugin(
+                                            "effect host lock unavailable".to_string(),
+                                        ))
+                                    }
+                                },
                             };
                             if result.is_ok() {
                                 std::mem::swap(&mut current, &mut scratch);
