@@ -104,7 +104,7 @@ impl DawApp {
     }
 
     pub(crate) fn sync_last_param_changes(&mut self) {
-        for (index, state) in self.track_audio.iter().enumerate() {
+        for (index, state) in self.engine.track_audio.iter().enumerate() {
             let Some(PluginHostHandle::Vst3(host)) = state.host.as_ref() else {
                 continue;
             };

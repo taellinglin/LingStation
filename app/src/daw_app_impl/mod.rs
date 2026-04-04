@@ -1,3 +1,16 @@
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+
+use engine::audio::{AudioClipCache, TrackAudioState, MAX_PLUGIN_OUTPUT_CHANNELS};
+use engine::hosts::clap as clap_host;
+use engine::hosts::vst3;
+use engine::midi::{export_midi, import_midi_channels, import_midi_tracks};
+use engine::models::*;
+use engine::performance::performance_length_samples;
+use engine::performance::{PerformanceRuntimeClip, PerformanceTriggerMode};
+use engine::render::*;
+use parking_lot::Mutex as ParkingMutex;
+
 use super::*;
 
 include!("eframe_app.rs");

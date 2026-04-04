@@ -385,10 +385,7 @@ impl DawApp {
         let sample_rate = self.settings.sample_rate.max(1);
         let total_frames = self.beats_to_samples((end - start).max(0.001), sample_rate).max(1);
 
-        let mut local_cache = AudioClipCache::new(
-            AUDIO_CLIP_CACHE_MAX_BYTES,
-            AUDIO_CLIP_CACHE_MAX_ENTRIES,
-        );
+        let mut local_cache = AudioClipCache::new();
         let mut channels = 1usize;
         let mut renders: Vec<(AudioClipRender, Arc<AudioClipData>)> = Vec::new();
         for clip in clips {
@@ -396,7 +393,7 @@ impl DawApp {
                 .resolve_clip_audio_path(clip)
                 .ok_or_else(|| format!("Missing audio file for {}", clip.name))?;
             let path_str = path.to_string_lossy().to_string();
-            let data = if let Some(data) = local_cache.get(&path_str) {
+            let data = if let Some(data) = local_cache.get(path_str.as_str()) {
                 data
             } else {
                 let data = Arc::new(
@@ -411,7 +408,7 @@ impl DawApp {
             renders.push((
                 AudioClipRender {
                     clip_id: clip.id,
-                    path: path_str.into(),
+                    path: path_str,
                     track_index: 0,
                     start_samples: self.beats_to_samples((clip.start_beats - start).max(0.0), sample_rate),
                     length_samples: self.beats_to_samples(clip.length_beats, sample_rate).max(1),
@@ -515,9 +512,8 @@ impl DawApp {
         writer.finalize().map_err(|e| e.to_string())?;
 
         if let Some(data) = Self::load_audio_clip_data(&target) {
-            if let Ok(mut cache) = self.audio_clip_cache.lock() {
-                cache.insert(target.to_string_lossy().to_string().into(), Arc::new(data));
-            }
+            let mut cache = self.engine.audio_cache.lock();
+            cache.insert(target.to_string_lossy().to_string().into(), Arc::new(data));
         }
 
         Ok(Clip {
@@ -589,12 +585,11 @@ impl DawApp {
     }
 
     pub(crate) fn send_all_notes_off(&self, track_index: usize) {
-        let Some(state) = self.track_audio.get(track_index) else {
+        let Some(state) = self.engine.track_audio.get(track_index) else {
             return;
         };
-        if let Ok(mut events) = state.midi_events.lock() {
-            events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
-        }
+        let mut events = state.midi_events.lock();
+        events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
     }
 
     pub(crate) fn update_clip_by_id<F>(&mut self, clip_id: usize, mut apply: F)

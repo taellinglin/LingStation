@@ -80,14 +80,10 @@ impl DawApp {
                         .collect()
                 })
                 .collect();
-            let node_activity_snapshot = self
-                .node_activity_rt
-                .lock()
-                .ok()
-                .map(|v| v.clone())
-                .unwrap_or_default();
+            let node_activity_snapshot = self.engine.node_activity.lock().clone();
 
             let max_out_pairs = self
+                .engine
                 .track_audio
                 .iter()
                 .filter_map(|state| state.host.as_ref().map(|host| host.io_channels().1.max(1).div_ceil(2)))
@@ -301,6 +297,7 @@ impl DawApp {
                     })
                     .unwrap_or("Track");
                 let out_channels = self
+                    .engine
                     .track_audio
                     .get(track_index)
                     .and_then(|state| state.host.as_ref())
@@ -488,11 +485,7 @@ impl DawApp {
                     if target.x <= source.x {
                         dx = ((source.x - target.x) * 0.25 + 90.0).clamp(90.0, 220.0);
                     }
-                    let c1 = if target.x > source.x {
-                        egui::pos2(source.x + dx, source.y + offset)
-                    } else {
-                        egui::pos2(source.x + dx, source.y + offset)
-                    };
+                    let c1 = egui::pos2(source.x + dx, source.y + offset);
                     let c2 = if target.x > source.x {
                         egui::pos2(target.x - dx, target.y + offset)
                     } else {
@@ -522,7 +515,7 @@ impl DawApp {
                     points: [chosen.0, chosen.1, chosen.2, chosen.3],
                     closed: false,
                     fill: egui::Color32::TRANSPARENT,
-                    stroke: stroke.into(),
+                    stroke,
                 };
                 painter.add(shape);
             };
@@ -703,6 +696,7 @@ impl DawApp {
                             }
                         });
                     let from_out_channels = self
+                        .engine
                         .track_audio
                         .get(self.node_route_from_track)
                         .and_then(|state| state.host.as_ref())

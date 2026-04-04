@@ -264,7 +264,7 @@ impl DawApp {
             let half = fft_size / 2;
             for bin in 1..half {
                 let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
-                if freq < 30.0 || freq > 5000.0 {
+                if !(30.0..=5000.0).contains(&freq) {
                     continue;
                 }
                 let mag = buffer[bin].norm();
@@ -348,7 +348,7 @@ impl DawApp {
             let half = fft_size / 2;
             for bin in 1..half {
                 let freq = bin as f32 * sample_rate as f32 / fft_size as f32;
-                if freq < 50.0 || freq > 2000.0 {
+                if !(50.0..=2000.0).contains(&freq) {
                     continue;
                 }
                 let mag = buffer[bin].norm();
@@ -445,7 +445,8 @@ impl DawApp {
             return;
         }
         let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
-        if let Ok(mut guard) = self.audio_clip_timeline.lock() {
+        {
+            let mut guard = self.engine.audio_clips.lock();
             *guard = timeline;
         }
     }
@@ -632,7 +633,7 @@ impl DawApp {
         let mut points = Vec::new();
         let seed_f = (seed as f32 * 13.7).sin().abs().max(0.2);
         while x <= rect.right() {
-            let t = (x - rect.left()) / rect.width() * 6.28 * 3.0;
+            let t = (x - rect.left()) / rect.width() * std::f32::consts::TAU * 3.0;
             let amp = (t.sin() * 0.6 + (t * 0.5 + seed_f).sin() * 0.4) * rect.height() * 0.25;
             points.push(egui::pos2(x, mid_y + amp));
             x += step;
@@ -741,31 +742,6 @@ impl DawApp {
         }
     }
 
-    pub(crate) fn automation_value_at(points: &[AutomationPoint], beat: f32) -> Option<f32> {
-        if points.is_empty() {
-            return None;
-        }
-        
-        // Binary search for the segment containing 'beat'
-        let idx = points.partition_point(|p| p.beat < beat);
-        
-        if idx == 0 {
-            return Some(points[0].value);
-        }
-        
-        if idx >= points.len() {
-            return Some(points[points.len() - 1].value);
-        }
-        
-        let prev = &points[idx - 1];
-        let next = &points[idx];
-        
-        let span = (next.beat - prev.beat).max(0.0001);
-        let t = ((beat - prev.beat) / span).clamp(0.0, 1.0);
-        
-        Some(prev.value + (next.value - prev.value) * t)
-    }
-
     pub(crate) fn build_waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
         if path.extension().and_then(|s| s.to_str()).map(|e| !e.eq_ignore_ascii_case("wav")).unwrap_or(true) {
             return None;
@@ -859,7 +835,7 @@ impl DawApp {
             low += alpha_low * (x - low);
             high += alpha_high * (x - high);
             let low_band = low;
-            let mid_band = (high - low).max(-1.0).min(1.0);
+            let mid_band = (high - low).clamp(-1.0, 1.0);
             let high_band = x - high;
             let bucket = (frame_index / frames_per_bucket).min(bucket_count - 1);
             low_sum[bucket] += low_band * low_band;
@@ -955,7 +931,7 @@ impl DawApp {
                 let pitch = self.clip_effective_pitch_semitones(clip);
                 renders.push(AudioClipRender {
                     clip_id: clip.id,
-                    path: path_str.into(),
+                    path: path_str,
                     track_index,
                     start_samples,
                     length_samples,
@@ -971,56 +947,7 @@ impl DawApp {
         renders
     }
 
-    pub(crate) fn build_audio_clip_render_data(
-        &self,
-        sample_rate: u32,
-        track_filter: Option<usize>,
-    ) -> (Vec<AudioClipRender>, HashMap<Arc<str>, Arc<AudioClipData>>) {
-        let mut renders = Vec::new();
-        let mut cache = HashMap::new();
-        for (track_index, track) in self.tracks.iter().enumerate() {
-            if let Some(filter) = track_filter {
-                if filter != track_index {
-                    continue;
-                }
-            }
-            for clip in &track.clips {
-                if clip.is_midi {
-                    continue;
-                }
-                let Some(path) = self.resolve_clip_audio_path(clip) else {
-                    continue;
-                };
-                let path_str = path.to_string_lossy().to_string();
-                let start_samples = self.beats_to_samples(clip.start_beats, sample_rate);
-                let length_samples = self.beats_to_samples(clip.length_beats, sample_rate).max(1);
-                let offset_samples = self.beats_to_samples(clip.audio_offset_beats, sample_rate);
-                let render_track_index = if track_filter.is_some() { 0 } else { track_index };
-                let pitch = self.clip_effective_pitch_semitones(clip);
-                renders.push(AudioClipRender {
-                    clip_id: clip.id,
-                    path: path_str.clone().into(),
-                    track_index: render_track_index,
-                    start_samples,
-                    length_samples,
-                    offset_samples,
-                    gain: clip.audio_gain,
-                    time_mul: Self::audio_playback_time_mul(clip, pitch),
-                    pitch_semitones: pitch,
-                    stretch_mode: clip.audio_stretch_mode,
-                    formant_scale: clip.audio_formant_scale,
-                });
-                if !cache.contains_key(path_str.as_str()) {
-                    if let Some(data) = Self::load_audio_clip_data(&path) {
-                        cache.insert(path_str.clone().into(), Arc::new(data));
-                    }
-                }
-            }
-        }
-        (renders, cache)
-    }
-
-    pub(crate) fn preload_audio_clips(&self, cache: &Arc<Mutex<AudioClipCache>>) {
+    pub(crate) fn preload_audio_clips(&self, cache: &Arc<ParkingMutex<AudioClipCache>>) {
         for track in &self.tracks {
             for clip in &track.clips {
                 if clip.is_midi {
@@ -1030,10 +957,7 @@ impl DawApp {
                     continue;
                 };
                 let key = path.to_string_lossy().to_string();
-                let mut guard = match cache.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => continue,
-                };
+                let mut guard = cache.lock();
                 if guard.get(key.as_str()).is_some() {
                     continue;
                 }
@@ -1044,10 +968,7 @@ impl DawApp {
             if let Some(treesynth) = track.treesynth.as_ref() {
                 for sample in &treesynth.samples {
                     let key = sample.path.clone();
-                    let mut guard = match cache.lock() {
-                        Ok(guard) => guard,
-                        Err(_) => continue,
-                    };
+                    let mut guard = cache.lock();
                     if guard.get(key.as_str()).is_some() {
                         continue;
                     }

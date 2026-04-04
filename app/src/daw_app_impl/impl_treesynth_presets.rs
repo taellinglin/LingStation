@@ -150,7 +150,7 @@ impl DawApp {
         }
 
         let (mut component_bytes, mut controller_bytes) = (Vec::new(), Vec::new());
-        if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
+        if let Some(host) = self.engine.track_audio.get(index).and_then(|state| state.host.as_ref()) {
             let (component, controller) = host.get_state_bytes();
             component_bytes = component;
             controller_bytes = controller;
@@ -282,17 +282,16 @@ impl DawApp {
             if let Some(track) = self.tracks.get_mut(index) {
                 track.treesynth = Some(state);
             }
-            if let Some(state) = self.track_audio.get(index) {
+            if let Some(audio) = self.engine.track_audio.get_mut(index) {
                 let enabled = Self::is_treesynth_path(&plugin_path);
                 if let Some(track) = self.tracks.get(index) {
-                    state.sync_treesynth(track, enabled, &self.audio_clip_cache);
+                    audio.sync_treesynth(track, enabled, &self.engine.audio_cache);
                 }
-                if let Ok(mut runtime) = state.treesynth_runtime.lock() {
-                    runtime.voices.clear();
-                    runtime.sequence_index = 0;
-                }
+                let mut runtime = audio.treesynth_runtime.lock();
+                runtime.voices.clear();
+                runtime.sequence_index = 0;
             }
-            self.preload_audio_clips(&self.audio_clip_cache);
+            self.preload_audio_clips(&self.engine.audio_cache);
             return Ok(());
         }
 
@@ -358,31 +357,32 @@ impl DawApp {
             }
         }
 
-        if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
-            if !component_bytes.is_empty() || !controller_bytes.is_empty() {
-                let _ = host.set_state_bytes(
-                    if component_bytes.is_empty() {
-                        None
-                    } else {
-                        Some(component_bytes.as_slice())
-                    },
-                    if controller_bytes.is_empty() {
-                        None
-                    } else {
-                        Some(controller_bytes.as_slice())
-                    },
-                );
-            } else if let Some(track) = self.tracks.get(index) {
-                for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
-                    host.push_param_change(*param_id, *value as f64);
+        if let Some(audio) = self.engine.track_audio.get_mut(index) {
+            if let Some(host) = audio.host.as_mut() {
+                if !component_bytes.is_empty() || !controller_bytes.is_empty() {
+                    let _ = host.set_state_bytes(
+                        if component_bytes.is_empty() {
+                            None
+                        } else {
+                            Some(component_bytes.as_slice())
+                        },
+                        if controller_bytes.is_empty() {
+                            None
+                        } else {
+                            Some(controller_bytes.as_slice())
+                        },
+                    );
+                } else if let Some(track) = self.tracks.get(index) {
+                    for (param_id, value) in track.param_ids.iter().zip(track.param_values.iter()) {
+                        host.push_param_change(*param_id, *value as f64);
+                    }
                 }
-            }
-
-            if let Some(track) = self.tracks.get_mut(index) {
-                for (slot, param_id) in track.param_ids.iter().enumerate() {
-                    if let Some(value) = host.get_param_normalized(*param_id) {
-                        if let Some(target) = track.param_values.get_mut(slot) {
-                            *target = value as f32;
+                if let Some(track) = self.tracks.get_mut(index) {
+                    for (slot, param_id) in track.param_ids.iter().enumerate() {
+                        if let Some(value) = host.get_param_normalized(*param_id) {
+                            if let Some(target) = track.param_values.get_mut(slot) {
+                                *target = value as f32;
+                            }
                         }
                     }
                 }
@@ -394,9 +394,7 @@ impl DawApp {
 
     pub(crate) fn normalize_param_name(name: &str) -> String {
         name.to_ascii_lowercase()
-            .replace(' ', "")
-            .replace('_', "")
-            .replace('-', "")
+            .replace([' ', '_', '-'], "")
     }
 
     pub(crate) fn debug_param_enabled() -> bool {
@@ -528,7 +526,7 @@ impl DawApp {
                     plugin_path,
                     &clap_id,
                     self.settings.sample_rate as f64,
-                    self.settings.buffer_size as u32,
+                    self.settings.buffer_size,
                     0,
                     2,
                 )?;
@@ -723,7 +721,7 @@ impl DawApp {
             *value = normalized as f32;
         }
 
-        if let Some(host) = self.track_audio.get(index).and_then(|state| state.host.as_ref()) {
+        if let Some(host) = self.engine.track_audio.get(index).and_then(|state| state.host.as_ref()) {
             host.push_param_change(program_param_id, normalized);
             for (slot, param_id) in param_ids.iter().enumerate() {
                 if let Some(value) = host.get_param_normalized(*param_id) {
@@ -868,7 +866,7 @@ impl DawApp {
     pub(crate) fn draw_treesynth_panel(
         ui: &mut egui::Ui,
         state: &mut TreeSynthState,
-        audio_clip_cache: &Arc<Mutex<AudioClipCache>>,
+        audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
         project_root: Option<&Path>,
     ) -> bool {
         let mut changed = false;
@@ -894,9 +892,10 @@ impl DawApp {
                     };
                     state.folder = Some(folder.to_string_lossy().to_string());
                     state.samples = Self::load_treesynth_folder(&folder);
-                    if let Ok(mut cache) = audio_clip_cache.lock() {
+                    {
+                        let mut cache = audio_clip_cache.lock();
                         for sample in &state.samples {
-                            if cache.get(&sample.path).is_some() {
+                            if cache.get(sample.path.as_str()).is_some() {
                                 continue;
                             }
                             if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
@@ -913,9 +912,10 @@ impl DawApp {
                     if let Some(folder) = state.folder.as_deref() {
                         let folder = PathBuf::from(folder);
                         state.samples = Self::load_treesynth_folder(&folder);
-                        if let Ok(mut cache) = audio_clip_cache.lock() {
+                        {
+                            let mut cache = audio_clip_cache.lock();
                             for sample in &state.samples {
-                                if cache.get(&sample.path).is_some() {
+                                if cache.get(sample.path.as_str()).is_some() {
                                     continue;
                                 }
                                 if let Some(data) = Self::load_audio_clip_data(Path::new(&sample.path)) {
@@ -981,13 +981,11 @@ impl DawApp {
             ("Sustain", &mut state.sustain, 3, 0.0, 1.0),
             ("Release", &mut state.release, 4, 0.0, 8.0),
         ];
-        // pending_midi_learn, pending_automationは親UIで管理する必要あり
-        // ここではグローバル変数的に仮定（本来はAppState等で管理）
         thread_local! {
-            static PENDING_MIDI_LEARN: std::cell::RefCell<Option<(usize, u32, String)>> = std::cell::RefCell::new(None);
-            static PENDING_AUTOMATION: std::cell::RefCell<Option<(usize, u32, String)>> = std::cell::RefCell::new(None);
+            static PENDING_MIDI_LEARN: std::cell::RefCell<Option<(usize, u32, String)>> = const { std::cell::RefCell::new(None) };
+            static PENDING_AUTOMATION: std::cell::RefCell<Option<(usize, u32, String)>> = const { std::cell::RefCell::new(None) };
         }
-        let track_index = 0; // TODO: 実際のトラックインデックスを渡す
+        let track_index = 0;
         for (label, value, param_id, min, max) in treesynth_param_defs {
             let slider = egui::Slider::new(value, min..=max).text(label);
             let response = ui.add(slider);

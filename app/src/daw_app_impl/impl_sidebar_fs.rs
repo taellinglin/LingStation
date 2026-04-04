@@ -169,7 +169,8 @@ impl DawApp {
         self.waveform_len_seconds_cache_order
             .borrow_mut()
             .retain(|entry| entry.as_ref() != key);
-        if let Ok(mut cache) = self.audio_clip_cache.lock() {
+        {
+            let mut cache = self.engine.audio_cache.lock();
             cache.remove(key.as_str());
         }
     }
@@ -367,7 +368,7 @@ impl DawApp {
 
         if !is_dir {
             if let Some(ext) = label.rsplit('.').next() {
-                if ext.len() > 0 && ext.len() <= 6 {
+                if !ext.is_empty() && ext.len() <= 6 {
                     let badge_text = ext.to_ascii_uppercase();
                     let badge_font = egui::FontId::proportional(BASE_UI_FONT_SIZE);
                     let badge_galley = ui.fonts(|f| {
@@ -428,12 +429,11 @@ impl DawApp {
                 action = Some(("show", path.to_path_buf()));
                 ui.close_menu();
             }
-            if source == FsSource::Browser && depth == 0 && is_dir {
-                if ui.button("Remove Folder").clicked() {
+            if source == FsSource::Browser && depth == 0 && is_dir
+                && ui.button("Remove Folder").clicked() {
                     open_folder_remove = true;
                     ui.close_menu();
                 }
-            }
         });
         if let Some((kind, path)) = action {
             match kind {
@@ -460,8 +460,8 @@ impl DawApp {
             self.remove_browser_folder(path);
         }
 
-        if !is_dir {
-            if response.drag_started() {
+        if !is_dir
+            && response.drag_started() {
                 if let Some(kind) = Self::fs_drag_kind_for_path(path) {
                     self.fs_drag = Some(FsDragState {
                         path: path.to_path_buf(),
@@ -469,7 +469,6 @@ impl DawApp {
                     });
                 }
             }
-        }
 
         is_dir && response.clicked()
     }

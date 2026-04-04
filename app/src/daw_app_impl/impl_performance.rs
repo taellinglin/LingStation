@@ -307,14 +307,15 @@ impl DawApp {
             None
         } else {
             self.resolve_clip_audio_path(&clip)
-                .map(|path| Arc::from(path.to_string_lossy().to_string().as_str()))
+                .map(|path| path.to_string_lossy().into_owned())
         };
         if let Some(path) = resolved_audio_path.as_deref() {
             self.preload_performance_audio_clip(path);
         }
 
         self.sync_performance_runtime();
-        if let Ok(mut runtime) = self.performance_runtime.lock() {
+        {
+            let mut runtime = self.engine.performance_runtime.lock();
             if runtime.len() < self.tracks.len() {
                 runtime.resize(self.tracks.len(), None);
             }
@@ -396,7 +397,7 @@ impl DawApp {
                     None
                 } else {
                     self.resolve_clip_audio_path(&clip)
-                        .map(|path| Arc::from(path.to_string_lossy().to_string().as_str()))
+                        .map(|path| path.to_string_lossy().into_owned())
                 },
                 clip,
             };
@@ -421,13 +422,8 @@ impl DawApp {
         }
         let bpm = self.tempo_bpm.max(1.0);
         let samples_per_beat = self.settings.sample_rate.max(1) as f64 * 60.0 / bpm as f64;
-        let current_samples = self.transport_samples.load(Ordering::Relaxed);
-        let runtime_snapshot = self
-            .performance_runtime
-            .lock()
-            .ok()
-            .map(|runtime| runtime.clone())
-            .unwrap_or_default();
+        let current_samples = self.engine.transport_samples.load(Ordering::Relaxed);
+        let runtime_snapshot = self.engine.performance_runtime.lock().clone();
 
         let mut relaunches = Vec::new();
         let mut clears = Vec::new();
@@ -457,12 +453,11 @@ impl DawApp {
         }
 
         if !clears.is_empty() {
-            if let Ok(mut runtime) = self.performance_runtime.lock() {
-                for (track_index, clip_id) in clears {
-                    if let Some(Some(active)) = runtime.get(track_index) {
-                        if active.clip.id == clip_id {
-                            runtime[track_index] = None;
-                        }
+            let mut runtime = self.engine.performance_runtime.lock();
+            for (track_index, clip_id) in clears {
+                if let Some(Some(active)) = runtime.get(track_index) {
+                    if active.clip.id == clip_id {
+                        runtime[track_index] = None;
                     }
                 }
             }
@@ -518,12 +513,12 @@ impl DawApp {
 
         let track = self.tracks.remove(from);
         self.tracks.insert(to, track);
-        if from < self.track_audio.len() {
-            let state = self.track_audio.remove(from);
-            if to <= self.track_audio.len() {
-                self.track_audio.insert(to, state);
+        if from < self.engine.track_audio.len() {
+            let state = self.engine.track_audio.remove(from);
+            if to <= self.engine.track_audio.len() {
+                self.engine.track_audio.insert(to, state);
             } else {
-                self.track_audio.push(state);
+                self.engine.track_audio.push(state);
             }
         }
 
@@ -553,7 +548,8 @@ impl DawApp {
             }
         }
 
-        if let Ok(mut recording) = self.recording.lock() {
+        {
+            let mut recording = self.engine.recording.lock();
             if recording.track_index != usize::MAX {
                 recording.track_index = Self::remap_track_index(recording.track_index, from, to);
             }

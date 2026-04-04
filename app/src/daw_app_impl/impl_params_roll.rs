@@ -519,8 +519,8 @@ impl DawApp {
                                         track.param_ids.clear();
                                         track.param_values.clear();
                                     }
-                                    if let Some(state) = self.track_audio.get_mut(index) {
-                                        if let Some(host) = state.host.take() {
+                                    if let Some(state) = self.engine.track_audio.get_mut(index) {
+                                        if let Some(mut host) = state.host.take() {
                                             host.prepare_for_drop();
                                             self.orphaned_hosts.push(host);
                                         }
@@ -537,7 +537,7 @@ impl DawApp {
                                 .map(Self::is_treesynth_path)
                                 .unwrap_or(false);
                             if is_treesynth {
-                                let audio_cache = self.audio_clip_cache.clone();
+                                let audio_cache = self.engine.audio_cache.clone();
                                 let mut changed = false;
                                 if let Some(track_index) = selected_track_index {
                                     let project_root = if self.project_path.trim().is_empty() {
@@ -605,21 +605,19 @@ impl DawApp {
                                 if changed {
                                     self.mark_dirty();
                                     if let Some(track_index) = selected_track_index {
-                                        if let Some(track) = self.tracks.get(track_index) {
-                                            if let Some(state) = self.track_audio.get(track_index) {
-                                                let enabled = track
-                                                    .instrument_path
-                                                    .as_deref()
-                                                    .map(Self::is_treesynth_path)
-                                                    .unwrap_or(false);
-                                                state.sync_treesynth(track, enabled, &self.audio_clip_cache);
-                                                if let Ok(mut runtime) =
-                                                    state.treesynth_runtime.lock()
-                                                {
-                                                    runtime.voices.clear();
-                                                    runtime.sequence_index = 0;
-                                                }
-                                            }
+                                        if let (Some(track), Some(audio)) = (
+                                            self.tracks.get(track_index),
+                                            self.engine.track_audio.get_mut(track_index),
+                                        ) {
+                                            let enabled = track
+                                                .instrument_path
+                                                .as_deref()
+                                                .map(Self::is_treesynth_path)
+                                                .unwrap_or(false);
+                                            audio.sync_treesynth(track, enabled, &self.engine.audio_cache);
+                                            let mut runtime = audio.treesynth_runtime.lock();
+                                            runtime.voices.clear();
+                                            runtime.sequence_index = 0;
                                         }
                                     }
                                 }
@@ -701,11 +699,9 @@ impl DawApp {
                                         track.param_values[program_index] = value;
                                         if let Some(param_id) = track.param_ids.get(program_index).copied() {
                                             if let Some(state) =
-                                                selected_track_index.and_then(|i| self.track_audio.get(i))
+                                                selected_track_index.and_then(|i| self.engine.track_audio.get(i))
                                             {
-                                                if let Ok(mut pending) =
-                                                    state.pending_param_changes.lock()
-                                                {
+                                                { let mut pending = state.pending_param_changes.lock();
                                                     pending.push(PendingParamChange {
                                                         target: PendingParamTarget::Instrument,
                                                         param_id,
@@ -845,7 +841,7 @@ impl DawApp {
                                         self.last_ui_param_change = Some((debug_id, *value));
                                         if let Some(param_id) = param_id {
                                             if let Some(state) =
-                                                selected_track_index.and_then(|i| self.track_audio.get(i))
+                                                selected_track_index.and_then(|i| self.engine.track_audio.get(i))
                                             {
                                                 let blocked = state
                                                     .host
@@ -864,7 +860,7 @@ impl DawApp {
                                                         if let Some((channel, controller)) =
                                                             host.param_to_cc(param_id)
                                                         {
-                                                            if let Ok(mut events) = state.midi_events.lock() {
+                                                            { let mut events = state.midi_events.lock();
                                                                 let cc_value = (*value * 127.0).round() as i32;
                                                                 let cc_value = cc_value.clamp(0, 127) as u8;
                                                                 events.push(vst3::MidiEvent::control_change(
@@ -876,9 +872,7 @@ impl DawApp {
                                                         }
                                                     }
                                                 }
-                                                if let Ok(mut pending) =
-                                                    state.pending_param_changes.lock()
-                                                {
+                                                { let mut pending = state.pending_param_changes.lock();
                                                     pending.push(PendingParamChange {
                                                         target: PendingParamTarget::Instrument,
                                                         param_id,
@@ -982,7 +976,7 @@ impl DawApp {
                                         .clicked()
                                     {
                                     let blocked = selected_track_index
-                                        .and_then(|i| self.track_audio.get(i))
+                                        .and_then(|i| self.engine.track_audio.get(i))
                                         .and_then(|state| state.host.as_ref())
                                         .map(|host| host.clap_blocks_params())
                                         .unwrap_or(false);
@@ -1004,11 +998,9 @@ impl DawApp {
                                         track.param_values[idx] = value;
                                         if let Some(param_id) = track.param_ids.get(idx).copied() {
                                             if let Some(state) = selected_track_index
-                                                .and_then(|i| self.track_audio.get(i))
+                                                .and_then(|i| self.engine.track_audio.get(i))
                                             {
-                                                if let Ok(mut pending) =
-                                                    state.pending_param_changes.lock()
-                                                {
+                                                { let mut pending = state.pending_param_changes.lock();
                                                     pending.push(PendingParamChange {
                                                         target: PendingParamTarget::Instrument,
                                                         param_id,
@@ -1101,8 +1093,8 @@ impl DawApp {
                         track.automation_lanes.remove(lane_index);
                     }
                 }
-                if let Some(state) = self.track_audio.get(track_index) {
-                    if let Ok(mut lanes) = state.automation_lanes.lock() {
+                if let Some(state) = self.engine.track_audio.get(track_index) {
+                    { let mut lanes = state.automation_lanes.lock();
                         *lanes = self
                             .tracks
                             .get(track_index)
@@ -1412,8 +1404,8 @@ impl DawApp {
                                             track.param_ids.clear();
                                             track.param_values.clear();
                                         }
-                                        if let Some(state) = self.track_audio.get_mut(index) {
-                                            if let Some(host) = state.host.take() {
+                                        if let Some(state) = self.engine.track_audio.get_mut(index) {
+                                            if let Some(mut host) = state.host.take() {
                                                 host.prepare_for_drop();
                                                 self.orphaned_hosts.push(host);
                                             }
@@ -1493,11 +1485,9 @@ impl DawApp {
                                             track.param_values[program_index] = value;
                                             if let Some(param_id) = track.param_ids.get(program_index).copied() {
                                                 if let Some(state) = selected_track_index
-                                                    .and_then(|i| self.track_audio.get(i))
+                                                    .and_then(|i| self.engine.track_audio.get(i))
                                                 {
-                                                    if let Ok(mut pending) =
-                                                        state.pending_param_changes.lock()
-                                                    {
+                                                    { let mut pending = state.pending_param_changes.lock();
                                                         pending.push(PendingParamChange {
                                                             target: PendingParamTarget::Instrument,
                                                             param_id,
@@ -1543,7 +1533,7 @@ impl DawApp {
                                             self.last_ui_param_change = Some((debug_id, *value));
                                             if let Some(param_id) = param_id {
                                                 if let Some(state) = selected_track_index
-                                                    .and_then(|i| self.track_audio.get(i))
+                                                    .and_then(|i| self.engine.track_audio.get(i))
                                                 {
                                                     if let Some(PluginHostHandle::Vst3(host)) =
                                                         state.host.as_ref()
@@ -1552,9 +1542,7 @@ impl DawApp {
                                                             if let Some((channel, controller)) =
                                                                 host.param_to_cc(param_id)
                                                             {
-                                                                if let Ok(mut events) =
-                                                                    state.midi_events.lock()
-                                                                {
+                                                                { let mut events = state.midi_events.lock();
                                                                     let cc_value =
                                                                         (*value * 127.0).round() as i32;
                                                                     let cc_value =
@@ -1570,9 +1558,7 @@ impl DawApp {
                                                             }
                                                         }
                                                     }
-                                                    if let Ok(mut pending) =
-                                                        state.pending_param_changes.lock()
-                                                    {
+                                                    { let mut pending = state.pending_param_changes.lock();
                                                         pending.push(PendingParamChange {
                                                             target: PendingParamTarget::Instrument,
                                                             param_id,
@@ -1674,11 +1660,9 @@ impl DawApp {
                                             track.param_values[idx] = value;
                                             if let Some(param_id) = track.param_ids.get(idx).copied() {
                                                 if let Some(state) = selected_track_index
-                                                    .and_then(|i| self.track_audio.get(i))
+                                                    .and_then(|i| self.engine.track_audio.get(i))
                                                 {
-                                                    if let Ok(mut pending) =
-                                                        state.pending_param_changes.lock()
-                                                    {
+                                                    { let mut pending = state.pending_param_changes.lock();
                                                         pending.push(PendingParamChange {
                                                             target: PendingParamTarget::Instrument,
                                                             param_id,
@@ -1754,8 +1738,8 @@ impl DawApp {
                                             track.automation_lanes.remove(lane_index);
                                         }
                                     }
-                                    if let Some(state) = self.track_audio.get(track_index) {
-                                        if let Ok(mut lanes) = state.automation_lanes.lock() {
+                                    if let Some(state) = self.engine.track_audio.get(track_index) {
+                                        { let mut lanes = state.automation_lanes.lock();
                                             *lanes = self
                                                 .tracks
                                                 .get(track_index)
@@ -2030,7 +2014,7 @@ impl DawApp {
                     if handle_resp.drag_started() {
                         if let Some(pos) = handle_resp.interact_pointer_pos().or(pointer_interact) {
                             self.piano_zoom_drag = Some(PianoZoomDragState {
-                                start_pos: pos,
+                                start_pos: [pos.x, pos.y],
                                 start_zoom_x: self.piano_zoom_x,
                                 start_zoom_y: self.piano_zoom_y,
                             });
@@ -2039,9 +2023,9 @@ impl DawApp {
                     if handle_resp.dragged() {
                         if let Some(drag) = &self.piano_zoom_drag {
                             if let Some(pos) = handle_resp.interact_pointer_pos().or(pointer_interact) {
-                                let delta = pos - drag.start_pos;
-                                let scale_x = (1.0 + delta.x * 0.005).max(0.05);
-                                let scale_y = (1.0 + delta.y * 0.005).max(0.05);
+                                let delta = pos - egui::pos2(drag.start_pos[0], drag.start_pos[1]);
+                                let scale_x = (1.0_f32 + delta.x * 0.005).max(0.05);
+                                let scale_y = (1.0_f32 + delta.y * 0.005).max(0.05);
                                 self.piano_zoom_x =
                                     (drag.start_zoom_x * scale_x).clamp(zoom_min_x, zoom_max_x);
                                 self.piano_zoom_y =
@@ -3215,11 +3199,10 @@ impl DawApp {
                                                             let dx = px - pos.x;
                                                             let dy = py - pos.y;
                                                             let dist = dx * dx + dy * dy;
-                                                            if dist < 64.0 {
-                                                                if closest.map_or(true, |(_, best)| dist < best) {
+                                                            if dist < 64.0
+                                                                && closest.is_none_or(|(_, best)| dist < best) {
                                                                     closest = Some((idx, dist));
                                                                 }
-                                                            }
                                                         }
                                                         if let Some((idx, _)) = closest {
                                                             self.piano_cc_drag = Some(idx);

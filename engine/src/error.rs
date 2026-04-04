@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub(crate) enum LingError {
+pub enum LingError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -15,7 +15,7 @@ pub(crate) enum LingError {
     Other(String),
 }
 
-pub(crate) type Result<T> = std::result::Result<T, LingError>;
+pub type Result<T> = std::result::Result<T, LingError>;
 
 impl From<LingError> for String {
     fn from(err: LingError) -> Self {

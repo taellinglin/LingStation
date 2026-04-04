@@ -459,6 +459,7 @@ impl DawApp {
                                     egui::Color32::from_rgb(16, 20, 24),
                                 );
                                 let (peak_l, peak_r) = self
+                                    .engine
                                     .track_audio
                                     .get(index)
                                     .map(|s| {
@@ -590,7 +591,7 @@ impl DawApp {
                                     });
                                 }
                                 if bypass_dirty {
-                                    if let Some(state) = self.track_audio.get(index) {
+                                    if let Some(state) = self.engine.track_audio.get(index) {
                                         state.sync_effect_bypass(track);
                                     }
                                 }
@@ -661,7 +662,8 @@ impl DawApp {
                             master_color,
                         );
 
-                        if let Ok(mut master) = self.master_settings.lock() {
+                        {
+                            let mut master = self.engine.master_comp.lock();
                             let level_response = ui.add_sized(
                                 [ui.available_width(), 12.0],
                                 egui::Slider::new(&mut master.level, 0.0..=1.5).text("Level"),
@@ -761,8 +763,8 @@ impl DawApp {
                             track.param_ids.clear();
                             track.param_values.clear();
                         }
-                        if let Some(state) = self.track_audio.get_mut(index) {
-                            if let Some(host) = state.host.take() {
+                        if let Some(state) = self.engine.track_audio.get_mut(index) {
+                            if let Some(mut host) = state.host.take() {
                                 host.prepare_for_drop();
                                 self.orphaned_hosts.push(host);
                             }
@@ -797,9 +799,9 @@ impl DawApp {
                                 track.effect_param_values.remove(fx_index);
                             }
                         }
-                        if let Some(state) = self.track_audio.get_mut(index) {
+                        if let Some(state) = self.engine.track_audio.get_mut(index) {
                             if fx_index < state.effect_hosts.len() {
-                                let host = state.effect_hosts.remove(fx_index);
+                                let mut host = state.effect_hosts.remove(fx_index);
                                 host.prepare_for_drop();
                                 self.orphaned_hosts.push(host);
                             }
@@ -835,7 +837,7 @@ impl DawApp {
                             }
                         }
                         if moved {
-                            if let Some(state) = self.track_audio.get_mut(index) {
+                            if let Some(state) = self.engine.track_audio.get_mut(index) {
                                 if target_index < state.effect_hosts.len() {
                                     state.effect_hosts.swap(fx_index, target_index);
                                 }

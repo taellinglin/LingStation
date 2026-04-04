@@ -1,20 +1,14 @@
 pub mod audio;
+pub mod error;
+pub mod hosts;
 pub mod midi;
+pub mod models;
+pub mod node_editor;
+pub mod performance;
+pub mod render;
 pub mod timeline;
-pub mod vst;
 
-pub struct DawEngine {
-    pub audio: audio::AudioEngine,
-    pub midi: midi::MidiEngine,
-    pub vst: vst::VstHost,
-}
-
-impl DawEngine {
-    pub fn new(sample_rate: f32, channels: u16) -> Self {
-        Self {
-            audio: audio::AudioEngine::new(sample_rate, channels),
-            midi: midi::MidiEngine::new(),
-            vst: vst::VstHost::new(),
-        }
-    }
-}
+pub use error::{LingError, Result};
+pub use hosts::vst3::MidiEvent;
+pub use models::*;
+pub use render::*;

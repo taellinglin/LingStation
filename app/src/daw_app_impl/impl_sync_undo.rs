@@ -3,17 +3,17 @@ impl DawApp {
 
     pub(crate) fn leak_hosts_on_exit(&mut self) {
         let mut hosts: Vec<PluginHostHandle> = Vec::new();
-        for state in self.track_audio.iter_mut() {
-            if let Some(host) = state.host.take() {
+        for state in self.engine.track_audio.iter_mut() {
+            if let Some(mut host) = state.host.take() {
                 host.prepare_for_drop();
                 hosts.push(host);
             }
-            for host in state.effect_hosts.drain(..) {
+            for mut host in state.effect_hosts.drain(..) {
                 host.prepare_for_drop();
                 hosts.push(host);
             }
         }
-        hosts.extend(self.orphaned_hosts.drain(..));
+        hosts.append(&mut self.orphaned_hosts);
         for host in hosts {
             std::mem::forget(host);
         }
@@ -264,7 +264,9 @@ impl DawApp {
 
     pub(crate) fn sync_selected_track_index(&self) {
         let index = self.selected_track.unwrap_or(usize::MAX);
-        self.selected_track_index.store(index, Ordering::Relaxed);
+        self.engine
+            .selected_track_index
+            .store(index, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_dirty(&mut self) {
@@ -350,15 +352,15 @@ impl DawApp {
                 track.treesynth = Some(TreeSynthState::default());
             }
         }
-        if self.track_audio.len() != self.tracks.len() {
-            self.track_audio = self
+        if self.engine.track_audio.len() != self.tracks.len() {
+            self.engine.track_audio = self
                 .tracks
                 .iter()
                 .map(TrackAudioState::from_track)
                 .collect();
         } else {
             for (index, track) in self.tracks.iter().enumerate() {
-                if let Some(state) = self.track_audio.get(index) {
+                if let Some(state) = self.engine.track_audio.get_mut(index) {
                     state.sync_notes(track);
                     state.sync_automation(track);
                     state.sync_effect_bypass(track);
@@ -367,7 +369,7 @@ impl DawApp {
                         .as_deref()
                         .map(Self::is_treesynth_path)
                         .unwrap_or(false);
-                    state.sync_treesynth(track, enabled, &self.audio_clip_cache);
+                    state.sync_treesynth(track, enabled, &self.engine.audio_cache);
                 }
             }
         }
@@ -451,34 +453,35 @@ impl DawApp {
     }
 
     pub(crate) fn sync_node_activity(&mut self) {
-        if let Ok(mut activity) = self.node_activity_rt.lock() {
-            if activity.len() < self.tracks.len() {
-                activity.resize(self.tracks.len(), TrackNodeActivity::default());
-            } else if activity.len() > self.tracks.len() {
-                activity.truncate(self.tracks.len());
-            }
-            for (idx, track) in self.tracks.iter().enumerate() {
-                if let Some(slot) = activity.get_mut(idx) {
-                    let fx_count = track.effect_paths.len();
-                    if slot.fx_input_peaks.len() != fx_count {
-                        slot.fx_input_peaks.resize(fx_count, 0.0);
-                    }
-                    if slot.fx_output_peaks.len() != fx_count {
-                        slot.fx_output_peaks.resize(fx_count, 0.0);
-                    }
+        let mut activity = self.engine.node_activity.lock();
+        if activity.len() < self.tracks.len() {
+            activity.resize(self.tracks.len(), TrackNodeActivity::default());
+        } else if activity.len() > self.tracks.len() {
+            activity.truncate(self.tracks.len());
+        }
+        for (idx, track) in self.tracks.iter().enumerate() {
+            if let Some(slot) = activity.get_mut(idx) {
+                let fx_count = track.effect_paths.len();
+                if slot.fx_input_peaks.len() != fx_count {
+                    slot.fx_input_peaks.resize(fx_count, 0.0);
+                }
+                if slot.fx_output_peaks.len() != fx_count {
+                    slot.fx_output_peaks.resize(fx_count, 0.0);
                 }
             }
         }
     }
 
     pub(crate) fn sync_track_mix(&mut self) {
-        if let Ok(mut mix) = self.track_mix.lock() {
+        {
+            let mut mix = self.engine.track_mix.lock();
             mix.clear();
             for track in &self.tracks {
                 mix.push(TrackMixState {
                     muted: track.muted,
                     solo: track.solo,
                     level: track.level,
+                    active: true,
                 });
             }
         }
@@ -497,39 +500,29 @@ impl DawApp {
                 self.performance_selected_clip = None;
             }
         }
-        if let Ok(mut routes) = self.node_routes_rt.lock() {
-            *routes = self.node_routes.clone();
-        }
+        *self.engine.node_routes.lock() = self.node_routes.clone();
     }
 
     pub(crate) fn sync_performance_runtime(&mut self) {
         let track_count = self.tracks.len();
-        if let Ok(mut runtime) = self.performance_runtime.lock() {
-            if runtime.len() < track_count {
-                runtime.resize(track_count, None);
-            } else if runtime.len() > track_count {
-                runtime.truncate(track_count);
-            }
-            for (track_index, slot) in runtime.iter_mut().enumerate() {
-                let Some(active) = slot.as_ref() else {
-                    continue;
-                };
-                let still_exists = self
-                    .find_clip_indices_by_id(active.clip.id)
-                    .map(|(ti, _)| ti == track_index)
-                    .unwrap_or(false);
-                if !still_exists {
-                    *slot = None;
-                }
+        let mut runtime = self.engine.performance_runtime.lock();
+        if runtime.len() < track_count {
+            runtime.resize(track_count, None);
+        } else if runtime.len() > track_count {
+            runtime.truncate(track_count);
+        }
+        for (track_index, slot) in runtime.iter_mut().enumerate() {
+            let Some(active) = slot.as_ref() else {
+                continue;
+            };
+            let still_exists = self
+                .find_clip_indices_by_id(active.clip.id)
+                .map(|(ti, _)| ti == track_index)
+                .unwrap_or(false);
+            if !still_exists {
+                *slot = None;
             }
         }
-    }
-
-    pub(crate) fn master_settings_snapshot(&self) -> MasterCompSettings {
-        self.master_settings
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
     }
 
     pub(crate) fn rebuild_all_track_midi_notes(&mut self) {
@@ -602,7 +595,7 @@ impl DawApp {
     pub(crate) fn sync_track_audio_notes(&mut self, index: usize) {
         self.rebuild_track_midi_notes(index);
         if let Some(track) = self.tracks.get(index) {
-            if let Some(state) = self.track_audio.get(index) {
+            if let Some(state) = self.engine.track_audio.get(index) {
                 state.sync_notes(track);
             }
         }
@@ -610,7 +603,7 @@ impl DawApp {
 
     pub(crate) fn selected_track_host(&self) -> Option<PluginHostHandle> {
         let index = self.selected_track?;
-        self.track_audio.get(index).and_then(|state| state.host.clone())
+        self.engine.track_audio.get(index).and_then(|state| state.host.clone())
     }
 
     pub(crate) fn ensure_track_host(&mut self, index: usize, channels: usize) -> Option<PluginHostHandle> {
@@ -628,7 +621,7 @@ impl DawApp {
             self.status = format!("Missing instrument cleared: {}", Self::plugin_display_name(&path));
             return None;
         }
-        let state = self.track_audio.get_mut(index)?;
+        let state = self.engine.track_audio.get_mut(index)?;
         if let Some(host) = state.host.as_ref() {
             return Some(host.clone());
         }
@@ -661,9 +654,9 @@ impl DawApp {
                     &path,
                     &clap_id,
                     self.settings.sample_rate as f64,
-                    self.settings.buffer_size as u32,
+                    self.settings.buffer_size,
                     0,
-                    channels.max(1).min(MAX_CLAP_OUTPUT_CHANNELS),
+                    channels.clamp(1, MAX_CLAP_OUTPUT_CHANNELS),
                 )
                 .ok()?;
                 Some(PluginHostHandle::Clap(Arc::new(Mutex::new(host))))
@@ -707,9 +700,9 @@ impl DawApp {
                     track.effect_param_values.remove(effect_index);
                 }
             }
-            if let Some(state) = self.track_audio.get_mut(track_index) {
+            if let Some(state) = self.engine.track_audio.get_mut(track_index) {
                 if effect_index < state.effect_hosts.len() {
-                    let host = state.effect_hosts.remove(effect_index);
+                    let mut host = state.effect_hosts.remove(effect_index);
                     host.prepare_for_drop();
                     self.orphaned_hosts.push(host);
                 }
@@ -717,13 +710,13 @@ impl DawApp {
             self.status = format!("Missing effect cleared: {}", Self::plugin_display_name(&path));
             return None;
         }
-        let state = self.track_audio.get_mut(track_index)?;
+        let state = self.engine.track_audio.get_mut(track_index)?;
         let (paths, clap_ids) = {
             let track = self.tracks.get(track_index)?;
             (track.effect_paths.clone(), track.effect_clap_ids.clone())
         };
         if state.effect_hosts.len() != paths.len() {
-            for host in state.effect_hosts.drain(..) {
+            for mut host in state.effect_hosts.drain(..) {
                 host.prepare_for_drop();
                 self.orphaned_hosts.push(host);
             }
@@ -756,7 +749,7 @@ impl DawApp {
                                 path,
                                 &clap_id,
                                 self.settings.sample_rate as f64,
-                                self.settings.buffer_size as u32,
+                                self.settings.buffer_size,
                                 channels,
                                 channels.min(MAX_CLAP_OUTPUT_CHANNELS),
                             )
@@ -900,9 +893,10 @@ impl DawApp {
                             || response.dragged();
                         if changed {
                             if let Some(param_id) = ids.get(param_index).copied() {
-                                if let Some(state) = self.track_audio.get(track_index) {
+                                if let Some(state) = self.engine.track_audio.get(track_index) {
                                     if state.effect_hosts.get(fx_index).is_some() {
-                                        if let Ok(mut pending) = state.pending_param_changes.lock() {
+                                        {
+                                            let mut pending = state.pending_param_changes.lock();
                                             pending.push(PendingParamChange {
                                                 target: PendingParamTarget::Effect(fx_index),
                                                 param_id,
@@ -990,10 +984,10 @@ impl DawApp {
     }
 
     pub(crate) fn update_playhead(&mut self, ctx: &egui::Context) {
-        self.tempo_bits.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
+        self.engine.tempo_bpm.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         let now = ctx.input(|i| i.time);
         if self.audio_running {
-            let samples = self.transport_samples.load(Ordering::Relaxed) as f32;
+            let samples = self.engine.transport_samples.load(Ordering::Relaxed) as f32;
             let sample_rate = self.settings.sample_rate.max(1) as f32;
             let seconds = samples / sample_rate;
             if self.arrangement_playback_enabled() {
@@ -1018,13 +1012,13 @@ impl DawApp {
             if end > start {
                 let start_samples = self.beats_to_samples(start, self.settings.sample_rate);
                 let end_samples = self.beats_to_samples(end, self.settings.sample_rate);
-                self.loop_start_samples.store(start_samples, Ordering::Relaxed);
-                self.loop_end_samples.store(end_samples.max(start_samples + 1), Ordering::Relaxed);
+                self.engine.loop_start_samples.store(start_samples, Ordering::Relaxed);
+                self.engine.loop_end_samples.store(end_samples.max(start_samples + 1), Ordering::Relaxed);
                 return;
             }
         }
-        self.loop_start_samples.store(0, Ordering::Relaxed);
-        self.loop_end_samples.store(0, Ordering::Relaxed);
+        self.engine.loop_start_samples.store(0, Ordering::Relaxed);
+        self.engine.loop_end_samples.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn seek_playhead(&mut self, beats: f32) {
@@ -1033,7 +1027,7 @@ impl DawApp {
         let tempo = self.tempo_bpm.max(1.0);
         let seconds = beats * 60.0 / tempo;
         let samples = (seconds * self.settings.sample_rate as f32).max(0.0) as u64;
-        self.transport_samples.store(samples, Ordering::Relaxed);
+        self.engine.transport_samples.store(samples, Ordering::Relaxed);
         self.last_frame_time = None;
     }
 

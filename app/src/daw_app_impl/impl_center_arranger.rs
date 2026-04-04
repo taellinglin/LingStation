@@ -231,9 +231,9 @@ impl DawApp {
                 if row_index < 0 {
                     return None;
                 }
-                rows.get(row_index as usize).and_then(|row| match *row {
-                    ArrangerRow::Track { track_index } => Some(track_index),
-                    ArrangerRow::Automation { track_index, .. } => Some(track_index),
+                rows.get(row_index as usize).map(|row| match *row {
+                    ArrangerRow::Track { track_index } => track_index,
+                    ArrangerRow::Automation { track_index, .. } => track_index,
                 })
             };
             let painter = ui.painter_at(rect);
@@ -854,11 +854,11 @@ impl DawApp {
                             }
                             let clip_header_clicked = header_left_resp
                                 .as_ref()
-                                .map_or(false, |resp| resp.clicked())
+                                .is_some_and(|resp| resp.clicked())
                                 || header_right_resp
                                     .as_ref()
-                                    .map_or(false, |resp| resp.clicked());
-                            if header_label_resp.as_ref().map_or(false, |resp| resp.clicked()) && selected {
+                                    .is_some_and(|resp| resp.clicked());
+                            if header_label_resp.as_ref().is_some_and(|resp| resp.clicked()) && selected {
                                 pending_clip_rename = Some((track_index, clip.id));
                             }
                             if !header_clicked
@@ -939,8 +939,8 @@ impl DawApp {
                                         group = Some(group_items);
                                         copy_mode = true;
                                     }
-                                    if shift_copy && kind == ClipDragKind::Move {
-                                        if group.is_none() {
+                                    if shift_copy && kind == ClipDragKind::Move
+                                        && group.is_none() {
                                             let new_id = this.next_clip_id();
                                             let link_id = this.ensure_clip_link_id(track_index, clip.id);
                                             if let Some(track) = this.tracks.get_mut(track_index) {
@@ -957,7 +957,6 @@ impl DawApp {
                                                 this.push_undo_state();
                                             }
                                         }
-                                    }
                                     pending_drag_start = Some(ClipDragState {
                                         clip_id,
                                         source_track: track_index,
@@ -1058,8 +1057,8 @@ impl DawApp {
                                     self.clone_clips_by_ids(&clone_ids);
                                     ui.close_menu();
                                 }
-                                if clip.link_id.is_some() {
-                                    if ui
+                                if clip.link_id.is_some()
+                                    && ui
                                         .add(egui::Button::image_and_text(
                                             egui::Image::new(egui::include_image!("../../../assets/icons/link-2.svg"))
                                                 .fit_to_exact_size(egui::vec2(12.0, 12.0))
@@ -1071,7 +1070,6 @@ impl DawApp {
                                         self.make_clip_unique(track_index, clip.id);
                                         ui.close_menu();
                                     }
-                                }
                                 let can_merge = self.can_merge_selected_clips()
                                     && self.selected_clips.contains(&clip.id);
                                 if ui
@@ -1191,14 +1189,13 @@ impl DawApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 let in_grid = grid_clip.contains(pos);
                 let select_mode = self.arranger_tool == ArrangerTool::Select || box_select_active;
-                if select_mode && in_grid && !over_clip {
-                    if response.drag_started() {
+                if select_mode && in_grid && !over_clip
+                    && response.drag_started() {
                         self.arranger_select_start = Some(pos);
                         self.arranger_select_add = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
                     }
-                }
-                if self.arranger_tool == ArrangerTool::Draw && in_grid && !over_clip {
-                    if response.drag_started() {
+                if self.arranger_tool == ArrangerTool::Draw && in_grid && !over_clip
+                    && response.drag_started() {
                         let target_track = track_for_pos(pos)
                             .unwrap_or(0)
                             .min(self.tracks.len().saturating_sub(1));
@@ -1206,10 +1203,9 @@ impl DawApp {
                         self.arranger_draw = Some(ArrangerDrawState {
                             track_index: target_track,
                             start_beats,
-                            start_pos: pos,
+                            start_pos: [pos.x, pos.y],
                         });
                     }
-                }
                 if self.arranger_tool == ArrangerTool::Slice && in_grid {
                     let free_snap = ctx.input(|i| i.modifiers.shift);
                     let beat = self.arranger_slice_beat((pos.x - row_left) / beat_width, free_snap);
@@ -1691,12 +1687,17 @@ impl DawApp {
                     let label_response =
                         ui.interact(label_click_rect, label_id, egui::Sense::click_and_drag());
                     if label_response.clicked()
-                        && !toggle_response.as_ref().map_or(false, |resp| resp.clicked())
+                        && !toggle_response.as_ref().is_some_and(|resp| resp.clicked())
                     {
                         pending_track_select = Some(track_index);
                     }
                     if label_response.drag_started() {
-                        self.track_drag = Some(TrackDragState { source_index: track_index });
+                        self.track_drag = Some(TrackDragState {
+                            track_index,
+                            origin_index: track_index,
+                            offset_y: 0.0,
+                            source_index: track_index,
+                        });
                     }
                     if label_response.drag_stopped() {
                         if let Some(drag) = self.track_drag.take() {
@@ -1771,6 +1772,7 @@ impl DawApp {
                 );
                 shelf_painter.rect_filled(meter_rect, 3.0, egui::Color32::from_rgb(16, 20, 24));
                 let peak = self
+                    .engine
                     .track_audio
                     .get(track_index)
                     .map(|s| f32::from_bits(s.peak_bits.load(Ordering::Relaxed)))
@@ -1809,10 +1811,9 @@ impl DawApp {
                             lane.points.push(AutomationPoint { beat, value });
                         }
                         lane.points.sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
-                        if let Some(state) = self.track_audio.get(track_index) {
-                            if let Ok(mut lanes) = state.automation_lanes.lock() {
-                                *lanes = track.automation_lanes.clone();
-                            }
+                        if let Some(state) = self.engine.track_audio.get(track_index) {
+                            let mut lanes = state.automation_lanes.lock();
+                            *lanes = track.automation_lanes.clone();
                         }
                     }
                 }

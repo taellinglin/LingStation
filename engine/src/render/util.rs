@@ -1,4 +1,7 @@
-pub(crate) fn collect_block_events(
+use crate::hosts::vst3;
+use crate::models::*;
+
+pub fn collect_block_events(
     notes: &[PianoRollNote],
     block_start: u64,
     block_end: u64,
@@ -7,14 +10,19 @@ pub(crate) fn collect_block_events(
     let mut events = Vec::new();
     for note in notes {
         let start_sample = (note.start_beats as f64 * samples_per_beat).round() as u64;
-        let mut end_sample = ((note.start_beats + note.length_beats) as f64 * samples_per_beat)
-            .round() as u64;
+        let mut end_sample =
+            ((note.start_beats + note.length_beats) as f64 * samples_per_beat).round() as u64;
         if end_sample <= start_sample {
             end_sample = start_sample.saturating_add(1);
         }
         if start_sample >= block_start && start_sample < block_end {
             let offset = (start_sample - block_start) as i32;
-            events.push(vst3::MidiEvent::note_on_at(0, note.midi_note, note.velocity, offset));
+            events.push(vst3::MidiEvent::note_on_at(
+                0,
+                note.midi_note,
+                note.velocity,
+                offset,
+            ));
         }
         if end_sample >= block_start && end_sample < block_end {
             let offset = (end_sample - block_start) as i32;
@@ -24,6 +32,7 @@ pub(crate) fn collect_block_events(
     events
 }
 
+#[allow(dead_code)]
 pub(crate) fn collect_block_events_into(
     notes: &[PianoRollNote],
     block_start: u64,
@@ -41,7 +50,12 @@ pub(crate) fn collect_block_events_into(
         }
         if start_sample >= block_start && start_sample < block_end {
             let offset = (start_sample - block_start) as i32;
-            out.push(vst3::MidiEvent::note_on_at(0, note.midi_note, note.velocity, offset));
+            out.push(vst3::MidiEvent::note_on_at(
+                0,
+                note.midi_note,
+                note.velocity,
+                offset,
+            ));
         }
         if end_sample >= block_start && end_sample < block_end {
             let offset = (end_sample - block_start) as i32;
@@ -50,11 +64,11 @@ pub(crate) fn collect_block_events_into(
     }
 }
 
-pub(crate) fn db_to_gain(db: f32) -> f32 {
+pub fn db_to_gain(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
-pub(crate) fn apply_master_processing(
+pub fn apply_master_processing(
     samples: &mut [f32],
     channels: usize,
     sample_rate: f32,
@@ -104,27 +118,34 @@ pub(crate) fn apply_master_processing(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RenderFormat {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RenderFormat {
     Wav,
     Ogg,
     Flac,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RenderWavBitDepth {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RenderWavBitDepth {
     Int16,
     Int24,
     Int32,
     Float32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RenderTailMode {
+    Cut,
+    Release,
+    Wrap,
+}
+
 impl RenderWavBitDepth {
-    pub(crate) fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 4] {
         [Self::Int16, Self::Int24, Self::Int32, Self::Float32]
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Int16 => "16-bit",
             Self::Int24 => "24-bit",
@@ -133,7 +154,7 @@ impl RenderWavBitDepth {
         }
     }
 
-    pub(crate) fn bits_per_sample(self) -> u16 {
+    pub fn bits_per_sample(self) -> u16 {
         match self {
             Self::Int16 => 16,
             Self::Int24 => 24,
@@ -142,7 +163,7 @@ impl RenderWavBitDepth {
         }
     }
 
-    pub(crate) fn sample_format(self) -> hound::SampleFormat {
+    pub fn sample_format(self) -> hound::SampleFormat {
         match self {
             Self::Float32 => hound::SampleFormat::Float,
             _ => hound::SampleFormat::Int,
@@ -150,7 +171,7 @@ impl RenderWavBitDepth {
     }
 }
 
-pub(crate) fn default_midi_params() -> Vec<String> {
+pub fn default_midi_params() -> Vec<String> {
     vec![
         "CC1 Modwheel".to_string(),
         "CC7 Volume".to_string(),
@@ -160,7 +181,7 @@ pub(crate) fn default_midi_params() -> Vec<String> {
     ]
 }
 
-pub(crate) fn gm_program_name(program: u8) -> &'static str {
+pub fn gm_program_name(program: u8) -> &'static str {
     const GM_NAMES: [&str; 128] = [
         "Acoustic Grand Piano",
         "Bright Acoustic Piano",
@@ -294,7 +315,7 @@ pub(crate) fn gm_program_name(program: u8) -> &'static str {
     GM_NAMES[program.min(127) as usize]
 }
 
-pub(crate) fn gm_drum_kit_name(program: u8) -> Option<&'static str> {
+pub fn gm_drum_kit_name(program: u8) -> Option<&'static str> {
     match program {
         0 => Some("Standard Kit"),
         8 => Some("Room Kit"),
@@ -309,7 +330,7 @@ pub(crate) fn gm_drum_kit_name(program: u8) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn default_instrument_params() -> Vec<String> {
+pub fn default_instrument_params() -> Vec<String> {
     vec![
         "Gain".to_string(),
         "Cutoff".to_string(),

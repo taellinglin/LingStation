@@ -30,16 +30,22 @@ pub fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
-    eframe::run_native("LingStation", options, Box::new(|cc| {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-        configure_fonts(&cc.egui_ctx);
-        Box::new(DawApp::default())
-    }))
+    eframe::run_native(
+        "LingStation",
+        options,
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            configure_fonts(&cc.egui_ctx);
+            Box::new(DawApp::default())
+        }),
+    )
 }
 
 fn run_cli_render(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
-        return Err("Usage: LingStation render <project_folder> <output_folder> [wav|ogg|flac]".to_string());
+        return Err(
+            "Usage: LingStation render <project_folder> <output_folder> [wav|ogg|flac]".to_string(),
+        );
     }
     let project_folder = PathBuf::from(args[0].trim());
     let output_folder = PathBuf::from(args[1].trim());
@@ -63,7 +69,7 @@ fn run_cli_render(args: &[String]) -> Result<(), String> {
 fn init_windows_com() {
     #[cfg(windows)]
     {
-        crate::vst3::init_windows_com_for_thread();
+        engine::hosts::vst3::init_windows_com_for_thread();
     }
 }
 
@@ -113,10 +119,9 @@ fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     // フォントファイルを読み込む
     if let Ok(font_bytes) = std::fs::read("./assets/font.ttf") {
-        fonts.font_data.insert(
-            "custom_font".to_owned(),
-            FontData::from_owned(font_bytes),
-        );
+        fonts
+            .font_data
+            .insert("custom_font".to_owned(), FontData::from_owned(font_bytes));
         // プロポーショナル/モノスペース両方に割り当て
         fonts
             .families
@@ -175,4 +180,3 @@ fn install_crash_logger() {
         default_hook(info);
     }));
 }
-

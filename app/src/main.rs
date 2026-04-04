@@ -1,301 +1,58 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use eframe::egui;
-use engine::midi::{export_midi, import_midi_channels, import_midi_tracks, MidiTrackData};
-use engine::timeline::PianoRollNote;
-use image::GenericImageView;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE;
 use base64::Engine;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
+use eframe::egui;
+use image::GenericImageView;
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput};
 use rand::RngCore;
 use reqwest::blocking::Client;
 use rodio::{Decoder, OutputStream, Sink, Source};
 use rustfft::{num_complex::Complex, FftPlanner};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::f32::consts::TAU;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::{self, Receiver, Sender},
     Arc, Mutex,
 };
 use std::thread;
 
-mod clap_host;
-mod node_editor;
-mod performance;
-mod vst3;
-mod entry;
-mod models;
-mod audio;
-mod render;
 mod daw_app;
 mod daw_app_impl;
-mod error;
-
+mod entry;
 use daw_app::DawApp;
-use models::{
-    default_performance_launch_quantize_beats, performance_scene_matches, AudioStretchMode, Clip,
-    GmCategory, GmParamValues, MidiDeviceConfig, MidiDeviceProfile, PluginCandidate,
-    PluginCategory, PluginKind, PluginTarget, PluginUiTarget, ProjectAction, ProjectState,
-    SettingsState, Track, TreeSynthMode, TreeSynthSample, TreeSynthState, Vst3PresetFile,
+use engine::audio::*;
+use engine::models::{
+    default_performance_launch_quantize_beats, ArrangerTool, AudioStretchMode, Clip, MainTab,
+    NodeRouteKind, PianoLaneMode, PianoRollNote, PianoTool, RenderFormat, RenderTailMode,
+    RenderWavBitDepth, SettingsState, SettingsTab, SidebarTab, Track, TrackMixState,
 };
-use audio::*;
-use render::*;
+use engine::node_editor::TrackNodeActivity;
+use engine::render::*;
 
-use node_editor::{
-    default_sidechain_amount, default_sidechain_attack_ms, default_sidechain_release_ms,
-    default_sidechain_threshold_db, NodeRouteKind, NodeRouteLink, TrackNodeActivity,
-};
-use performance::{
-    collect_performance_block_events_into,
-    performance_audio_clip_for_block,
-    performance_length_samples, PerformanceClipSettings, PerformanceRuntimeClip,
-    PerformanceTriggerMode,
-};
-
-const BASE_UI_FONT_SIZE: f32 = 12.0;
-const LICENSE_API_BASE: &str = "https://linglin.art";
-const LICENSE_PUBLIC_KEY_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJQEieMJP2VOEI8yM7BOpelBIUvC2AOUDm85k0OjtYNT";
-const LICENSE_PRODUCT_CODE: &str = "LingStation";
-const AUDIO_CLIP_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
-const AUDIO_CLIP_CACHE_MAX_ENTRIES: usize = 256;
-const WAVEFORM_CACHE_MAX_ENTRIES: usize = 256;
-const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
-const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
-const TREESYNTH_MAX_VOICES: usize = 64;
-const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 16;
-const MAX_CLAP_OUTPUT_CHANNELS: usize = 16;
-static PLUGIN_PROCESS_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) const BASE_UI_FONT_SIZE: f32 = 12.0;
+pub(crate) const LICENSE_API_BASE: &str = "https://linglin.art";
+pub(crate) const LICENSE_PUBLIC_KEY_B64: &str =
+    "MC4CAQAwBQYDK2VwBCIEIJQEieMJP2VOEI8yM7BOpelBIUvC2AOUDm85k0OjtYNT";
+pub(crate) const LICENSE_PRODUCT_CODE: &str = "LingStation";
+pub(crate) const WAVEFORM_CACHE_MAX_ENTRIES: usize = 256;
+pub(crate) const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
+pub(crate) const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
+pub(crate) const MAX_CLAP_OUTPUT_CHANNELS: usize = 16;
 
 fn main() -> eframe::Result<()> {
     entry::main()
 }
 
-#[allow(dead_code)]
-struct ClipDragState {
-    clip_id: usize,
-    source_track: usize,
-    origin_track: usize,
-    offset_beats: f32,
-    start_beats: f32,
-    length_beats: f32,
-    origin_start_beats: f32,
-    origin_length_beats: f32,
-    audio_offset_beats: f32,
-    audio_source_beats: Option<f32>,
-    kind: ClipDragKind,
-    undo_pushed: bool,
-    grabbed: bool,
-    copy_mode: bool,
-    group: Option<Vec<ClipDragGroupItem>>,
-}
-
-#[allow(dead_code)]
-struct ClipDragGroupItem {
-    clip_id: usize,
-    source_track: usize,
-    start_beats: f32,
-    length_beats: f32,
-    is_midi: bool,
-}
-
-struct TrackDragState {
-    source_index: usize,
-}
-
-struct MidiImportState {
-    path: String,
-    tracks: Vec<MidiTrackData>,
-    enabled: Vec<bool>,
-    apply_program: Vec<bool>,
-    instrument_plugin: String,
-    percussion_plugin: String,
-    import_portamento: bool,
-    mode: MidiImportMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ArrangerTool {
-    Draw,
-    Select,
-    Move,
-    Slice,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutoSliceMode {
-    Smart,
-    Bar,
-    Phrase,
-}
-
-impl AutoSliceMode {
-    fn label(self) -> &'static str {
-        match self {
-            AutoSliceMode::Smart => "Smart Sections",
-            AutoSliceMode::Bar => "By Bar",
-            AutoSliceMode::Phrase => "By Phrase",
-        }
-    }
-
-    fn interval_beats(self) -> f32 {
-        match self {
-            AutoSliceMode::Smart => 16.0,
-            AutoSliceMode::Bar => 4.0,
-            AutoSliceMode::Phrase => 16.0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct PerformanceSectionAnalysis {
-    start_beats: f32,
-    length_beats: f32,
-    loop_unit_beats: Option<f32>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct AutoPerformanceBuildSummary {
-    sections: usize,
-    slices_created: usize,
-    configured_clips: usize,
-    loop_clips: usize,
-}
-
-impl AutoPerformanceBuildSummary {
-    fn changed(&self) -> bool {
-        self.slices_created > 0 || self.configured_clips > 0
-    }
-
-    fn status_message(&self) -> String {
-        format!(
-            "Smart performance layout built {} section(s), created {} slice(s), configured {} clip(s), and enabled {} loop pad(s)",
-            self.sections,
-            self.slices_created,
-            self.configured_clips,
-            self.loop_clips,
-        )
-    }
-}
-
-#[allow(dead_code)]
-struct ArrangerDrawState {
-    track_index: usize,
-    start_beats: f32,
-    start_pos: egui::Pos2,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ArrangerSliceDragState {
-    beat: f32,
-    start_track: usize,
-    end_track: usize,
-    free_snap: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PianoDragKind {
-    Move,
-    Resize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PianoTool {
-    Pencil,
-    Select,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PianoLaneMode {
-    Velocity,
-    Pan,
-    Cutoff,
-    Resonance,
-    MidiCc,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MainTab {
-    Arranger,
-    Parameters,
-    PianoRoll,
-    NodeEditor,
-    Performance,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsTab {
-    General,
-    Audio,
-    Midi,
-    Devices,
-    Theme,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SidebarTab {
-    Project,
-    Browser,
-}
-
-struct PianoDragState {
-    track_index: usize,
-    note_index: usize,
-    kind: PianoDragKind,
-    offset_beats: f32,
-    start_beats: f32,
-    start_length: f32,
-    start_pitch: u8,
-    start_pos_y: f32,
-    selected_notes: Vec<(usize, f32, u8, f32)>,
-}
-
-struct PianoScaleDragState {
-    track_index: usize,
-    anchor_start: f32,
-    anchor_end: f32,
-    selected_notes: Vec<(usize, f32, u8, f32)>,
-}
-
-struct PianoZoomDragState {
-    start_pos: egui::Pos2,
-    start_zoom_x: f32,
-    start_zoom_y: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FsSource {
-    Project,
-    Browser,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FsDragKind {
-    Audio,
-    Midi,
-}
-
-struct FsDragState {
-    path: PathBuf,
-    kind: FsDragKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum MidiImportMode {
-    ReplaceProject,
-    AppendTracks { start_beats: f32 },
-}
-
 impl Default for DawApp {
     fn default() -> Self {
-        let clips = vec![
+        let clips = [
             Clip {
                 id: 1,
                 track: 0,
@@ -480,7 +237,7 @@ impl Default for DawApp {
         let tracks = vec![
             Track {
                 name: "FishSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 0).collect(),
+                clips: clips.iter().filter(|&c| c.track == 0).cloned().collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
@@ -506,7 +263,7 @@ impl Default for DawApp {
             },
             Track {
                 name: "CatSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 1).collect(),
+                clips: clips.iter().filter(|&c| c.track == 1).cloned().collect(),
                 level: 0.7,
                 muted: false,
                 solo: false,
@@ -532,7 +289,7 @@ impl Default for DawApp {
             },
             Track {
                 name: "SannySynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 2).collect(),
+                clips: clips.iter().filter(|&c| c.track == 2).cloned().collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
@@ -558,7 +315,7 @@ impl Default for DawApp {
             },
             Track {
                 name: "DogSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 3).collect(),
+                clips: clips.iter().filter(|&c| c.track == 3).cloned().collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
@@ -584,7 +341,7 @@ impl Default for DawApp {
             },
             Track {
                 name: "LingSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 4).collect(),
+                clips: clips.iter().filter(|&c| c.track == 4).cloned().collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
@@ -610,7 +367,7 @@ impl Default for DawApp {
             },
             Track {
                 name: "MiceSynth".to_string(),
-                clips: clips.iter().cloned().filter(|c| c.track == 5).collect(),
+                clips: clips.iter().filter(|&c| c.track == 5).cloned().collect(),
                 level: 0.8,
                 muted: false,
                 solo: false,
@@ -636,25 +393,36 @@ impl Default for DawApp {
             },
         ];
 
-        let track_audio: Vec<TrackAudioState> = tracks
-            .iter()
-            .map(TrackAudioState::from_track)
-            .collect();
+        let track_audio: Vec<TrackAudioState> =
+            tracks.iter().map(TrackAudioState::from_track).collect();
         let track_mix_states: Vec<TrackMixState> = tracks
             .iter()
             .map(|track| TrackMixState {
                 muted: track.muted,
                 solo: track.solo,
                 level: track.level,
+                active: true,
             })
             .collect();
-        let node_activity_states: Vec<TrackNodeActivity> =
-            tracks.iter().map(|_| TrackNodeActivity::default()).collect();
-        let selected_track_index = Some(0);
+        let node_activity_states: Vec<TrackNodeActivity> = tracks
+            .iter()
+            .map(|_| TrackNodeActivity::default())
+            .collect();
         let initial_selected_clip = Some(1);
 
+        let mut engine = AudioEngine::new(44100.0, 512);
+        engine.track_audio = track_audio;
+        *engine.track_mix.lock() = track_mix_states;
+        *engine.node_activity.lock() = node_activity_states;
+        engine.selected_track_index.store(0, Ordering::Relaxed);
+        engine
+            .tempo_bpm
+            .store(120.0f32.to_bits(), Ordering::Relaxed);
+        engine
+            .midi_freq_bits
+            .store(440.0f32.to_bits(), Ordering::Relaxed);
+
         let mut app = Self {
-            node_activity_rt: Arc::new(Mutex::new(node_activity_states)),
             project_name: "LingStation Demo".to_string(),
             project_path: String::new(),
             metadata_artist: String::new(),
@@ -674,23 +442,9 @@ impl Default for DawApp {
             audio_stream: None,
             midi_conns: Vec::new(),
             audio_stop: Arc::new(AtomicBool::new(false)),
-            audio_callback_active: Arc::new(AtomicUsize::new(0)),
-            playback_panic: Arc::new(AtomicBool::new(false)),
-            playback_fade_in: Arc::new(AtomicBool::new(false)),
-            midi_freq_bits: Arc::new(AtomicU32::new(440.0f32.to_bits())),
-            midi_gate: Arc::new(AtomicBool::new(false)),
-            tempo_bits: Arc::new(AtomicU32::new(120.0f32.to_bits())),
-            transport_samples: Arc::new(AtomicU64::new(0)),
-            master_peak_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             master_peak_display: 0.0,
-            master_settings: Arc::new(Mutex::new(MasterCompSettings::default())),
-            master_comp_state: Arc::new(Mutex::new(MasterCompState::default())),
             last_output_channels: 2,
-            track_audio,
-            track_mix: Arc::new(Mutex::new(track_mix_states)),
-            selected_track_index: Arc::new(AtomicUsize::new(
-                selected_track_index.unwrap_or(usize::MAX),
-            )),
+            engine,
             midi_learn: Arc::new(Mutex::new(None)),
             rename_buffer: String::new(),
             rename_clip_buffer: String::new(),
@@ -767,24 +521,6 @@ impl Default for DawApp {
             record_performance: false,
             is_recording: false,
             record_started_audio: false,
-            recording: Arc::new(Mutex::new(RecordingBuffers {
-                active: false,
-                track_index: 0,
-                start_samples: 0,
-                start_beats: 0.0,
-                record_audio: false,
-                record_midi: false,
-                record_automation: false,
-                record_performance: false,
-                audio_samples: Vec::new(),
-                audio_channels: 0,
-                audio_sample_rate: 0,
-                midi_active: HashMap::new(),
-                midi_notes: Vec::new(),
-                automation_points: Vec::new(),
-                performance_active: HashMap::new(),
-                performance_takes: Vec::new(),
-            })),
             audio_input_stream: None,
             plugin_candidates: Vec::new(),
             plugin_search: String::new(),
@@ -807,11 +543,6 @@ impl Default for DawApp {
             waveform_cache_order: RefCell::new(VecDeque::new()),
             waveform_color_cache_order: RefCell::new(VecDeque::new()),
             waveform_len_seconds_cache_order: RefCell::new(VecDeque::new()),
-            audio_clip_cache: Arc::new(Mutex::new(AudioClipCache::new(
-                AUDIO_CLIP_CACHE_MAX_BYTES,
-                AUDIO_CLIP_CACHE_MAX_ENTRIES,
-            ))),
-            audio_clip_timeline: Arc::new(Mutex::new(Vec::new())),
             analysis_sender: None,
             analysis_receiver: None,
             analysis_pending: HashSet::new(),
@@ -819,7 +550,6 @@ impl Default for DawApp {
             audio_preview_sink: None,
             audio_preview_loop: false,
             audio_preview_clip_id: None,
-            audio_stats: Arc::new(AudioRuntimeStats::new()),
             ui_frame_last_ms: 0.0,
             ui_frame_max_ms: 0.0,
             ui_arranger_last_ms: 0.0,
@@ -868,13 +598,10 @@ impl Default for DawApp {
             fs_drag: None,
             loop_start_beats: None,
             loop_end_beats: None,
-            loop_start_samples: Arc::new(AtomicU64::new(0)),
-            loop_end_samples: Arc::new(AtomicU64::new(0)),
             orphaned_hosts: Vec::new(),
             automation_active: None,
             automation_rows_expanded: HashSet::new(),
             node_routes: Vec::new(),
-            node_routes_rt: Arc::new(Mutex::new(Vec::new())),
             node_route_kind: NodeRouteKind::AudioSend,
             node_route_from_track: 0,
             node_route_source_output_pair: 0,
@@ -886,8 +613,6 @@ impl Default for DawApp {
             performance_clip_settings: HashMap::new(),
             performance_launch_quantize_beats: default_performance_launch_quantize_beats(),
             performance_selected_clip: None,
-            performance_runtime: Arc::new(Mutex::new(Vec::new())),
-            arrangement_playback_enabled: Arc::new(AtomicBool::new(false)),
             gm_presets_generated: false,
         };
         app.load_settings_or_default();
@@ -902,7 +627,6 @@ impl Default for DawApp {
     }
 }
 
-
 #[cfg(windows)]
 fn create_plugin_child_window(parent: isize) -> Option<isize> {
     use std::ffi::OsStr;
@@ -910,8 +634,8 @@ fn create_plugin_child_window(parent: isize) -> Option<isize> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassExW, WNDCLASSEXW, CS_HREDRAW, CS_OWNDC,
-        CS_VREDRAW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, RegisterClassExW, CS_HREDRAW, CS_OWNDC, CS_VREDRAW,
+        WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
     };
 
     let class_name: Vec<u16> = OsStr::new("LingStationPluginChild")
@@ -973,9 +697,9 @@ fn create_plugin_top_window(width: i32, height: i32) -> Option<isize> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, RegisterClassExW, ShowWindow, WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW,
-        CS_OWNDC, SW_SHOW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
-        WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CreateWindowExW, RegisterClassExW, ShowWindow, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, SW_SHOW,
+        WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CONTROLPARENT,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     let class_name: Vec<u16> = OsStr::new("LingStationPluginHost")
@@ -1070,9 +794,7 @@ fn create_plugin_child_window(_parent: isize) -> Option<isize> {
 
 #[cfg(windows)]
 fn move_plugin_child_window(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
     unsafe {
         SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
@@ -1128,9 +850,7 @@ fn destroy_plugin_child_window(_hwnd: isize) {}
 
 #[cfg(windows)]
 fn bring_window_to_front(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SW_SHOW,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -1213,7 +933,7 @@ fn get_plugin_close_flag(_hwnd: isize) -> Option<&'static AtomicBool> {
 #[cfg(windows)]
 fn pump_plugin_messages(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE, MSG,
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
     if hwnd == 0 {
         return;
@@ -1255,14 +975,16 @@ fn client_window_size(hwnd: isize) -> Option<(i32, i32)> {
     if ok == 0 {
         return None;
     }
-    Some(((rect.right - rect.left).max(0), (rect.bottom - rect.top).max(0)))
+    Some((
+        (rect.right - rect.left).max(0),
+        (rect.bottom - rect.top).max(0),
+    ))
 }
 
 #[cfg(not(windows))]
 fn client_window_size(_hwnd: isize) -> Option<(i32, i32)> {
     None
 }
-
 
 #[cfg(windows)]
 fn is_window_alive(hwnd: isize) -> bool {
@@ -1285,8 +1007,6 @@ fn is_window_visible(hwnd: isize) -> bool {
 fn is_window_visible(_hwnd: isize) -> bool {
     false
 }
-
-
 
 #[cfg(test)]
 mod tests {

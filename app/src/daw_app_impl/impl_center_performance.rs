@@ -34,18 +34,14 @@ impl DawApp {
             let mut stop_track_action: Option<usize> = None;
             let mut performance_status: Option<String> = None;
             let mut trigger_action: Option<(usize, usize, PerformanceClipSettings, String)> = None;
-            let runtime_snapshot = self
-                .performance_runtime
-                .lock()
-                .ok()
-                .map(|runtime| runtime.clone())
-                .unwrap_or_default();
-            let current_transport_samples = self.transport_samples.load(Ordering::Relaxed);
+            let runtime_snapshot = self.engine.performance_runtime.lock().clone();
+            let current_transport_samples = self.engine.transport_samples.load(Ordering::Relaxed);
             let clock_beat = self.current_transport_beat();
             let animation_t = ctx.input(|i| i.time) as f32;
             let pulse_fast = 0.45 + 0.55 * ((animation_t * 7.0).sin() * 0.5 + 0.5);
             let pulse_slow = 0.55 + 0.45 * ((animation_t * 2.6).sin() * 0.5 + 0.5);
             let track_strip_peaks: Vec<f32> = self
+                .engine
                 .track_audio
                 .iter()
                 .map(|state| f32::from_bits(state.peak_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0))
@@ -122,10 +118,10 @@ impl DawApp {
             let mut x = max_rect.left() + 40.0;
             let mut col_index = 0usize;
             while x < max_rect.right() {
-                let color = if col_index % 4 == 0 { grid_major } else { grid_minor };
+                let color = if col_index.is_multiple_of(4) { grid_major } else { grid_minor };
                 painter.line_segment(
                     [egui::pos2(x, max_rect.top() + 18.0), egui::pos2(x, max_rect.bottom())],
-                    egui::Stroke::new(if col_index % 4 == 0 { 1.0 } else { 0.5 }, color),
+                    egui::Stroke::new(if col_index.is_multiple_of(4) { 1.0 } else { 0.5 }, color),
                 );
                 x += col_step;
                 col_index += 1;

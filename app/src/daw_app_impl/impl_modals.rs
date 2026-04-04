@@ -459,8 +459,8 @@ impl DawApp {
                                 track.effect_param_ids.push(Vec::new());
                                 track.effect_param_values.push(Vec::new());
                             }
-                            if let Some(state) = self.track_audio.get_mut(index) {
-                                for host in state.effect_hosts.drain(..) {
+                            if let Some(state) = self.engine.track_audio.get_mut(index) {
+                                for mut host in state.effect_hosts.drain(..) {
                                     host.prepare_for_drop();
                                     self.orphaned_hosts.push(host);
                                 }

@@ -609,7 +609,10 @@ impl DawApp {
                 ui.checkbox(&mut self.record_performance, "Performance");
                 ui.separator();
                 ui.label("Tempo");
-                ui.add(egui::DragValue::new(&mut self.tempo_bpm).speed(1.0));
+                let mut tempo = f32::from_bits(self.engine.tempo_bpm.load(Ordering::Relaxed));
+                if ui.add(egui::DragValue::new(&mut tempo).speed(1.0)).changed() {
+                    self.engine.tempo_bpm.store(tempo.to_bits(), Ordering::Relaxed);
+                }
                 ui.separator();
                 ui.label(&self.status);
                 if self.show_hitboxes {
@@ -638,7 +641,7 @@ impl DawApp {
                             }
                         }
                     }
-                    let (blocks, overruns, last_ms, max_ms) = self.audio_stats.snapshot();
+                    let (blocks, overruns, last_ms, max_ms) = self.engine.stats.snapshot();
                     ui.label(format!(
                         "Audio blocks {blocks} | overruns {overruns} | last {last_ms:.2} ms | max {max_ms:.2} ms"
                     ));
@@ -654,11 +657,12 @@ impl DawApp {
                             self.ui_arranger_max_ms
                         ));
                     }
-                    if let Ok(cache) = self.audio_clip_cache.lock() {
-                        let mb = cache.size_bytes() as f32 / (1024.0 * 1024.0);
+                    {
+                        let cache = self.engine.audio_cache.lock();
+                        let mb = cache.bytes as f32 / (1024.0 * 1024.0);
                         ui.label(format!(
                             "Clip cache: {} items | {:.1} MB",
-                            cache.len(),
+                            cache.entries.len(),
                             mb
                         ));
                     }
@@ -686,7 +690,7 @@ impl DawApp {
                 }
             });
 
-            let raw_peak = f32::from_bits(self.master_peak_bits.load(Ordering::Relaxed));
+            let raw_peak = f32::from_bits(self.engine.master_peak_bits.load(Ordering::Relaxed));
             self.master_peak_display = (self.master_peak_display * 0.92).max(raw_peak);
             let meter_value = self.master_peak_display.clamp(0.0, 1.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -726,7 +730,7 @@ impl DawApp {
                         editor.set_focus(false);
                         eprintln!("UI close_requested: VST3 focus false");
                     }
-                    if let PluginUiEditor::Clap = &ui_host.editor {
+                    if let PluginUiEditor::Clap(_) = &ui_host.editor {
                         if let PluginHostHandle::Clap(host) = &ui_host.host {
                             if let Ok(mut host) = host.try_lock() {
                                 host.hide_gui();
@@ -762,7 +766,7 @@ impl DawApp {
                     editor.set_focus(false);
                     eprintln!("UI should_close_hidden: VST3 focus false");
                 }
-                if let PluginUiEditor::Clap = &ui_host.editor {
+                if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Ok(mut host) = host.try_lock() {
                             host.hide_gui();
@@ -860,7 +864,7 @@ impl DawApp {
                         editor.set_size(cw, ch);
                     }
                 }
-                PluginUiEditor::Clap => {
+                PluginUiEditor::Clap(_) => {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Ok(mut host) = host.try_lock() {
                             let request_hide = host.take_gui_request_hide();
@@ -941,7 +945,7 @@ impl DawApp {
                     editor.set_focus(false);
                     eprintln!("UI close_editor: VST3 focus false");
                 }
-                if let PluginUiEditor::Clap = &ui_host.editor {
+                if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Ok(mut host) = host.try_lock() {
                             host.hide_gui();
@@ -969,7 +973,7 @@ impl DawApp {
                     if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                         editor.set_focus(false);
                     }
-                    if let PluginUiEditor::Clap = &ui_host.editor {
+                    if let PluginUiEditor::Clap(_) = &ui_host.editor {
                         if let PluginHostHandle::Clap(host) = &ui_host.host {
                             if let Ok(mut host) = host.try_lock() {
                                 host.hide_gui();
@@ -1153,7 +1157,7 @@ impl DawApp {
                 self.plugin_ui = Some(PluginUiHost {
                     hwnd,
                     child_hwnd,
-                    editor: PluginUiEditor::Clap,
+                    editor: PluginUiEditor::Clap(clap_host.clone()),
                     host: host.clone(),
                     target,
                     close_requested,
@@ -1178,7 +1182,7 @@ impl DawApp {
                 editor.set_focus(false);
                 editor.removed();
             }
-            PluginUiEditor::Clap => {
+            PluginUiEditor::Clap(_) => {
                 if let PluginHostHandle::Clap(host) = &ui_host.host {
                     if let Ok(mut host) = host.try_lock() {
                         host.hide_gui();

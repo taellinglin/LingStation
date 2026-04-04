@@ -63,9 +63,7 @@ impl eframe::App for DawApp {
                 self.buffer_override = Some(base);
                 if self.audio_running {
                     self.adaptive_restart_pending = true;
-                    self.status = format!(
-                        "Audio buffer increase pending (stop to apply)"
-                    );
+                    self.status = "Audio buffer increase pending (stop to apply)".to_string();
                 } else {
                     self.adaptive_restart_pending = false;
                     self.status = format!("Audio buffer set to {effective} samples");

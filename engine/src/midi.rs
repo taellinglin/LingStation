@@ -1,4 +1,4 @@
-use crate::timeline::PianoRollNote;
+use crate::models::PianoRollNote;
 use midly::{MetaMessage, MidiMessage as MidlyMessage, Smf, Timing, TrackEventKind};
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +12,12 @@ pub struct MidiMessage {
 
 pub struct MidiEngine {
     pub queue: Vec<MidiMessage>,
+}
+
+impl Default for MidiEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MidiEngine {
@@ -101,11 +107,28 @@ pub fn export_midi(path: &str, notes: &[PianoRollNote], ticks_per_beat: u16) -> 
     let mut events: Vec<(u64, TrackEventKind)> = Vec::new();
     for note in notes {
         let start = (note.start_beats * tpq as f32).round().max(0.0) as u64;
-        let end = ((note.start_beats + note.length_beats) * tpq as f32).round().max(0.0) as u64;
+        let end = ((note.start_beats + note.length_beats) * tpq as f32)
+            .round()
+            .max(0.0) as u64;
         let key = midly::num::u7::from(note.midi_note.min(127));
         let vel = midly::num::u7::from(note.velocity.min(127));
-        events.push((start, TrackEventKind::Midi { channel: midly::num::u4::from(0), message: MidlyMessage::NoteOn { key, vel } }));
-        events.push((end, TrackEventKind::Midi { channel: midly::num::u4::from(0), message: MidlyMessage::NoteOff { key, vel: midly::num::u7::from(0) } }));
+        events.push((
+            start,
+            TrackEventKind::Midi {
+                channel: midly::num::u4::from(0),
+                message: MidlyMessage::NoteOn { key, vel },
+            },
+        ));
+        events.push((
+            end,
+            TrackEventKind::Midi {
+                channel: midly::num::u4::from(0),
+                message: MidlyMessage::NoteOff {
+                    key,
+                    vel: midly::num::u7::from(0),
+                },
+            },
+        ));
     }
 
     events.sort_by_key(|(t, _)| *t);
@@ -114,12 +137,21 @@ pub fn export_midi(path: &str, notes: &[PianoRollNote], ticks_per_beat: u16) -> 
     for (tick, kind) in events {
         let delta = tick.saturating_sub(last_tick) as u32;
         last_tick = tick;
-        track.push(midly::TrackEvent { delta: delta.into(), kind });
+        track.push(midly::TrackEvent {
+            delta: delta.into(),
+            kind,
+        });
     }
-    track.push(midly::TrackEvent { delta: 0.into(), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) });
+    track.push(midly::TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
 
     let smf = Smf {
-        header: midly::Header::new(midly::Format::SingleTrack, Timing::Metrical(ticks_per_beat.into())),
+        header: midly::Header::new(
+            midly::Format::SingleTrack,
+            Timing::Metrical(ticks_per_beat.into()),
+        ),
         tracks: vec![track],
     };
 
@@ -178,16 +210,13 @@ pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String>
                         if vel.as_int() == 0 {
                             if let Some((start, velocity)) = active.remove(&(ch, k)) {
                                 let length_ticks = abs_ticks.saturating_sub(start);
-                                channel_notes
-                                    .entry(ch)
-                                    .or_default()
-                                    .push(note_from_ticks(
-                                        start,
-                                        length_ticks,
-                                        k,
-                                        velocity,
-                                        ticks_per_beat,
-                                    ));
+                                channel_notes.entry(ch).or_default().push(note_from_ticks(
+                                    start,
+                                    length_ticks,
+                                    k,
+                                    velocity,
+                                    ticks_per_beat,
+                                ));
                             }
                         } else {
                             active.insert((ch, k), (abs_ticks, vel.as_int()));
@@ -197,16 +226,13 @@ pub fn import_midi_channels(path: &str) -> Result<Vec<MidiChannelNotes>, String>
                         let k = key.as_int();
                         if let Some((start, velocity)) = active.remove(&(ch, k)) {
                             let length_ticks = abs_ticks.saturating_sub(start);
-                            channel_notes
-                                .entry(ch)
-                                .or_default()
-                                .push(note_from_ticks(
-                                    start,
-                                    length_ticks,
-                                    k,
-                                    velocity,
-                                    ticks_per_beat,
-                                ));
+                            channel_notes.entry(ch).or_default().push(note_from_ticks(
+                                start,
+                                length_ticks,
+                                k,
+                                velocity,
+                                ticks_per_beat,
+                            ));
                         }
                     }
                     _ => {}
@@ -251,7 +277,9 @@ pub fn import_midi_tracks(path: &str) -> Result<Vec<MidiTrackData>, String> {
                     has_drums = true;
                 }
                 match message {
-                    MidlyMessage::ProgramChange { program: program_id } => {
+                    MidlyMessage::ProgramChange {
+                        program: program_id,
+                    } => {
                         program = Some(program_id.as_int());
                     }
                     MidlyMessage::Controller { controller, value } => {
@@ -259,7 +287,11 @@ pub fn import_midi_tracks(path: &str) -> Result<Vec<MidiTrackData>, String> {
                         if cc == 65 {
                             let beat = ticks_to_beats(abs_ticks, ticks_per_beat);
                             let norm = (value.as_int() as f32 / 127.0).clamp(0.0, 1.0);
-                            cc_events.push(MidiCcEvent { cc, beat, value: norm });
+                            cc_events.push(MidiCcEvent {
+                                cc,
+                                beat,
+                                value: norm,
+                            });
                         }
                     }
                     MidlyMessage::NoteOn { key, vel } => {

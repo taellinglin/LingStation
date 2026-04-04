@@ -40,11 +40,9 @@ impl DawApp {
         self.selected_clip = None;
         self.selected_track = Some(0);
         self.playhead_beats = 0.0;
-        if let Ok(mut master) = self.master_settings.lock() {
+        {
+            let mut master = self.engine.master_comp.lock();
             *master = MasterCompSettings::default();
-        }
-        if let Ok(mut state) = self.master_comp_state.lock() {
-            *state = MasterCompState::default();
         }
         self.performance_clip_settings.clear();
         self.performance_selected_clip = None;
@@ -81,28 +79,30 @@ impl DawApp {
             self.stop_audio_and_midi();
         }
         let mut hosts: Vec<PluginHostHandle> = Vec::new();
-        for state in self.track_audio.iter_mut() {
-            if let Some(host) = state.host.take() {
+        for state in self.engine.track_audio.iter_mut() {
+            if let Some(mut host) = state.host.take() {
                 host.prepare_for_drop();
                 hosts.push(host);
             }
-            for host in state.effect_hosts.drain(..) {
+            for mut host in state.effect_hosts.drain(..) {
                 host.prepare_for_drop();
                 hosts.push(host);
             }
         }
         self.orphaned_hosts.extend(hosts);
-        self.track_audio.clear();
+        self.engine.track_audio.clear();
         self.waveform_cache.borrow_mut().clear();
         self.waveform_color_cache.borrow_mut().clear();
         self.waveform_len_seconds_cache.borrow_mut().clear();
         self.waveform_cache_order.borrow_mut().clear();
         self.waveform_color_cache_order.borrow_mut().clear();
         self.waveform_len_seconds_cache_order.borrow_mut().clear();
-        if let Ok(mut cache) = self.audio_clip_cache.lock() {
+        {
+            let mut cache = self.engine.audio_cache.lock();
             cache.clear();
         }
-        if let Ok(mut timeline) = self.audio_clip_timeline.lock() {
+        {
+            let mut timeline = self.engine.audio_clips.lock();
             timeline.clear();
         }
     }
@@ -138,7 +138,7 @@ impl DawApp {
         self.selected_track = Some(self.tracks.len().saturating_sub(1));
         self.refresh_params_for_selected_track(true);
         if let Some(track) = self.tracks.last() {
-            self.track_audio.push(TrackAudioState::from_track(track));
+            self.engine.track_audio.push(TrackAudioState::from_track(track));
         }
         self.sync_track_mix();
         self.mark_dirty();
@@ -158,13 +158,13 @@ impl DawApp {
                     self.destroy_plugin_ui();
                 }
                 self.tracks.remove(index);
-                if index < self.track_audio.len() {
-                    let mut state = self.track_audio.remove(index);
-                    if let Some(host) = state.host.take() {
+                if index < self.engine.track_audio.len() {
+                    let mut state = self.engine.track_audio.remove(index);
+                    if let Some(mut host) = state.host.take() {
                         host.prepare_for_drop();
                         self.orphaned_hosts.push(host);
                     }
-                    for host in state.effect_hosts.drain(..) {
+                    for mut host in state.effect_hosts.drain(..) {
                         host.prepare_for_drop();
                         self.orphaned_hosts.push(host);
                     }
@@ -192,7 +192,7 @@ impl DawApp {
                 }
                 self.tracks.insert(new_index, dup);
                 let state = TrackAudioState::from_track(&track);
-                self.track_audio.insert(new_index, state);
+                self.engine.track_audio.insert(new_index, state);
                 self.selected_track = Some(new_index);
                 self.sync_track_mix();
                 self.mark_dirty();
@@ -209,7 +209,7 @@ impl DawApp {
                 clone.name = format!("{} Clone", clone.name);
                 self.tracks.insert(index + 1, clone);
                 let state = TrackAudioState::from_track(&track);
-                self.track_audio.insert(index + 1, state);
+                self.engine.track_audio.insert(index + 1, state);
                 self.selected_track = Some(index + 1);
                 self.sync_track_mix();
                 self.mark_dirty();
@@ -271,7 +271,7 @@ impl DawApp {
 
     pub(crate) fn capture_plugin_states(&mut self) {
         for (index, track) in self.tracks.iter_mut().enumerate() {
-            let Some(state) = self.track_audio.get(index) else {
+            let Some(state) = self.engine.track_audio.get(index) else {
                 continue;
             };
             let Some(host) = state.host.as_ref() else {
@@ -343,7 +343,7 @@ impl DawApp {
             node_routes: self.node_routes.clone(),
             performance_clip_settings: self.performance_clip_settings.clone(),
             performance_launch_quantize_beats: self.performance_launch_quantize_beats.max(0.0),
-            master_settings: self.master_settings_snapshot(),
+            master_settings: self.engine.master_comp_snapshot(),
         };
         let folder = Self::normalize_windows_path(folder);
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
@@ -468,7 +468,7 @@ impl DawApp {
         }
         #[cfg(not(windows))]
         {
-            return a == b;
+            a == b
         }
     }
 
@@ -505,23 +505,20 @@ impl DawApp {
         self.sync_node_routes();
         for track in &mut self.tracks {
             if let Some(treesynth) = track.treesynth.as_mut() {
-                if track
+                if !track
                     .instrument_path
                     .as_deref()
                     .map(Self::is_treesynth_path)
                     .unwrap_or(false)
-                    == false
                 {
                     track.instrument_path = Some("native:treesynth".to_string());
                 }
                 Self::resolve_treesynth_paths_from_project_root(treesynth, &project_root);
             }
         }
-        if let Ok(mut master) = self.master_settings.lock() {
+        {
+            let mut master = self.engine.master_comp.lock();
             *master = state.master_settings.clone();
-        }
-        if let Ok(mut comp_state) = self.master_comp_state.lock() {
-            *comp_state = MasterCompState::default();
         }
         self.selected_clip = None;
         self.selected_clips.clear();
@@ -745,11 +742,9 @@ impl DawApp {
             self.node_routes = Self::default_node_routes(&self.tracks);
         }
         self.sync_node_routes();
-        if let Ok(mut master) = self.master_settings.lock() {
+        {
+            let mut master = self.engine.master_comp.lock();
             *master = state.master_settings.clone();
-        }
-        if let Ok(mut comp_state) = self.master_comp_state.lock() {
-            *comp_state = MasterCompState::default();
         }
         self.selected_clip = None;
         self.selected_clips.clear();
@@ -1087,7 +1082,7 @@ impl DawApp {
         if peak <= 0.0 {
             return Err("Clip is silent".to_string());
         }
-        let target = db_to_gain(-1.0);
+        let target = engine::db_to_gain(-1.0);
         clip.audio_gain = (target / peak).clamp(0.0, 2.0);
         Ok(())
     }
@@ -1442,7 +1437,7 @@ impl DawApp {
         }
         let track_index = self.selected_track.unwrap_or(0).min(self.tracks.len().saturating_sub(1));
         let start_beats = self.playhead_beats.max(0.0);
-        let start_samples = self.transport_samples.load(Ordering::Relaxed);
+        let start_samples = self.engine.transport_samples.load(Ordering::Relaxed);
         if !self.audio_running {
             self.start_audio_and_midi()?;
             self.seek_playhead(start_beats);
@@ -1450,7 +1445,8 @@ impl DawApp {
         } else {
             self.record_started_audio = false;
         }
-        if let Ok(mut rec) = self.recording.lock() {
+        {
+            let mut rec = self.engine.recording.lock();
             rec.active = true;
             rec.track_index = track_index;
             rec.start_samples = start_samples;
@@ -1482,7 +1478,7 @@ impl DawApp {
         }
         self.is_recording = false;
         let _stream = self.audio_input_stream.take();
-        let mut rec = self.recording.lock().map_err(|_| "Recording lock failed".to_string())?;
+        let mut rec = self.engine.recording.lock();
         rec.active = false;
         let track_index = rec.track_index;
         let start_beats = rec.start_beats;
@@ -1542,13 +1538,14 @@ impl DawApp {
         let mut stream_config: cpal::StreamConfig = config.clone().into();
         stream_config.sample_rate = cpal::SampleRate(self.settings.sample_rate.max(1));
         stream_config.buffer_size = cpal::BufferSize::Fixed(self.effective_buffer_size());
-        let recording = self.recording.clone();
+        let recording = self.engine.recording.clone();
 
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
-                    if let Ok(mut rec) = recording.lock() {
+                    {
+                    let mut rec = recording.lock();
                         if !rec.active || !rec.record_audio {
                             return;
                         }
@@ -1565,7 +1562,8 @@ impl DawApp {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
-                    if let Ok(mut rec) = recording.lock() {
+                    {
+                    let mut rec = recording.lock();
                         if !rec.active || !rec.record_audio {
                             return;
                         }
@@ -1582,7 +1580,8 @@ impl DawApp {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
-                    if let Ok(mut rec) = recording.lock() {
+                    {
+                    let mut rec = recording.lock();
                         if !rec.active || !rec.record_audio {
                             return;
                         }
@@ -1670,10 +1669,11 @@ impl DawApp {
         self.enqueue_audio_analysis(clip_id, path.clone());
         if self.audio_running {
             let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
-            if let Ok(mut guard) = self.audio_clip_timeline.lock() {
+            {
+            let mut guard = self.engine.audio_clips.lock();
                 *guard = timeline;
             }
-            self.preload_audio_clips(&self.audio_clip_cache);
+            self.preload_audio_clips(&self.engine.audio_cache);
         }
         self.selected_track = Some(track_index);
         self.selected_clip = Some(clip_id);
@@ -1788,17 +1788,16 @@ impl DawApp {
                     let range_end = new_points.last().map(|p| p.beat).unwrap_or(range_start);
                     let mut merged: Vec<AutomationPoint> = lane
                         .points
-                        .iter()
-                        .cloned()
-                        .filter(|p| p.beat < range_start - 0.02 || p.beat > range_end + 0.02)
+                        .iter().filter(|&p| p.beat < range_start - 0.02 || p.beat > range_end + 0.02).cloned()
                         .collect();
                     merged.extend(new_points.into_iter());
                     Self::coalesce_automation_points(&mut merged, 0.02);
                     lane.points = merged;
                 }
             }
-            if let Some(state) = self.track_audio.get(track_index) {
-                if let Ok(mut lanes) = state.automation_lanes.lock() {
+            if let Some(state) = self.engine.track_audio.get(track_index) {
+                {
+                let mut lanes = state.automation_lanes.lock();
                     *lanes = track.automation_lanes.clone();
                 }
             }
@@ -1866,8 +1865,9 @@ impl DawApp {
                 }
                 Self::coalesce_automation_points(&mut lane.points, 0.02);
             }
-            if let Some(state) = self.track_audio.get(track_index) {
-                if let Ok(mut lanes) = state.automation_lanes.lock() {
+            if let Some(state) = self.engine.track_audio.get(track_index) {
+                {
+                let mut lanes = state.automation_lanes.lock();
                     *lanes = track.automation_lanes.clone();
                 }
             }
@@ -1878,7 +1878,7 @@ impl DawApp {
         if self.audio_running {
             let sample_rate = self.settings.sample_rate.max(1) as f32;
             let bpm = self.tempo_bpm.max(1.0);
-            let samples = self.transport_samples.load(Ordering::Relaxed) as f32;
+            let samples = self.engine.transport_samples.load(Ordering::Relaxed) as f32;
             (samples / sample_rate) * (bpm / 60.0)
         } else {
             self.playhead_beats.max(0.0)
@@ -1886,11 +1886,14 @@ impl DawApp {
     }
 
     pub(crate) fn arrangement_playback_enabled(&self) -> bool {
-        self.arrangement_playback_enabled.load(Ordering::Relaxed)
+        self.engine
+            .arrangement_playback_enabled
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_arrangement_playback_enabled(&self, enabled: bool) {
-        self.arrangement_playback_enabled
+        self.engine
+            .arrangement_playback_enabled
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -1902,7 +1905,7 @@ impl DawApp {
 
     pub(crate) fn performance_launch_samples(&self) -> u64 {
         let current_samples = if self.audio_running {
-            self.transport_samples.load(Ordering::Relaxed)
+            self.engine.transport_samples.load(Ordering::Relaxed)
         } else {
             self.beats_to_samples(self.playhead_beats.max(0.0), self.settings.sample_rate)
         };
@@ -1971,7 +1974,8 @@ impl DawApp {
             .and_then(|(ti, ci)| self.tracks.get(ti).and_then(|t| t.clips.get(ci)))
             .map(|clip| clip.length_beats.max(0.25))
             .unwrap_or(0.25);
-        if let Ok(mut rec) = self.recording.lock() {
+        {
+            let mut rec = self.engine.recording.lock();
             if !rec.active || !rec.record_performance {
                 return;
             }
@@ -2025,7 +2029,8 @@ impl DawApp {
     }
 
     pub(crate) fn preload_performance_audio_clip(&self, path_str: &str) {
-        if let Ok(mut cache) = self.audio_clip_cache.lock() {
+        {
+            let mut cache = self.engine.audio_cache.lock();
             if cache.get(path_str).is_none() {
                 let path = PathBuf::from(path_str);
                 if let Some(data) = Self::load_audio_clip_data(&path) {
@@ -2087,7 +2092,8 @@ impl DawApp {
     }
 
     pub(crate) fn stop_performance_track(&mut self, track_index: usize) {
-        if let Ok(mut runtime) = self.performance_runtime.lock() {
+        {
+            let mut runtime = self.engine.performance_runtime.lock();
             if let Some(slot) = runtime.get_mut(track_index) {
                 *slot = None;
             }
@@ -2132,7 +2138,8 @@ impl DawApp {
             return;
         }
         let now = self.current_transport_beat().max(0.0);
-        if let Ok(mut rec) = self.recording.lock() {
+        {
+            let mut rec = self.engine.recording.lock();
             if !rec.active || !rec.record_performance {
                 return;
             }
@@ -2249,10 +2256,11 @@ impl DawApp {
         }
         if added_audio_clip && self.audio_running {
             let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
-            if let Ok(mut guard) = self.audio_clip_timeline.lock() {
+            {
+            let mut guard = self.engine.audio_clips.lock();
                 *guard = timeline;
             }
-            self.preload_audio_clips(&self.audio_clip_cache);
+            self.preload_audio_clips(&self.engine.audio_cache);
         }
         if let Some(clip_id) = last_clip_id {
             self.selected_clip = Some(clip_id);
@@ -2305,7 +2313,7 @@ impl DawApp {
         if self.audio_running {
             return Ok(());
         }
-        self.audio_stats = Arc::new(AudioRuntimeStats::new());
+        self.engine.stats = Arc::new(AudioStats::new());
         self.audio_stop.store(false, Ordering::Relaxed);
         let host = cpal::default_host();
         let device = if self.settings.output_device.trim().is_empty() {
@@ -2325,27 +2333,28 @@ impl DawApp {
         self.last_output_channels = channels.max(1);
         let effective_buffer = self.effective_buffer_size();
         let buffer_size_usize = effective_buffer as usize;
-        let freq_bits = self.midi_freq_bits.clone();
-        let gate = self.midi_gate.clone();
-        let master_peak_bits = self.master_peak_bits.clone();
-        let master_settings = self.master_settings.clone();
-        let master_comp_state = self.master_comp_state.clone();
+        let freq_bits = self.engine.midi_freq_bits.clone();
+        let gate = self.engine.midi_gate.clone();
+        let master_peak_bits = self.engine.master_peak_bits.clone();
+        let master_settings = self.engine.master_comp.clone();
+        let master_comp_state = self.engine.master_comp_state.clone();
         self.adaptive_buffer_size
             .store(effective_buffer, Ordering::Relaxed);
         self.last_overrun.store(false, Ordering::Relaxed);
         if reset_transport {
-            self.transport_samples.store(0, Ordering::Relaxed);
-            self.playback_panic.store(true, Ordering::Relaxed);
-            self.playback_fade_in.store(true, Ordering::Relaxed);
+            self.engine.transport_samples.store(0, Ordering::Relaxed);
+            self.engine.playback_panic.store(true, Ordering::Relaxed);
+            self.engine.playback_fade_in.store(true, Ordering::Relaxed);
         }
         self.ensure_synth_soundfont();
-        self.tempo_bits.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
+        self.engine.tempo_bpm.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         self.sync_track_audio_states();
         let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
-        if let Ok(mut guard) = self.audio_clip_timeline.lock() {
+        {
+            let mut guard = self.engine.audio_clips.lock();
             *guard = timeline;
         }
-        self.preload_audio_clips(&self.audio_clip_cache);
+        self.preload_audio_clips(&self.engine.audio_cache);
         let mut micesynth_program_sync: Vec<usize> = Vec::new();
         for index in 0..self.tracks.len() {
             let path = self.tracks[index].instrument_path.clone();
@@ -2357,7 +2366,7 @@ impl DawApp {
                 .map(Self::is_micesynth_path)
                 .unwrap_or(false)
                 && self.tracks.get(index).and_then(|track| track.midi_program).is_some();
-            let state = match self.track_audio.get_mut(index) {
+            let state = match self.engine.track_audio.get_mut(index) {
                 Some(state) => state,
                 None => continue,
             };
@@ -2397,7 +2406,7 @@ impl DawApp {
                             })
                         }
                     };
-                    if let Some(host) = host {
+                    if let Some(mut host) = host {
                         let params = host.enumerate_params();
                         if let Some(track) = self.tracks.get_mut(index) {
                             if !params.is_empty() {
@@ -2471,7 +2480,7 @@ impl DawApp {
                 }
             }
             if state.effect_hosts.len() != effect_paths.len() {
-                for host in state.effect_hosts.drain(..) {
+                for mut host in state.effect_hosts.drain(..) {
                     host.prepare_for_drop();
                     self.orphaned_hosts.push(host);
                 }
@@ -2570,22 +2579,22 @@ impl DawApp {
         self.send_midi_stop_to_hosts();
         self.warmup_hosts(channels, buffer_size_usize, 2);
         self.sync_node_routes();
-        let track_audio = self.track_audio.clone();
-        let track_mix = self.track_mix.clone();
-        let node_activity_rt = self.node_activity_rt.clone();
-        let node_routes_rt = self.node_routes_rt.clone();
-        let performance_runtime = self.performance_runtime.clone();
-        let arrangement_playback_enabled = self.arrangement_playback_enabled.clone();
-        let tempo_bits = self.tempo_bits.clone();
-        let transport_samples = self.transport_samples.clone();
-        let loop_start_samples = self.loop_start_samples.clone();
-        let loop_end_samples = self.loop_end_samples.clone();
-        let playback_panic = self.playback_panic.clone();
-        let playback_fade_in = self.playback_fade_in.clone();
+        let track_audio = self.engine.track_audio.clone();
+        let track_mix = self.engine.track_mix.clone();
+        let node_activity_rt = self.engine.node_activity.clone();
+        let node_routes_rt = self.engine.node_routes.clone();
+        let performance_runtime = self.engine.performance_runtime.clone();
+        let arrangement_playback_enabled = self.engine.arrangement_playback_enabled.clone();
+        let tempo_bits = self.engine.tempo_bpm.clone();
+        let transport_samples = self.engine.transport_samples.clone();
+        let loop_start_samples = self.engine.loop_start_samples.clone();
+        let loop_end_samples = self.engine.loop_end_samples.clone();
+        let playback_panic = self.engine.playback_panic.clone();
+        let playback_fade_in = self.engine.playback_fade_in.clone();
         let audio_stop = self.audio_stop.clone();
-        let audio_callback_active = self.audio_callback_active.clone();
-        let audio_clip_cache = self.audio_clip_cache.clone();
-        let audio_clip_timeline = self.audio_clip_timeline.clone();
+        let audio_callback_active = self.engine.audio_callback_active.clone();
+        let audio_clip_cache = self.engine.audio_cache.clone();
+        let audio_clip_timeline = self.engine.audio_clips.clone();
         let adaptive_enabled = self.settings.adaptive_buffer;
         let safe_underruns = self.settings.safe_underruns;
         let smart_disable_plugins = self.settings.smart_disable_plugins;
@@ -2593,7 +2602,7 @@ impl DawApp {
         let adaptive_restart_requested = self.adaptive_restart_requested.clone();
         let adaptive_buffer_size = self.adaptive_buffer_size.clone();
         let last_overrun = self.last_overrun.clone();
-        let audio_stats = self.audio_stats.clone();
+        let audio_stats = self.engine.stats.clone();
 
         let mut stream_config: cpal::StreamConfig = config.clone().into();
         let target_rate = self.settings.sample_rate;
@@ -2672,7 +2681,7 @@ impl DawApp {
                             render_sine(data, channels, sample_rate, &freq_bits, &gate);
                         }
                         let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.try_lock() {
+                        if let Some(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 data,
                                 channels,
@@ -2764,7 +2773,7 @@ impl DawApp {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
                         }
                         let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.try_lock() {
+                        if let Some(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 &mut temp,
                                 channels,
@@ -2861,7 +2870,7 @@ impl DawApp {
                             render_sine(&mut temp, channels, sample_rate, &freq_bits, &gate);
                         }
                         let settings = master_settings.try_lock().map(|s| s.clone()).unwrap_or_default();
-                        if let Ok(mut state) = master_comp_state.try_lock() {
+                        if let Some(mut state) = master_comp_state.try_lock() {
                             apply_master_processing(
                                 &mut temp,
                                 channels,
@@ -2916,7 +2925,7 @@ impl DawApp {
         self.audio_running = true;
         if self.adaptive_restart_pending {
             self.adaptive_restart_pending = false;
-            self.status = format!("Audio buffer applied");
+            self.status = "Audio buffer applied".to_string();
         }
         Ok(())
     }
@@ -2944,23 +2953,25 @@ impl DawApp {
         self.audio_stop.store(true, Ordering::Relaxed);
         self.audio_running = false;
         self.set_arrangement_playback_enabled(false);
-        if let Ok(mut runtime) = self.performance_runtime.lock() {
+        {
+            let mut runtime = self.engine.performance_runtime.lock();
             runtime.iter_mut().for_each(|slot| *slot = None);
         }
         self.midi_conns.clear();
         let _stream = self.audio_stream.take();
         let _input = self.audio_input_stream.take();
         let start = std::time::Instant::now();
-        while self.audio_callback_active.load(Ordering::Relaxed) > 0 {
+        while self.engine.audio_callback_active.load(Ordering::Relaxed) > 0 {
             if start.elapsed() > std::time::Duration::from_millis(1000) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         self.send_midi_stop_to_hosts();
-        self.midi_gate.store(false, Ordering::Relaxed);
-        for state in &self.track_audio {
-            if let Ok(mut events) = state.midi_events.lock() {
+        self.engine.midi_gate.store(false, Ordering::Relaxed);
+        for state in &self.engine.track_audio {
+            {
+                            let mut events = state.midi_events.lock();
                 events.clear();
             }
         }
@@ -2970,14 +2981,15 @@ impl DawApp {
         self.audio_stop.store(true, Ordering::Relaxed);
         self.audio_running = false;
         self.set_arrangement_playback_enabled(false);
-        if let Ok(mut runtime) = self.performance_runtime.lock() {
+        {
+            let mut runtime = self.engine.performance_runtime.lock();
             runtime.iter_mut().for_each(|slot| *slot = None);
         }
         self.midi_conns.clear();
         let _stream = self.audio_stream.take();
         let _input = self.audio_input_stream.take();
         let start = std::time::Instant::now();
-        while self.audio_callback_active.load(Ordering::Relaxed) > 0 {
+        while self.engine.audio_callback_active.load(Ordering::Relaxed) > 0 {
             if start.elapsed() > std::time::Duration::from_millis(1000) {
                 break;
             }
@@ -2987,12 +2999,13 @@ impl DawApp {
             self.send_midi_stop_to_hosts();
         }
         // Keep the host alive on Stop; dropping here can crash some plugins.
-        self.midi_gate.store(false, Ordering::Relaxed);
+        self.engine.midi_gate.store(false, Ordering::Relaxed);
         if reset_transport {
-            self.transport_samples.store(0, Ordering::Relaxed);
+            self.engine.transport_samples.store(0, Ordering::Relaxed);
         }
-        for state in &self.track_audio {
-            if let Ok(mut events) = state.midi_events.lock() {
+        for state in &self.engine.track_audio {
+            {
+                            let mut events = state.midi_events.lock();
                 events.clear();
             }
         }
@@ -3011,7 +3024,7 @@ impl DawApp {
                 events.push(vst3::MidiEvent::note_off_at(channel, note, 0, 0));
             }
         }
-        for state in &self.track_audio {
+        for state in &self.engine.track_audio {
             let Some(host) = state.host.as_ref() else {
                 continue;
             };
@@ -3028,7 +3041,7 @@ impl DawApp {
         let mut scratch = vec![0.0f32; frames * channels];
         let events: [vst3::MidiEvent; 0] = [];
         for _ in 0..blocks {
-            for state in &self.track_audio {
+            for state in &self.engine.track_audio {
                 if let Some(host) = state.host.as_ref() {
                     silence.fill(0.0);
                     let _ = host.process_f32(&mut silence, channels, &events);
@@ -3308,7 +3321,7 @@ impl DawApp {
 
         let status = Self::get_value_string(payload, &["status"])
             .ok_or_else(|| "License missing status".to_string())?;
-        if status.to_ascii_lowercase() != "active" {
+        if !status.eq_ignore_ascii_case("active") {
             return Err(format!("License inactive ({status})"));
         }
         let product = Self::get_value_string(payload, &["product", "code"])
@@ -3335,8 +3348,7 @@ impl DawApp {
         let cleaned = key_text
             .replace("-----BEGIN PUBLIC KEY-----", "")
             .replace("-----END PUBLIC KEY-----", "")
-            .replace('\n', "")
-            .replace('\r', "")
+            .replace(['\n', '\r'], "")
             .trim()
             .to_string();
         let raw = BASE64_URL_SAFE
@@ -3900,14 +3912,14 @@ impl DawApp {
             .find(|port| midi_in.port_name(port).ok().as_deref() == Some(device.input_port.as_str()))
             .ok_or_else(|| format!("port not found: {}", device.input_port))?;
 
-        let freq_bits = self.midi_freq_bits.clone();
-        let gate = self.midi_gate.clone();
-        let track_audio = self.track_audio.clone();
-        let selected_track_index = self.selected_track_index.clone();
+        let freq_bits = self.engine.midi_freq_bits.clone();
+        let gate = self.engine.midi_gate.clone();
+        let track_audio = self.engine.track_audio.clone();
+        let selected_track_index = self.engine.selected_track_index.clone();
         let midi_learn = self.midi_learn.clone();
-        let recording = self.recording.clone();
-        let tempo_bits = self.tempo_bits.clone();
-        let transport_samples = self.transport_samples.clone();
+        let recording = self.engine.recording.clone();
+        let tempo_bits = self.engine.tempo_bpm.clone();
+        let transport_samples = self.engine.transport_samples.clone();
         let record_sample_rate = self.settings.sample_rate.max(1) as f32;
         let channel_filter = device.midi_channel;
 
@@ -3940,11 +3952,13 @@ impl DawApp {
                         freq_bits.store(freq.to_bits(), Ordering::Relaxed);
                         gate.store(true, Ordering::Relaxed);
                         if let Some(state) = state {
-                            if let Ok(mut events) = state.midi_events.lock() {
+                            {
+                            let mut events = state.midi_events.lock();
                                 events.push(vst3::MidiEvent::note_on(channel, note, vel));
                             }
                         }
-                        if let Ok(mut rec) = recording.lock() {
+                        {
+                    let mut rec = recording.lock();
                             if rec.active && rec.record_midi {
                                 rec.midi_active.insert(note, (beat, vel));
                             }
@@ -3952,11 +3966,13 @@ impl DawApp {
                     } else if status == 0x80 || (status == 0x90 && vel == 0) {
                         gate.store(false, Ordering::Relaxed);
                         if let Some(state) = state {
-                            if let Ok(mut events) = state.midi_events.lock() {
+                            {
+                            let mut events = state.midi_events.lock();
                                 events.push(vst3::MidiEvent::note_off(channel, note, vel));
                             }
                         }
-                        if let Ok(mut rec) = recording.lock() {
+                        {
+                    let mut rec = recording.lock();
                             if rec.active && rec.record_midi {
                                 if let Some((start, start_vel)) = rec.midi_active.remove(&note) {
                                     let length = (beat - start).max(0.05);
@@ -3970,7 +3986,8 @@ impl DawApp {
                             if let Some((learn_index, param_id)) = *learn {
                                 if learn_index == index {
                                     if let Some(state) = track_audio.get(learn_index) {
-                                        if let Ok(mut map) = state.learned_cc.lock() {
+                                        {
+                                        let mut map = state.learned_cc.lock();
                                             map.insert((channel, note), param_id);
                                         }
                                     }
@@ -3980,12 +3997,15 @@ impl DawApp {
                             }
                         }
                         if let Some(state) = state {
-                            if let Ok(mut events) = state.midi_events.lock() {
+                            {
+                            let mut events = state.midi_events.lock();
                                 events.push(vst3::MidiEvent::control_change(channel, note, vel));
                             }
-                            if let Ok(map) = state.learned_cc.lock() {
+                            {
+                                    let map = state.learned_cc.lock();
                                 if let Some(param_id) = map.get(&(channel, note)).copied() {
-                                    if let Ok(mut rec) = recording.lock() {
+                                    {
+                    let mut rec = recording.lock();
                                         if rec.active && rec.record_automation {
                                             let value = (vel as f32 / 127.0).clamp(0.0, 1.0);
                                             rec.automation_points.push(RecordedAutomationPoint {
@@ -4217,15 +4237,14 @@ impl DawApp {
     }
 
     pub(crate) fn scan_plugins(&self) -> Vec<PluginCandidate> {
-        let mut native = Vec::new();
-        native.push(PluginCandidate {
+        let mut native = vec![PluginCandidate {
             path: "native:treesynth".to_string(),
             kind: PluginKind::Native,
             clap_id: None,
             display: "TreeSynth (Sampler)".to_string(),
             category: PluginCategory::Native,
             instrument_only: true,
-        });
+        }];
 
         let mut bundled = Vec::new();
         let mut system = Vec::new();
@@ -4371,7 +4390,7 @@ impl DawApp {
                     path,
                     &clap_id,
                     self.settings.sample_rate as f64,
-                    self.settings.buffer_size as u32,
+                    self.settings.buffer_size,
                     0,
                     2,
                 )
@@ -4463,6 +4482,7 @@ impl DawApp {
             return;
         };
         let params_result = self
+            .engine
             .track_audio
             .get(index)
             .and_then(|state| state.host.as_ref())
@@ -4537,12 +4557,13 @@ impl DawApp {
     }
 
     pub(crate) fn reset_midi_for_selected_track(&mut self) {
-        self.midi_gate.store(false, Ordering::Relaxed);
+        self.engine.midi_gate.store(false, Ordering::Relaxed);
         let Some(index) = self.selected_track else {
             return;
         };
-        if let Some(state) = self.track_audio.get(index) {
-            if let Ok(mut events) = state.midi_events.lock() {
+        if let Some(state) = self.engine.track_audio.get(index) {
+            {
+                            let mut events = state.midi_events.lock();
                 events.clear();
                 for note in 0u8..=127 {
                     events.push(vst3::MidiEvent::note_off(0, note, 0));
@@ -4554,25 +4575,27 @@ impl DawApp {
 
     pub(crate) fn piano_preview_note_on(&mut self, note: u8, velocity: u8) {
         let freq = 440.0f32 * 2.0f32.powf((note as f32 - 69.0) / 12.0);
-        self.midi_freq_bits.store(freq.to_bits(), Ordering::Relaxed);
-        self.midi_gate.store(true, Ordering::Relaxed);
+        self.engine.midi_freq_bits.store(freq.to_bits(), Ordering::Relaxed);
+        self.engine.midi_gate.store(true, Ordering::Relaxed);
         let Some(index) = self.selected_track else {
             return;
         };
-        if let Some(state) = self.track_audio.get(index) {
-            if let Ok(mut events) = state.midi_events.lock() {
+        if let Some(state) = self.engine.track_audio.get(index) {
+            {
+                            let mut events = state.midi_events.lock();
                 events.push(vst3::MidiEvent::note_on(0, note, velocity));
             }
         }
     }
 
     pub(crate) fn piano_preview_note_off(&mut self, note: u8) {
-        self.midi_gate.store(false, Ordering::Relaxed);
+        self.engine.midi_gate.store(false, Ordering::Relaxed);
         let Some(index) = self.selected_track else {
             return;
         };
-        if let Some(state) = self.track_audio.get(index) {
-            if let Ok(mut events) = state.midi_events.lock() {
+        if let Some(state) = self.engine.track_audio.get(index) {
+            {
+                            let mut events = state.midi_events.lock();
                 events.push(vst3::MidiEvent::note_off(0, note, 0));
             }
         }
@@ -4583,7 +4606,7 @@ impl DawApp {
         if self
             .plugin_ui
             .as_ref()
-            .map_or(false, |ui| ui.target == PluginUiTarget::Instrument(index))
+            .is_some_and(|ui| ui.target == PluginUiTarget::Instrument(index))
         {
             reopen_ui = self.show_plugin_ui;
             self.show_plugin_ui = false;
@@ -4607,17 +4630,25 @@ impl DawApp {
             } else {
                 track.treesynth = None;
             }
-            if let Some(state) = self.track_audio.get(index) {
-                let enabled = track
-                    .instrument_path
+        }
+        let treesynth_enabled = self
+            .tracks
+            .get(index)
+            .map(|t| {
+                t.instrument_path
                     .as_deref()
                     .map(Self::is_treesynth_path)
-                    .unwrap_or(false);
-                state.sync_treesynth(track, enabled, &self.audio_clip_cache);
-            }
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if let (Some(state), Some(track)) = (
+            self.engine.track_audio.get_mut(index),
+            self.tracks.get(index),
+        ) {
+            state.sync_treesynth(track, treesynth_enabled, &self.engine.audio_cache);
         }
-        if let Some(state) = self.track_audio.get_mut(index) {
-            if let Some(host) = state.host.take() {
+        if let Some(state) = self.engine.track_audio.get_mut(index) {
+            if let Some(mut host) = state.host.take() {
                 host.prepare_for_drop();
                 self.orphaned_hosts.push(host);
             }
