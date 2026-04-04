@@ -84,11 +84,19 @@ jobs:
           DEST_DIR="dist/LingStation-v${VERSION}-${EXT}"
           mkdir -p "$DEST_DIR"
           cp "target/release/${BIN_NAME}" "$DEST_DIR/LingStation"
-          cp -R "synths" "$DEST_DIR/"
-          cp -R "samples" "$DEST_DIR/"
-          cp -R "sample_kits" "$DEST_DIR/"
-          cp -R "templates" "$DEST_DIR/"
-          cp -R "examples" "$DEST_DIR/"
+          bundle_dir() {
+            local name="$1"
+            if [ -d "$name" ]; then
+              cp -R "$name" "$DEST_DIR/"
+            else
+              mkdir -p "$DEST_DIR/$name"
+            fi
+          }
+          bundle_dir synths
+          bundle_dir samples
+          bundle_dir sample_kits
+          bundle_dir templates
+          bundle_dir examples
           tar -czf "dist/LingStation-v${VERSION}-${EXT}.tar.gz" -C dist \
             "LingStation-v${VERSION}-${EXT}"
 
@@ -96,16 +104,24 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          function Bundle-Dir($Name, $DestRoot) {
+            $target = Join-Path $DestRoot $Name
+            if (Test-Path $Name) {
+              Copy-Item -Path $Name -Destination $target -Recurse
+            } else {
+              New-Item -ItemType Directory -Force -Path $target | Out-Null
+            }
+          }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $binName = "lingstation-app.exe"
           $destDir = "dist\LingStation-v$env:VERSION-Windows"
           New-Item -ItemType Directory -Force -Path $destDir | Out-Null
           Copy-Item -Path "target\release\$binName" -Destination (Join-Path $destDir "LingStation.exe")
-          Copy-Item -Path "synths" -Destination (Join-Path $destDir "synths") -Recurse
-          Copy-Item -Path "samples" -Destination (Join-Path $destDir "samples") -Recurse
-          Copy-Item -Path "sample_kits" -Destination (Join-Path $destDir "sample_kits") -Recurse
-          Copy-Item -Path "templates" -Destination (Join-Path $destDir "templates") -Recurse
-          Copy-Item -Path "examples" -Destination (Join-Path $destDir "examples") -Recurse
+          Bundle-Dir "synths" $destDir
+          Bundle-Dir "samples" $destDir
+          Bundle-Dir "sample_kits" $destDir
+          Bundle-Dir "templates" $destDir
+          Bundle-Dir "examples" $destDir
           Compress-Archive -Path $destDir -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
       - name: Delete existing release assets

@@ -1587,6 +1587,7 @@ dependencies = [
  "vorbis-encoder",
  "vst3",
  "vst3-sys",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
