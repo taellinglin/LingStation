@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - main
   workflow_dispatch:
 
 permissions:
@@ -124,9 +125,6 @@ jobs:
           Bundle-Dir "examples" $destDir
           Compress-Archive -Path $destDir -DestinationPath "dist\LingStation-v$env:VERSION-Windows.zip" -Force
 
-      - name: Delete existing release assets
-        run: echo "release handled in separate job"
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -189,57 +187,46 @@ jobs:
             find . -type f -maxdepth 3 || true
             exit 1
           fi
-          {
-            echo 'list<<EOF'
-            for f in "${files[@]}"; do
-              echo "dist/$f"
-            done
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          : > "$GITHUB_WORKSPACE/release-asset-paths.txt"
+          for f in "${files[@]}"; do
+            echo "dist/$f" >> "$GITHUB_WORKSPACE/release-asset-paths.txt"
+          done
           echo "Found ${#files[@]} archive(s) for upload."
+          cat "$GITHUB_WORKSPACE/release-asset-paths.txt"
 
-      - name: Delete existing release assets
-        uses: actions/github-script@v7
+      # Use `gh release create` (not a third-party action) so each run always gets a new
+      # tag + release at $GITHUB_SHA. Updating one release in place leaves published_at and
+      # the auto "Source code" snapshots tied to the old date while only uploaded binaries look new.
+
+      - name: Create GitHub Release
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ env.VERSION }}
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const tag = 'latest';
-            const prefix = `LingStation-v${process.env.VERSION}-`;
-            let release;
-            try {
-              const res = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-              release = res.data;
-            } catch (err) {
-              core.info('No existing latest release; skipping asset delete.');
-              return;
-            }
-            for (const asset of release.assets || []) {
-              if (asset.name.startsWith(prefix)) {
-                core.info(`Deleting asset ${asset.name}`);
-                await github.rest.repos.deleteReleaseAsset({
-                  owner,
-                  repo,
-                  asset_id: asset.id,
-                });
-              }
-            }
+        run: |
+          set -euo pipefail
+          mapfile -t assets < "$GITHUB_WORKSPACE/release-asset-paths.txt"
+          for a in "${assets[@]}"; do
+            if [[ ! -f "$a" ]]; then
+              echo "::error::Missing asset file: $a"
+              exit 1
+            fi
+          done
+          TAG="v${VERSION}-r${GITHUB_RUN_ID}"
+          NOTES=$(mktemp)
+          cat > "$NOTES" << EOF
+          **Version:** ${VERSION} (from workspace \`Cargo.toml\`)
 
-      - name: Create release and upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: Latest
-          target_commitish: ${{ github.sha }}
-          make_latest: true
-          generate_release_notes: true
-          body: |
-            **Version:** ${{ env.VERSION }} (from workspace `Cargo.toml`)
+          **Commit:** [\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
 
-            **Commit:** [`${{ github.sha }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+          **Workflow run:** [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
-            **Workflow run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          files: ${{ steps.release_assets.outputs.list }}
-          fail_on_unmatched_files: true
+          Use the **Linux / macOS / Windows** archives below. (*Source code* zips are GitHub’s snapshot of the commit above.)
+          EOF
+          gh release create "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "LingStation ${VERSION} (run ${GITHUB_RUN_ID})" \
+            --notes-file "$NOTES" \
+            --latest \
+            "${assets[@]}"
+          rm -f "$NOTES"
