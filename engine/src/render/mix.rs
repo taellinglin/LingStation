@@ -667,12 +667,16 @@ pub fn mix_track_hosts(
                                     if pending.target == PendingParamTarget::Instrument {
                                         match host {
                                             PluginHostHandle::Vst3(h) => {
-                                                h.lock()
-                                                    .push_param_change(pending.param_id, pending.value);
+                                                h.lock().push_param_change(
+                                                    pending.param_id,
+                                                    pending.value,
+                                                );
                                             }
                                             PluginHostHandle::Clap(h) => {
-                                                h.lock()
-                                                    .push_param_change(pending.param_id, pending.value);
+                                                h.lock().push_param_change(
+                                                    pending.param_id,
+                                                    pending.value,
+                                                );
                                             }
                                         }
                                     }
@@ -702,12 +706,12 @@ pub fn mix_track_hosts(
                                 FILTERED_EVENTS_TMP.with(|filtered_cell| {
                                     let filtered = filtered_cell.borrow();
                                     let result = match host {
-                                        PluginHostHandle::Vst3(h) => h
-                                            .lock()
-                                            .process_f32(&mut host_out, channels, &filtered),
-                                        PluginHostHandle::Clap(h) => h
-                                            .lock()
-                                            .process_f32(&mut host_out, channels, &filtered),
+                                        PluginHostHandle::Vst3(h) => {
+                                            h.lock().process_f32(&mut host_out, channels, &filtered)
+                                        }
+                                        PluginHostHandle::Clap(h) => {
+                                            h.lock().process_f32(&mut host_out, channels, &filtered)
+                                        }
                                     };
                                     if result.is_ok() {
                                         for (t, h) in temp.iter_mut().zip(host_out.iter()) {
@@ -802,18 +806,14 @@ pub fn mix_track_hosts(
 
                             scratch.fill(0.0);
                             let result = match fx {
-                                PluginHostHandle::Vst3(h) => h.lock().process_f32_with_input(
-                                    current,
-                                    scratch,
-                                    channels,
-                                    &[],
-                                ),
-                                PluginHostHandle::Clap(h) => h.lock().process_f32_with_input(
-                                    current,
-                                    scratch,
-                                    channels,
-                                    &[],
-                                ),
+                                PluginHostHandle::Vst3(h) => {
+                                    h.lock()
+                                        .process_f32_with_input(current, scratch, channels, &[])
+                                }
+                                PluginHostHandle::Clap(h) => {
+                                    h.lock()
+                                        .process_f32_with_input(current, scratch, channels, &[])
+                                }
                             };
                             if result.is_ok() {
                                 std::mem::swap(&mut current, &mut scratch);
