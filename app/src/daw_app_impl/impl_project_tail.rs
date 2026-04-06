@@ -2335,7 +2335,6 @@ impl DawApp {
         }
         .ok_or("No output device")?;
         let config = device.default_output_config().map_err(|e| e.to_string())?;
-        let sample_rate = self.settings.sample_rate.max(1) as f32;
         let channels = config.channels() as usize;
         self.last_output_channels = channels.max(1);
         let effective_buffer = self.effective_buffer_size();
@@ -2353,10 +2352,41 @@ impl DawApp {
             self.engine.playback_panic.store(true, Ordering::Relaxed);
             self.engine.playback_fade_in.store(true, Ordering::Relaxed);
         }
+
+        // Use the actual stream sample rate consistently across engine + plugins.
+        let target_rate = self.settings.sample_rate.max(1);
+        let mut actual_rate = target_rate;
+        if let Ok(supported) = device.supported_output_configs() {
+            let mut found = false;
+            let mut closest_rate = 44100;
+            let mut min_diff = u32::MAX;
+            for conf in supported {
+                let min = conf.min_sample_rate().0;
+                let max = conf.max_sample_rate().0;
+                if target_rate >= min && target_rate <= max {
+                    found = true;
+                    break;
+                }
+                let diff_min = target_rate.abs_diff(min);
+                let diff_max = target_rate.abs_diff(max);
+                if diff_min < min_diff {
+                    min_diff = diff_min;
+                    closest_rate = min;
+                }
+                if diff_max < min_diff {
+                    min_diff = diff_max;
+                    closest_rate = max;
+                }
+            }
+            if !found && min_diff != u32::MAX {
+                actual_rate = closest_rate;
+            }
+        }
+        let sample_rate = actual_rate.max(1) as f32;
         self.ensure_synth_soundfont();
         self.engine.tempo_bpm.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         self.sync_track_audio_states();
-        let timeline = self.build_audio_clip_timeline(self.settings.sample_rate);
+        let timeline = self.build_audio_clip_timeline(actual_rate);
         {
             let mut guard = self.engine.audio_clips.lock();
             *guard = timeline;
@@ -2384,7 +2414,7 @@ impl DawApp {
                         PluginKind::Native => None,
                         PluginKind::Vst3 => vst3::Vst3Host::load(
                             &path,
-                            self.settings.sample_rate as f64,
+                            actual_rate as f64,
                             buffer_size_usize,
                             channels,
                         )
@@ -2403,7 +2433,7 @@ impl DawApp {
                                 clap_host::ClapHost::load(
                                     &path,
                                     &clap_id,
-                                    self.settings.sample_rate as f64,
+                                    actual_rate as f64,
                                     buffer_size_usize as u32,
                                     channels,
                                     channels.min(MAX_CLAP_OUTPUT_CHANNELS),
@@ -2497,7 +2527,7 @@ impl DawApp {
                         PluginKind::Native => None,
                         PluginKind::Vst3 => vst3::Vst3Host::load_with_input(
                             fx_path,
-                            self.settings.sample_rate as f64,
+                            actual_rate as f64,
                             buffer_size_usize,
                             channels,
                             channels,
@@ -2520,7 +2550,7 @@ impl DawApp {
                                 clap_host::ClapHost::load(
                                     fx_path,
                                     &clap_id,
-                                    self.settings.sample_rate as f64,
+                                    actual_rate as f64,
                                     buffer_size_usize as u32,
                                     channels,
                                     channels.min(MAX_CLAP_OUTPUT_CHANNELS),
@@ -2612,28 +2642,6 @@ impl DawApp {
         let audio_stats = self.engine.stats.clone();
 
         let mut stream_config: cpal::StreamConfig = config.clone().into();
-        let target_rate = self.settings.sample_rate;
-        let mut actual_rate = target_rate;
-        if let Ok(supported) = device.supported_output_configs() {
-            let mut found = false;
-            let mut closest_rate = 44100;
-            let mut min_diff = u32::MAX;
-            for conf in supported {
-                let min = conf.min_sample_rate().0;
-                let max = conf.max_sample_rate().0;
-                if target_rate >= min && target_rate <= max {
-                    found = true;
-                    break;
-                }
-                let diff_min = target_rate.abs_diff(min);
-                let diff_max = target_rate.abs_diff(max);
-                if diff_min < min_diff { min_diff = diff_min; closest_rate = min; }
-                if diff_max < min_diff { min_diff = diff_max; closest_rate = max; }
-            }
-            if !found && min_diff != u32::MAX {
-                actual_rate = closest_rate;
-            }
-        }
         stream_config.sample_rate = cpal::SampleRate(actual_rate);
         stream_config.buffer_size = cpal::BufferSize::Fixed(effective_buffer);
 
