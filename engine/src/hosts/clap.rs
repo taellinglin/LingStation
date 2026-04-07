@@ -21,10 +21,12 @@ use clap_sys::entry::clap_plugin_entry;
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 use clap_sys::plugin::clap_plugin_descriptor;
 use libloading::Library;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::clap_param_map::{normalized_to_plain, plain_to_normalized};
 use crate::error::{LingError, Result as LingResult};
 use crate::hosts::vst3::MidiEvent as VstMidiEvent;
 
@@ -33,6 +35,8 @@ pub struct ParamInfo {
     pub id: u32,
     pub name: String,
     pub default_value: f64,
+    pub min_value: f64,
+    pub max_value: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -192,13 +196,13 @@ pub struct ClapHost {
     input_events: EventBuffer,
     output_events: EventBuffer,
     pending_params: Vec<(u32, f64)>,
+    param_ranges: HashMap<u32, (f64, f64)>,
     gui_parent: Option<Window<'static>>,
     gui_open: bool,
     gui_size: Option<GuiSize>,
     gui_created: bool,
 }
 
-// Safety: ClapHost is only accessed behind a Mutex and never concurrently without locking.
 unsafe impl Send for ClapHost {}
 unsafe impl Sync for ClapHost {}
 
@@ -351,6 +355,7 @@ impl ClapHost {
             input_events: EventBuffer::with_capacity(2048),
             output_events: EventBuffer::with_capacity(2048),
             pending_params: Vec::new(),
+            param_ranges: HashMap::new(),
             gui_parent: None,
             gui_open: false,
             gui_size: None,
@@ -360,19 +365,27 @@ impl ClapHost {
 
     pub fn enumerate_params(&mut self) -> Vec<ParamInfo> {
         let Some(params) = self.params_ext else {
+            self.param_ranges.clear();
             return Vec::new();
         };
         let mut handle = self.instance.plugin_handle();
         let count = params.count(&mut handle);
         let mut buffer = ParamInfoBuffer::new();
         let mut out = Vec::with_capacity(count as usize);
+        self.param_ranges.clear();
+        self.param_ranges.reserve(count as usize);
         for index in 0..count {
             if let Some(info) = params.get_info(&mut handle, index, &mut buffer) {
+                let id = info.id.get();
                 let name = String::from_utf8_lossy(info.name).to_string();
+                self.param_ranges
+                    .insert(id, (info.min_value, info.max_value));
                 out.push(ParamInfo {
-                    id: info.id.get(),
+                    id,
                     name,
                     default_value: info.default_value,
+                    min_value: info.min_value,
+                    max_value: info.max_value,
                 });
             }
         }
@@ -386,8 +399,30 @@ impl ClapHost {
         if !value.is_finite() {
             return;
         }
-        let value = value.clamp(0.0, 1.0);
-        self.pending_params.push((param_id, value));
+        let norm = value.clamp(0.0, 1.0);
+        let plain = self
+            .param_ranges
+            .get(&param_id)
+            .and_then(|&(min, max)| normalized_to_plain(norm, min, max))
+            .unwrap_or(norm);
+        if !plain.is_finite() {
+            return;
+        }
+        self.pending_params.push((param_id, plain));
+    }
+
+    pub fn get_param_normalized(&mut self, param_id: u32) -> Option<f64> {
+        let params = self.params_ext?;
+        let id = ClapId::from_raw(param_id)?;
+        let mut handle = self.instance.plugin_handle();
+        let plain = params.get_value(&mut handle, id)?;
+        if !plain.is_finite() {
+            return None;
+        }
+        self.param_ranges
+            .get(&param_id)
+            .and_then(|&(min, max)| plain_to_normalized(plain, min, max))
+            .or(Some(plain.clamp(0.0, 1.0)))
     }
 
     pub fn param_changes_blocked(&self) -> bool {

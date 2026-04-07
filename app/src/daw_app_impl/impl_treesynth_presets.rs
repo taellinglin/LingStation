@@ -483,6 +483,12 @@ impl DawApp {
             .collect()
     }
 
+    pub(crate) fn clap_param_default_normalized(p: &clap_host::ParamInfo) -> f32 {
+        engine::clap_param_map::plain_to_normalized(p.default_value, p.min_value, p.max_value)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.5) as f32
+    }
+
     pub(crate) fn remap_param_values_by_id_or_name_clap(
         old_ids: &[u32],
         old_names: &[String],
@@ -504,7 +510,7 @@ impl DawApp {
                     .get(&p.id)
                     .copied()
                     .or_else(|| name_map.get(&Self::normalize_param_name(&p.name)).copied())
-                    .unwrap_or(p.default_value as f32)
+                    .unwrap_or_else(|| Self::clap_param_default_normalized(p))
             })
             .collect()
     }

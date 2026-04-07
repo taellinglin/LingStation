@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod clap_param_map;
 pub mod error;
 pub mod hosts;
 pub mod midi;

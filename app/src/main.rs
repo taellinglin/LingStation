@@ -1011,6 +1011,7 @@ fn is_window_visible(_hwnd: isize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::hosts::clap::ParamInfo;
 
     #[test]
     fn safe_join_rejects_traversal() {
@@ -1019,5 +1020,99 @@ mod tests {
 
         let child = DawApp::safe_join_within_base(base, "render").unwrap();
         assert!(child.starts_with(base));
+    }
+
+    fn clap_pi(id: u32, name: &str, def: f64, min: f64, max: f64) -> ParamInfo {
+        ParamInfo {
+            id,
+            name: name.to_string(),
+            default_value: def,
+            min_value: min,
+            max_value: max,
+        }
+    }
+
+    #[test]
+    fn clap_remap_preserves_by_id() {
+        let old_ids = vec![10u32, 20];
+        let old_names = vec!["a".to_string(), "b".to_string()];
+        let old_values = vec![0.25f32, 0.75];
+        let new_params = vec![
+            clap_pi(10, "a", 0.0, 0.0, 1.0),
+            clap_pi(20, "b", 0.0, 0.0, 1.0),
+        ];
+        let out = DawApp::remap_param_values_by_id_or_name_clap(
+            &old_ids,
+            &old_names,
+            &old_values,
+            &new_params,
+        );
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.25).abs() < 1e-5);
+        assert!((out[1] - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clap_remap_reorders_same_len() {
+        let old_ids = vec![1, 2];
+        let old_names = vec!["x".to_string(), "y".to_string()];
+        let old_values = vec![0.1, 0.9];
+        let new_params = vec![
+            clap_pi(2, "y", 0.0, 0.0, 1.0),
+            clap_pi(1, "x", 0.0, 0.0, 1.0),
+        ];
+        let out = DawApp::remap_param_values_by_id_or_name_clap(
+            &old_ids,
+            &old_names,
+            &old_values,
+            &new_params,
+        );
+        assert!((out[0] - 0.9).abs() < 1e-5);
+        assert!((out[1] - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clap_remap_name_fallback_when_id_changes() {
+        let old_ids = vec![99];
+        let old_names = vec!["Cutoff".to_string()];
+        let old_values = vec![0.6];
+        let new_params = vec![clap_pi(100, "Cutoff", 2000.0, 20.0, 20000.0)];
+        let out = DawApp::remap_param_values_by_id_or_name_clap(
+            &old_ids,
+            &old_names,
+            &old_values,
+            &new_params,
+        );
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clap_remap_default_is_normalized_plain_range() {
+        let old_ids = vec![1u32];
+        let old_names = vec!["gone".to_string()];
+        let old_values = vec![0.99];
+        let new_params = vec![clap_pi(2, "newp", 500.0, 0.0, 1000.0)];
+        let out = DawApp::remap_param_values_by_id_or_name_clap(
+            &old_ids,
+            &old_names,
+            &old_values,
+            &new_params,
+        );
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clap_param_default_normalized_fallback() {
+        let p = ParamInfo {
+            id: 1,
+            name: "x".into(),
+            default_value: f64::NAN,
+            min_value: 0.0,
+            max_value: 1.0,
+        };
+        let n = DawApp::clap_param_default_normalized(&p);
+        assert!((n - 0.5).abs() < 1e-5);
     }
 }

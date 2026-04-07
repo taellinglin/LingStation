@@ -89,14 +89,12 @@ impl DawApp {
             return;
         }
         if let Some(track) = self.tracks.get_mut(index) {
-            if track.param_values.len() != params.len() {
-                track.param_values = Self::remap_param_values_by_id_or_name_clap(
-                    &track.param_ids,
-                    &track.params,
-                    &track.param_values,
-                    &params,
-                );
-            }
+            track.param_values = Self::remap_param_values_by_id_or_name_clap(
+                &track.param_ids,
+                &track.params,
+                &track.param_values,
+                &params,
+            );
             track.params = params.iter().map(|p| p.name.clone()).collect();
             track.param_ids = params.iter().map(|p| p.id).collect();
             Self::log_fm_ratio_param_from(index, "refresh_clap", &track.params, &track.param_ids, &track.param_values);

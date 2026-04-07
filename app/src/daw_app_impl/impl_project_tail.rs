@@ -2474,35 +2474,46 @@ impl DawApp {
                                     .as_ref()
                                     .map(|v| !v.is_empty())
                                     .unwrap_or(false);
-                            let allow_state_restore = if kind == PluginKind::Clap {
-                                // Disabled for CLAP runtime init path to avoid plugin crashes
-                                // from stale/incompatible serialized state.
-                                false
-                            } else {
-                                true
-                            };
-                            if has_state && allow_state_restore {
-                                let _ = host.set_state_bytes(
+                            if has_state {
+                                let restore = host.set_state_bytes(
                                     component.as_deref(),
                                     controller.as_deref(),
                                 );
-                                if let Some(track) = self.tracks.get_mut(index) {
-                                    if track.param_values.len() != track.param_ids.len() {
-                                        track.param_values.resize(track.param_ids.len(), 0.0);
+                                if let Err(e) = &restore {
+                                    if kind == PluginKind::Clap {
+                                        log::warn!(
+                                            "CLAP state restore failed for track {} instrument {}: {}",
+                                            index,
+                                            path,
+                                            e
+                                        );
                                     }
-                                    for (slot, param_id) in track.param_ids.iter().enumerate() {
-                                        if let Some(value) = host.get_param_normalized(*param_id) {
-                                            if let Some(target) = track.param_values.get_mut(slot) {
-                                                *target = value as f32;
+                                }
+                                let refresh_from_host =
+                                    restore.is_ok() || kind != PluginKind::Clap;
+                                if refresh_from_host {
+                                    if let Some(track) = self.tracks.get_mut(index) {
+                                        if track.param_values.len() != track.param_ids.len() {
+                                            track.param_values.resize(track.param_ids.len(), 0.0);
+                                        }
+                                        for (slot, param_id) in track.param_ids.iter().enumerate() {
+                                            if let Some(value) = host.get_param_normalized(*param_id) {
+                                                if let Some(target) = track.param_values.get_mut(slot)
+                                                {
+                                                    *target = value as f32;
+                                                }
                                             }
                                         }
                                     }
+                                } else if kind == PluginKind::Clap && !track.param_ids.is_empty() {
+                                    for (param_id, value) in track
+                                        .param_ids
+                                        .iter()
+                                        .zip(track.param_values.iter())
+                                    {
+                                        host.push_param_change(*param_id, *value as f64);
+                                    }
                                 }
-                            } else if has_state && kind == PluginKind::Clap {
-                                log::warn!(
-                                    "CLAP state restore skipped for track {} during runtime init",
-                                    index
-                                );
                             } else if !track.param_ids.is_empty() {
                                 for (param_id, value) in
                                     track.param_ids.iter().zip(track.param_values.iter())

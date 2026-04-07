@@ -385,7 +385,7 @@ impl PluginHostHandle {
     pub fn get_param_normalized(&self, param_id: u32) -> Option<f64> {
         match self {
             PluginHostHandle::Vst3(h) => h.lock().get_param_normalized(param_id),
-            PluginHostHandle::Clap(_) => None,
+            PluginHostHandle::Clap(h) => h.lock().get_param_normalized(param_id),
         }
     }
 }
