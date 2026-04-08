@@ -481,7 +481,7 @@ impl Default for DawApp {
             piano_snap: 0.25,
             piano_roll_hovered: false,
             piano_key_down: None,
-            drum_pad_note_down: None,
+            drum_pad_note_down: Vec::new(),
             piano_lane_mode: PianoLaneMode::Velocity,
             piano_cc: 1,
             import_path: "project.mid".to_string(),
@@ -624,6 +624,17 @@ impl Default for DawApp {
         app.load_settings_or_default();
         app.ensure_device_id();
         app.refresh_license_status();
+        let default_example = PathBuf::from("examples").join("SeekTheLight");
+        if default_example.exists() {
+            if let Err(err) = app.load_project_from_folder(&default_example) {
+                app.status = format!("Default example load failed: {err}");
+            }
+        } else {
+            app.status = format!(
+                "Default example missing: {}",
+                default_example.to_string_lossy()
+            );
+        }
         if app.settings.play_startup_sound {
             if let Err(err) = app.play_startup_sound() {
                 app.status = format!("Startup sound failed: {err}");

@@ -341,6 +341,11 @@ impl DawApp {
 
     pub(crate) fn sync_track_audio_states(&mut self) {
         self.rebuild_all_track_midi_notes();
+        let project_root = if self.project_path.trim().is_empty() {
+            None
+        } else {
+            Some(Path::new(self.project_path.trim()))
+        };
         let mut pending_default_kits: Vec<usize> = Vec::new();
         for (track_index, track) in self.tracks.iter_mut().enumerate() {
             if track
@@ -371,7 +376,11 @@ impl DawApp {
                 track.drum_machine = Some(DrumMachineState::default());
             }
             if let Some(drums) = track.drum_machine.as_mut() {
-                Self::resolve_and_preload_drummachine_state(drums, &self.engine.audio_cache);
+                Self::resolve_and_preload_drummachine_state(
+                    drums,
+                    &self.engine.audio_cache,
+                    project_root,
+                );
                 if drums.pads.iter().all(|pad| pad.path.is_none()) {
                     pending_default_kits.push(track_index);
                 }
@@ -1030,7 +1039,7 @@ impl DawApp {
         let now = ctx.input(|i| i.time);
         if self.audio_running {
             let samples = self.engine.transport_samples.load(Ordering::Relaxed) as f32;
-            let sample_rate = self.settings.sample_rate.max(1) as f32;
+            let sample_rate = self.engine.sample_rate.max(1.0);
             let seconds = samples / sample_rate;
             if self.arrangement_playback_enabled() {
                 self.playhead_beats = seconds * (self.tempo_bpm / 60.0);
@@ -1050,10 +1059,15 @@ impl DawApp {
     }
 
     pub(crate) fn update_loop_samples(&mut self) {
+        let sample_rate = if self.audio_running {
+            self.engine.sample_rate.max(1.0) as u32
+        } else {
+            self.settings.sample_rate.max(1)
+        };
         if let (Some(start), Some(end)) = (self.loop_start_beats, self.loop_end_beats) {
             if end > start {
-                let start_samples = self.beats_to_samples(start, self.settings.sample_rate);
-                let end_samples = self.beats_to_samples(end, self.settings.sample_rate);
+                let start_samples = self.beats_to_samples(start, sample_rate);
+                let end_samples = self.beats_to_samples(end, sample_rate);
                 self.engine.loop_start_samples.store(start_samples, Ordering::Relaxed);
                 self.engine.loop_end_samples.store(end_samples.max(start_samples + 1), Ordering::Relaxed);
                 return;
@@ -1068,7 +1082,12 @@ impl DawApp {
         self.playhead_beats = beats;
         let tempo = self.tempo_bpm.max(1.0);
         let seconds = beats * 60.0 / tempo;
-        let samples = (seconds * self.settings.sample_rate as f32).max(0.0) as u64;
+        let sample_rate = if self.audio_running {
+            self.engine.sample_rate.max(1.0)
+        } else {
+            self.settings.sample_rate.max(1) as f32
+        };
+        let samples = (seconds * sample_rate).max(0.0) as u64;
         self.engine.transport_samples.store(samples, Ordering::Relaxed);
         self.last_frame_time = None;
     }

@@ -1170,31 +1170,53 @@ impl DawApp {
             .map(|e| e.eq_ignore_ascii_case("wav"))
             .unwrap_or(false);
         if is_wav {
-            let mut reader = hound::WavReader::open(path).ok()?;
-            let spec = reader.spec();
-            let channels = spec.channels.max(1) as usize;
-            let mut samples = Vec::new();
-            match spec.sample_format {
-                hound::SampleFormat::Float => {
-                    for sample in reader.samples::<f32>() {
-                        samples.push(sample.ok()?);
+            if let Ok(mut reader) = hound::WavReader::open(path) {
+                let spec = reader.spec();
+                let channels = spec.channels.max(1) as usize;
+                let mut samples = Vec::new();
+                let mut failed = false;
+                match spec.sample_format {
+                    hound::SampleFormat::Float => {
+                        for sample in reader.samples::<f32>() {
+                            match sample {
+                                Ok(value) => samples.push(value),
+                                Err(_) => {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    hound::SampleFormat::Int => {
+                        if spec.bits_per_sample <= 16 {
+                            let max = i16::MAX as f32;
+                            for sample in reader.samples::<i16>() {
+                                match sample {
+                                    Ok(value) => samples.push(value as f32 / max),
+                                    Err(_) => {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            let max = i32::MAX as f32;
+                            for sample in reader.samples::<i32>() {
+                                match sample {
+                                    Ok(value) => samples.push(value as f32 / max),
+                                    Err(_) => {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                hound::SampleFormat::Int => {
-                    if spec.bits_per_sample <= 16 {
-                        let max = i16::MAX as f32;
-                        for sample in reader.samples::<i16>() {
-                            samples.push(sample.ok()? as f32 / max);
-                        }
-                    } else {
-                        let max = i32::MAX as f32;
-                        for sample in reader.samples::<i32>() {
-                            samples.push(sample.ok()? as f32 / max);
-                        }
-                    }
+                if !failed {
+                    return Some((samples, channels, spec.sample_rate));
                 }
             }
-            return Some((samples, channels, spec.sample_rate));
         }
 
         let file = std::fs::File::open(path).ok()?;
@@ -1916,7 +1938,7 @@ impl DawApp {
 
     pub(crate) fn current_transport_beat(&self) -> f32 {
         if self.audio_running {
-            let sample_rate = self.settings.sample_rate.max(1) as f32;
+            let sample_rate = self.engine.sample_rate.max(1.0);
             let bpm = self.tempo_bpm.max(1.0);
             let samples = self.engine.transport_samples.load(Ordering::Relaxed) as f32;
             (samples / sample_rate) * (bpm / 60.0)
@@ -2416,6 +2438,7 @@ impl DawApp {
             }
         }
         let sample_rate = actual_rate.max(1) as f32;
+        self.engine.sample_rate = sample_rate;
         self.ensure_synth_soundfont();
         self.engine.tempo_bpm.store(self.tempo_bpm.to_bits(), Ordering::Relaxed);
         self.sync_track_audio_states();

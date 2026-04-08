@@ -989,6 +989,9 @@ pub fn mix_track_hosts(
     let transport_pos = transport_samples.load(Ordering::Relaxed);
     let playback_enabled = arrangement_playback_enabled.load(Ordering::Relaxed);
     let panic_all = playback_panic.load(Ordering::Relaxed);
+    if panic_all {
+        playback_panic.store(false, Ordering::Relaxed);
+    }
     let loop_start = loop_start_samples.load(Ordering::Relaxed);
     let loop_end = loop_end_samples.load(Ordering::Relaxed);
     let is_looping = loop_end > loop_start;

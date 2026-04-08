@@ -111,7 +111,8 @@ impl DawApp {
             {
                 state.selected_pad = bank_base.min(state.pads.len().saturating_sub(1));
             }
-            if let Some(prev) = self.drum_pad_note_down.take() {
+            let prev_notes: Vec<u8> = self.drum_pad_note_down.drain(..).collect();
+            for prev in prev_notes {
                 self.piano_preview_note_off(prev);
             }
         }
@@ -170,11 +171,10 @@ impl DawApp {
                         } else {
                             100
                         };
-                        if let Some(prev) = self.drum_pad_note_down.take() {
-                            self.piano_preview_note_off(prev);
-                        }
                         self.piano_preview_note_on(note, vel);
-                        self.drum_pad_note_down = Some(note);
+                        if !self.drum_pad_note_down.contains(&note) {
+                            self.drum_pad_note_down.push(note);
+                        }
                     }
                 }
             });
@@ -182,7 +182,8 @@ impl DawApp {
         }
 
         if ui.input(|i| i.pointer.any_released()) {
-            if let Some(prev) = self.drum_pad_note_down.take() {
+            let prev_notes: Vec<u8> = self.drum_pad_note_down.drain(..).collect();
+            for prev in prev_notes {
                 self.piano_preview_note_off(prev);
             }
         }
@@ -341,7 +342,16 @@ impl DawApp {
             return;
         };
         if Self::populate_drummachine_from_samples(state, &samples_root) {
-            Self::resolve_and_preload_drummachine_state(state, &self.engine.audio_cache);
+            let project_root = if self.project_path.trim().is_empty() {
+                None
+            } else {
+                Some(Path::new(self.project_path.trim()))
+            };
+            Self::resolve_and_preload_drummachine_state(
+                state,
+                &self.engine.audio_cache,
+                project_root,
+            );
             if let Some(audio_state) = self.engine.track_audio.get_mut(track_index) {
                 audio_state.sync_drum_machine(track, true);
             }
@@ -679,6 +689,48 @@ impl DawApp {
         None
     }
 
+    pub(crate) fn resolve_drum_sample_path_with_project_root(
+        path: &str,
+        project_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if candidate.is_absolute() {
+            let file_name = candidate.file_name().map(|s| s.to_string_lossy().to_string());
+            if let Some(file_name) = file_name {
+                for root in Self::drummachine_samples_roots(project_root) {
+                    if let Some(found) = Self::find_sample_by_name(&root, &file_name) {
+                        return Some(found);
+                    }
+                }
+            }
+            return None;
+        }
+        for root in Self::drummachine_samples_roots(project_root) {
+            let from_root = root.join(path);
+            if from_root.exists() {
+                return Some(from_root);
+            }
+            let file_name = Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string());
+            if let Some(file_name) = file_name {
+                if let Some(found) = Self::find_sample_by_name(&root, &file_name) {
+                    return Some(found);
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            let from_cwd = cwd.join(path);
+            if from_cwd.exists() {
+                return Some(from_cwd);
+            }
+        }
+        None
+    }
+
     fn find_sample_by_name(root: &Path, file_name: &str) -> Option<PathBuf> {
         let entries = fs::read_dir(root).ok()?;
         for entry in entries.flatten() {
@@ -701,13 +753,17 @@ impl DawApp {
     pub(crate) fn resolve_and_preload_drummachine_state(
         state: &mut DrumMachineState,
         audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
+        project_root: Option<&Path>,
     ) {
         let mut cache = audio_clip_cache.lock();
         for pad in &mut state.pads {
             let Some(path_str) = pad.path.as_ref() else {
                 continue;
             };
-            let resolved = Self::resolve_drum_sample_path(path_str)
+            let resolved = Self::resolve_drum_sample_path_with_project_root(
+                path_str,
+                project_root,
+            )
                 .unwrap_or_else(|| PathBuf::from(path_str));
             let resolved_str = resolved.to_string_lossy().to_string();
             if resolved_str != *path_str {
