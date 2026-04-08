@@ -461,6 +461,7 @@ impl DawApp {
                 midi_cc_lanes,
                 midi_program,
                 treesynth: None,
+                drum_machine: None,
             });
         }
 

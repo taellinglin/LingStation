@@ -194,7 +194,7 @@ impl DawApp {
                                 egui::ComboBox::from_id_source("sample_rate")
                                     .selected_text(format!("{}", self.settings.sample_rate))
                                     .show_ui(ui, |ui| {
-                                        for rate in [44_100u32, 48_000, 96_000] {
+                                        for rate in [44_100u32, 48_000, 96_000, 176_400, 192_000] {
                                             if ui
                                                 .selectable_label(
                                                     self.settings.sample_rate == rate,

@@ -213,6 +213,47 @@ pub struct TreeSynthRuntime {
     pub last_note: Option<u8>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct DrumMachineFilterState {
+    pub lp: f32,
+    pub bp: f32,
+}
+
+#[derive(Clone)]
+pub struct DrumMachineVoice {
+    pub pad_index: usize,
+    pub sample_pos: f64,
+    pub sample_end: f64,
+    pub step: f64,
+    pub start_sample: u64,
+    pub gain: f32,
+    pub pan: f32,
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub output_pair: usize,
+    pub note: u8,
+    pub filter: DrumMachineFilterState,
+}
+
+#[derive(Clone)]
+pub struct DrumMachineRuntime {
+    pub voices: Vec<DrumMachineVoice>,
+}
+
+impl Default for DrumMachineRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DrumMachineRuntime {
+    pub fn new() -> Self {
+        Self {
+            voices: Vec::with_capacity(64),
+        }
+    }
+}
+
 impl Default for TreeSynthRuntime {
     fn default() -> Self {
         Self::new()
@@ -246,6 +287,9 @@ pub struct TrackAudioState {
     pub treesynth_enabled: Arc<AtomicBool>,
     pub treesynth_state: Option<Arc<Mutex<TreeSynthState>>>,
     pub treesynth_runtime: Arc<Mutex<TreeSynthRuntime>>,
+    pub drum_machine_state: Option<Arc<Mutex<DrumMachineState>>>,
+    pub drum_machine_runtime: Arc<Mutex<DrumMachineRuntime>>,
+    pub drum_machine_enabled: Arc<AtomicBool>,
     pub automation_lanes: Arc<Mutex<Vec<AutomationLane>>>,
     pub effect_bypass: Arc<Mutex<Vec<bool>>>,
     pub midi_events: Arc<Mutex<Vec<vst3::MidiEvent>>>,
@@ -259,6 +303,7 @@ pub struct TrackAudioState {
     pub fx_in_peaks: Arc<Mutex<Vec<f32>>>,
     pub fx_out_peaks: Arc<Mutex<Vec<f32>>>,
     pub track_buffer: Arc<Mutex<Vec<f32>>>,
+    pub native_output_channels: Arc<AtomicU32>,
     pub silent_blocks: Arc<AtomicU64>,
 }
 
@@ -392,6 +437,15 @@ impl PluginHostHandle {
 
 impl TrackAudioState {
     pub fn from_track(track: &Track) -> Self {
+        let drum_state = track
+            .drum_machine
+            .clone()
+            .unwrap_or_else(DrumMachineState::default);
+        let native_output_channels = if track.drum_machine.is_some() {
+            (DRUM_MACHINE_OUTPUT_PAIRS * 2) as u32
+        } else {
+            2
+        };
         Self {
             host: None,
             effect_hosts: Vec::new(),
@@ -402,6 +456,9 @@ impl TrackAudioState {
                 .as_ref()
                 .map(|t| Arc::new(Mutex::new(t.clone()))),
             treesynth_runtime: Arc::new(Mutex::new(TreeSynthRuntime::new())),
+            drum_machine_state: Some(Arc::new(Mutex::new(drum_state))),
+            drum_machine_runtime: Arc::new(Mutex::new(DrumMachineRuntime::new())),
+            drum_machine_enabled: Arc::new(AtomicBool::new(track.drum_machine.is_some())),
             automation_lanes: Arc::new(Mutex::new(track.automation_lanes.clone())),
             effect_bypass: Arc::new(Mutex::new(track.effect_bypass.clone())),
             midi_events: Arc::new(Mutex::new(Vec::new())),
@@ -415,6 +472,7 @@ impl TrackAudioState {
             fx_in_peaks: Arc::new(Mutex::new(Vec::new())),
             fx_out_peaks: Arc::new(Mutex::new(Vec::new())),
             track_buffer: Arc::new(Mutex::new(Vec::new())),
+            native_output_channels: Arc::new(AtomicU32::new(native_output_channels)),
             silent_blocks: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -445,6 +503,31 @@ impl TrackAudioState {
                 .map(|t| Arc::new(Mutex::new(t.clone())));
         } else {
             self.treesynth_state = None;
+        }
+    }
+
+    pub fn sync_drum_machine(&mut self, track: &Track, enabled: bool) {
+        if enabled {
+            let next_state = track
+                .drum_machine
+                .clone()
+                .unwrap_or_else(DrumMachineState::default);
+            if let Some(state) = self.drum_machine_state.as_ref() {
+                *state.lock() = next_state;
+            } else {
+                self.drum_machine_state = Some(Arc::new(Mutex::new(next_state)));
+            }
+        }
+        self.drum_machine_enabled.store(enabled, Ordering::Relaxed);
+        let channels = if enabled {
+            (DRUM_MACHINE_OUTPUT_PAIRS * 2) as u32
+        } else {
+            2
+        };
+        self.native_output_channels.store(channels, Ordering::Relaxed);
+        if !enabled {
+            self.drum_machine_state = None;
+            self.drum_machine_runtime.lock().voices.clear();
         }
     }
 }

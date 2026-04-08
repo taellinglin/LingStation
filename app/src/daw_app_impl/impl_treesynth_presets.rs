@@ -3,6 +3,9 @@ impl DawApp {
         if Self::is_treesynth_path(path) {
             return "TreeSynth".to_string();
         }
+        if Self::is_drummachine_path(path) {
+            return "Drum Machine".to_string();
+        }
         let candidate = Path::new(path)
             .file_stem()
             .or_else(|| Path::new(path).file_name())

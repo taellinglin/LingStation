@@ -36,6 +36,7 @@ impl DawApp {
             midi_cc_lanes: Vec::new(),
             midi_program: None,
             treesynth: None,
+            drum_machine: None,
         }];
         self.selected_clip = None;
         self.selected_track = Some(0);
@@ -134,6 +135,7 @@ impl DawApp {
             midi_cc_lanes: Vec::new(),
             midi_program: None,
             treesynth: None,
+            drum_machine: None,
         });
         self.selected_track = Some(self.tracks.len().saturating_sub(1));
         self.refresh_params_for_selected_track(true);
@@ -327,6 +329,9 @@ impl DawApp {
             if track.treesynth.is_some() {
                 track.instrument_path = Some("native:treesynth".to_string());
             }
+            if track.drum_machine.is_some() {
+                track.instrument_path = Some("native:drummachine".to_string());
+            }
         }
         let state = ProjectState {
             name: self.project_name.clone(),
@@ -516,6 +521,19 @@ impl DawApp {
                 Self::resolve_treesynth_paths_from_project_root(treesynth, &project_root);
             }
         }
+        for track in &mut self.tracks {
+            if let Some(drums) = track.drum_machine.as_mut() {
+                if !track
+                    .instrument_path
+                    .as_deref()
+                    .map(Self::is_drummachine_path)
+                    .unwrap_or(false)
+                {
+                    track.instrument_path = Some("native:drummachine".to_string());
+                }
+                Self::resolve_drummachine_paths_from_project_root(drums, &project_root);
+            }
+        }
         {
             let mut master = self.engine.master_comp.lock();
             *master = state.master_settings.clone();
@@ -571,6 +589,21 @@ impl DawApp {
             let path = Path::new(&sample.path);
             if path.is_relative() {
                 sample.path = project_root.join(path).to_string_lossy().to_string();
+            }
+        }
+    }
+
+    pub(crate) fn resolve_drummachine_paths_from_project_root(
+        state: &mut DrumMachineState,
+        project_root: &Path,
+    ) {
+        for pad in &mut state.pads {
+            let Some(path_str) = pad.path.as_ref() else {
+                continue;
+            };
+            let path = Path::new(path_str);
+            if path.is_relative() {
+                pad.path = Some(project_root.join(path).to_string_lossy().to_string());
             }
         }
     }
@@ -4270,6 +4303,14 @@ impl DawApp {
             display: "TreeSynth (Sampler)".to_string(),
             category: PluginCategory::Native,
             instrument_only: true,
+        },
+        PluginCandidate {
+            path: "native:drummachine".to_string(),
+            kind: PluginKind::Native,
+            clap_id: None,
+            display: "Drum Machine (Sampler)".to_string(),
+            category: PluginCategory::Native,
+            instrument_only: true,
         }];
 
         let mut bundled = Vec::new();
@@ -4358,6 +4399,10 @@ impl DawApp {
 
     pub(crate) fn is_treesynth_path(path: &str) -> bool {
         path.eq_ignore_ascii_case("native:treesynth")
+    }
+
+    pub(crate) fn is_drummachine_path(path: &str) -> bool {
+        path.eq_ignore_ascii_case("native:drummachine")
     }
 
     pub(crate) fn is_bundled_plugin_path(path: &str) -> bool {
@@ -4656,6 +4701,11 @@ impl DawApp {
             } else {
                 track.treesynth = None;
             }
+            if Self::is_drummachine_path(track.instrument_path.as_deref().unwrap_or("")) {
+                track.drum_machine = Some(DrumMachineState::default());
+            } else {
+                track.drum_machine = None;
+            }
         }
         let treesynth_enabled = self
             .tracks
@@ -4667,11 +4717,22 @@ impl DawApp {
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+        let drummachine_enabled = self
+            .tracks
+            .get(index)
+            .map(|t| {
+                t.instrument_path
+                    .as_deref()
+                    .map(Self::is_drummachine_path)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
         if let (Some(state), Some(track)) = (
             self.engine.track_audio.get_mut(index),
             self.tracks.get(index),
         ) {
             state.sync_treesynth(track, treesynth_enabled, &self.engine.audio_cache);
+            state.sync_drum_machine(track, drummachine_enabled);
         }
         if let Some(state) = self.engine.track_audio.get_mut(index) {
             if let Some(mut host) = state.host.take() {

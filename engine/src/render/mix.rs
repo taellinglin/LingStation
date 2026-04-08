@@ -1,5 +1,6 @@
 use crate::audio::{
-    AudioClipCache, AudioClipData, TrackAudioState, TreeSynthRuntime, TreeSynthVoice,
+    AudioClipCache, AudioClipData, DrumMachineFilterState, TrackAudioState, TreeSynthRuntime,
+    TreeSynthVoice,
 };
 use crate::hosts::vst3;
 use crate::models::PluginHostHandle;
@@ -200,18 +201,6 @@ pub(crate) fn mix_treesynth_block(
     state: &TrackAudioState,
     audio_cache: &Arc<Mutex<AudioClipCache>>,
 ) -> (bool, Vec<vst3::MidiEvent>) {
-    let treesynth_state = match state
-        .treesynth_state
-        .as_ref()
-        .and_then(|arc| arc.try_lock())
-    {
-        Some(guard) => (*guard).clone(),
-        None => return (false, Vec::new()),
-    };
-    if treesynth_state.samples.is_empty() {
-        return (false, Vec::new());
-    }
-
     let mut events = collect_block_events(notes, block_start, block_end, samples_per_beat);
     events.extend(extra_events.iter().cloned());
     if panic_notes {
@@ -229,6 +218,18 @@ pub(crate) fn mix_treesynth_block(
     }
     if let Some(mut queued) = state.midi_events.try_lock() {
         events.extend(queued.drain(..));
+    }
+
+    let treesynth_state = match state
+        .treesynth_state
+        .as_ref()
+        .and_then(|arc| arc.try_lock())
+    {
+        Some(guard) => (*guard).clone(),
+        None => return (false, events),
+    };
+    if treesynth_state.samples.is_empty() {
+        return (false, events);
     }
 
     let mut runtime = match state.treesynth_runtime.try_lock() {
@@ -521,6 +522,435 @@ pub(crate) fn mix_treesynth_block(
     (processed, events)
 }
 
+#[derive(Clone, Copy)]
+struct DrumMachineNoteEvent {
+    note: u8,
+    velocity: u8,
+    sample_offset: u64,
+    pan: f32,
+    cutoff: f32,
+    resonance: f32,
+    note_on: bool,
+}
+
+fn drum_machine_pad_index(note: u8) -> Option<usize> {
+    let idx = note as i32 - DRUM_MACHINE_BASE_NOTE as i32;
+    if idx >= 0 && (idx as usize) < DRUM_MACHINE_PAD_COUNT {
+        Some(idx as usize)
+    } else {
+        None
+    }
+}
+
+fn collect_drum_machine_events(
+    notes: &[PianoRollNote],
+    block_start: u64,
+    block_end: u64,
+    samples_per_beat: f64,
+    out: &mut Vec<DrumMachineNoteEvent>,
+) {
+    out.clear();
+    for note in notes {
+        let start_sample = (note.start_beats as f64 * samples_per_beat).round() as u64;
+        let mut end_sample =
+            ((note.start_beats + note.length_beats) as f64 * samples_per_beat).round() as u64;
+        if end_sample <= start_sample {
+            end_sample = start_sample.saturating_add(1);
+        }
+        if start_sample >= block_start && start_sample < block_end {
+            out.push(DrumMachineNoteEvent {
+                note: note.midi_note,
+                velocity: note.velocity,
+                sample_offset: start_sample.saturating_sub(block_start),
+                pan: note.pan,
+                cutoff: note.cutoff,
+                resonance: note.resonance,
+                note_on: true,
+            });
+        }
+        if end_sample >= block_start && end_sample < block_end {
+            out.push(DrumMachineNoteEvent {
+                note: note.midi_note,
+                velocity: 0,
+                sample_offset: end_sample.saturating_sub(block_start),
+                pan: note.pan,
+                cutoff: note.cutoff,
+                resonance: note.resonance,
+                note_on: false,
+            });
+        }
+    }
+}
+
+fn drum_machine_lowpass(
+    sample: f32,
+    cutoff: f32,
+    resonance: f32,
+    sample_rate: f32,
+    state: &mut DrumMachineFilterState,
+) -> f32 {
+    let cutoff = cutoff.clamp(0.0, 1.0);
+    if cutoff >= 0.999 {
+        return sample;
+    }
+    let min_hz = 30.0f32;
+    let max_hz = 20_000.0f32;
+    let freq = min_hz * (max_hz / min_hz).powf(cutoff);
+    let g = (std::f32::consts::PI * freq / sample_rate.max(1.0)).tan();
+    let q = (0.5 + resonance.clamp(0.0, 1.0) * 9.5).max(0.5);
+    let k = 1.0 / q;
+    let a1 = 1.0 / (1.0 + g * (g + k));
+    let a2 = g * a1;
+    let a3 = g * a2;
+    let v3 = sample - state.lp - k * state.bp;
+    let v2 = state.bp + a2 * v3;
+    state.bp = v2;
+    state.lp = state.lp + a3 * v3;
+    state.lp
+}
+
+fn drum_machine_env(
+    attack_ms: f32,
+    decay_ms: f32,
+    sustain: f32,
+    release_ms: f32,
+    elapsed: f32,
+    remaining: f32,
+) -> f32 {
+    let attack = (attack_ms.max(0.0) / 1000.0).max(0.0001);
+    let decay = (decay_ms.max(0.0) / 1000.0).max(0.0001);
+    let sustain = sustain.clamp(0.0, 1.0);
+    let release = (release_ms.max(0.0) / 1000.0).max(0.0001);
+
+    let mut level = if elapsed <= 0.0 {
+        0.0
+    } else if elapsed < attack {
+        (elapsed / attack).clamp(0.0, 1.0)
+    } else if elapsed < attack + decay {
+        let t = (elapsed - attack) / decay;
+        (1.0 - (1.0 - sustain) * t).clamp(0.0, 1.0)
+    } else {
+        sustain
+    };
+
+    if remaining <= release {
+        let tail = (remaining / release).clamp(0.0, 1.0);
+        level *= tail;
+    }
+
+    level
+}
+
+pub(crate) fn mix_drum_machine_block(
+    temp: &mut [f32],
+    channels: usize,
+    sample_rate: f32,
+    block_start: u64,
+    block_end: u64,
+    samples_per_beat: f64,
+    panic_notes: bool,
+    loop_wrapped: bool,
+    notes: &[PianoRollNote],
+    extra_events: &[vst3::MidiEvent],
+    state: &TrackAudioState,
+    audio_cache: &Arc<Mutex<AudioClipCache>>,
+) -> (bool, Vec<vst3::MidiEvent>) {
+    let drums_state = match state
+        .drum_machine_state
+        .as_ref()
+        .and_then(|arc| arc.try_lock())
+    {
+        Some(guard) => (*guard).clone(),
+        None => return (false, Vec::new()),
+    };
+    if drums_state.pads.is_empty() {
+        return (false, Vec::new());
+    }
+
+    let mut events = collect_block_events(notes, block_start, block_end, samples_per_beat);
+    events.extend(extra_events.iter().cloned());
+    if panic_notes {
+        for channel in 0u8..16 {
+            events.push(vst3::MidiEvent::control_change(channel, 120, 0));
+            events.push(vst3::MidiEvent::control_change(channel, 123, 0));
+        }
+        for channel in 0u8..16 {
+            events.extend(
+                (0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
+            );
+        }
+    }
+    if loop_wrapped {
+        events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
+    }
+    let mut note_events = Vec::with_capacity(64);
+    collect_drum_machine_events(notes, block_start, block_end, samples_per_beat, &mut note_events);
+    for event in extra_events {
+        match *event {
+            vst3::MidiEvent::NoteOn {
+                note,
+                velocity,
+                sample_offset,
+                ..
+            } => {
+                let vel = if velocity == 0 { 0 } else { velocity };
+                note_events.push(DrumMachineNoteEvent {
+                    note,
+                    velocity: vel,
+                    sample_offset: sample_offset.max(0) as u64,
+                    pan: 0.0,
+                    cutoff: 0.5,
+                    resonance: 0.0,
+                    note_on: vel > 0,
+                });
+            }
+            vst3::MidiEvent::NoteOff {
+                note,
+                sample_offset,
+                ..
+            } => {
+                note_events.push(DrumMachineNoteEvent {
+                    note,
+                    velocity: 0,
+                    sample_offset: sample_offset.max(0) as u64,
+                    pan: 0.0,
+                    cutoff: 0.5,
+                    resonance: 0.0,
+                    note_on: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(mut queued) = state.midi_events.try_lock() {
+        for event in queued.drain(..) {
+            events.push(event);
+            match event {
+                vst3::MidiEvent::NoteOn {
+                    note,
+                    velocity,
+                    sample_offset,
+                    ..
+                } => {
+                    let vel = if velocity == 0 { 0 } else { velocity };
+                    note_events.push(DrumMachineNoteEvent {
+                        note,
+                        velocity: vel,
+                        sample_offset: sample_offset.max(0) as u64,
+                        pan: 0.0,
+                        cutoff: 0.5,
+                        resonance: 0.0,
+                        note_on: vel > 0,
+                    });
+                }
+                vst3::MidiEvent::NoteOff {
+                    note,
+                    sample_offset,
+                    ..
+                } => {
+                    note_events.push(DrumMachineNoteEvent {
+                        note,
+                        velocity: 0,
+                        sample_offset: sample_offset.max(0) as u64,
+                        pan: 0.0,
+                        cutoff: 0.5,
+                        resonance: 0.0,
+                        note_on: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let sample_count = drums_state.pads.len();
+    let sample_data: Vec<Option<Arc<AudioClipData>>> = if let Some(mut cache) = audio_cache.try_lock() {
+        drums_state
+            .pads
+            .iter()
+            .map(|pad| pad.path.as_ref().and_then(|path| cache.get(path)))
+            .collect()
+    } else {
+        vec![None; sample_count]
+    };
+
+    let mut runtime = match state.drum_machine_runtime.try_lock() {
+        Some(guard) => guard,
+        None => return (false, events),
+    };
+
+    let mut changed_state = drums_state.clone();
+    for event in &events {
+        if let vst3::MidiEvent::ControlChange {
+            controller, value, ..
+        } = event
+        {
+            let norm = (*value as f32 / 127.0).clamp(0.0, 1.0);
+            match *controller {
+                7 => changed_state.gain = (norm * 2.0).clamp(0.0, 2.0),
+                10 => changed_state.pan = (norm * 2.0 - 1.0).clamp(-1.0, 1.0),
+                74 => changed_state.cutoff = norm,
+                71 => changed_state.resonance = norm,
+                _ => {}
+            }
+        }
+    }
+    if let Some(state_arc) = state.drum_machine_state.as_ref() {
+        if let Some(mut guard) = state_arc.try_lock() {
+            *guard = changed_state.clone();
+        }
+    }
+
+    for note_event in &note_events {
+        if !note_event.note_on {
+            continue;
+        }
+        let Some(pad_index) = drum_machine_pad_index(note_event.note) else {
+            continue;
+        };
+        let Some(pad) = changed_state.pads.get(pad_index) else {
+            continue;
+        };
+        let Some(data) = sample_data.get(pad_index).and_then(|d| d.as_ref()) else {
+            continue;
+        };
+        let src_channels = data.channels.max(1);
+        let src_frames = data.samples.len() / src_channels;
+        if src_frames == 0 {
+            continue;
+        }
+        let start = 0.0f64;
+        let end = src_frames as f64;
+        let rate_ratio = data.sample_rate as f64 / sample_rate.max(1.0) as f64;
+        let pitch = pad.pitch_semitones;
+        let rate = 2.0f64.powf(pitch as f64 / 12.0);
+        let velocity_gain =
+            (note_event.velocity as f32 / 127.0).powf(2.0) * pad.sensitivity.max(0.1);
+        let velocity_gain = velocity_gain.clamp(0.0, 1.5);
+        let gain = changed_state.gain * pad.gain * velocity_gain;
+        let pan = (changed_state.pan + pad.pan + note_event.pan).clamp(-1.0, 1.0);
+        let cutoff = if (note_event.cutoff - 0.5).abs() > 0.001 {
+            note_event.cutoff
+        } else {
+            (changed_state.cutoff * pad.cutoff).clamp(0.0, 1.0)
+        };
+        let resonance = if note_event.resonance.abs() > 0.001 {
+            note_event.resonance
+        } else {
+            (changed_state.resonance + pad.resonance).clamp(0.0, 1.0)
+        };
+        runtime.voices.push(crate::audio::DrumMachineVoice {
+            pad_index,
+            sample_pos: start,
+            sample_end: end,
+            step: rate_ratio * rate,
+            start_sample: block_start.saturating_add(note_event.sample_offset),
+            gain,
+            pan,
+            cutoff,
+            resonance,
+            output_pair: pad.output_pair.min(DRUM_MACHINE_OUTPUT_PAIRS.saturating_sub(1)),
+            note: note_event.note,
+            filter: DrumMachineFilterState { lp: 0.0, bp: 0.0 },
+        });
+    }
+
+    let frame_count = (block_end - block_start) as usize;
+    let mut processed = false;
+
+    runtime.voices.retain_mut(|voice| {
+        let pad_index = voice.pad_index;
+        let pad = match changed_state.pads.get(pad_index) {
+            Some(pad) => pad,
+            None => return false,
+        };
+        let data = match sample_data.get(pad_index).and_then(|d| d.as_ref()) {
+            Some(d) => d,
+            None => return false,
+        };
+        let src_channels = data.channels.max(1);
+        let src_frames = data.samples.len() / src_channels;
+        if src_frames == 0 {
+            return false;
+        }
+        let left_gain = if channels >= 2 {
+            (1.0 - voice.pan) * 0.5
+        } else {
+            1.0
+        };
+        let right_gain = if channels >= 2 {
+            (1.0 + voice.pan) * 0.5
+        } else {
+            1.0
+        };
+        for i in 0..frame_count {
+            let current_sample = block_start.saturating_add(i as u64);
+            if current_sample < voice.start_sample {
+                continue;
+            }
+            if voice.sample_pos >= voice.sample_end {
+                break;
+            }
+            let base = voice.sample_pos.floor() as usize;
+            let frac = (voice.sample_pos - base as f64) as f32;
+            let next = (base + 1).min(src_frames.saturating_sub(1));
+            let mono = if src_channels == 1 {
+                let s0 = data.samples.get(base).copied().unwrap_or(0.0);
+                let s1 = data.samples.get(next).copied().unwrap_or(0.0);
+                s0 + (s1 - s0) * frac
+            } else {
+                let idx0 = base * src_channels;
+                let idx1 = next * src_channels;
+                let s0 = data.samples.get(idx0).copied().unwrap_or(0.0);
+                let s1 = data.samples.get(idx0 + 1).copied().unwrap_or(0.0);
+                let s2 = data.samples.get(idx1).copied().unwrap_or(0.0);
+                let s3 = data.samples.get(idx1 + 1).copied().unwrap_or(0.0);
+                let l = s0 + (s2 - s0) * frac;
+                let r = s1 + (s3 - s1) * frac;
+                (l + r) * 0.5
+            };
+            let elapsed =
+                (current_sample.saturating_sub(voice.start_sample)) as f32 / sample_rate.max(1.0);
+            let remaining =
+                ((voice.sample_end - voice.sample_pos).max(0.0) as f32) / sample_rate.max(1.0);
+            let env = drum_machine_env(
+                pad.attack_ms,
+                pad.decay_ms,
+                pad.sustain,
+                pad.release_ms,
+                elapsed,
+                remaining,
+            );
+            let filtered = drum_machine_lowpass(
+                mono,
+                voice.cutoff,
+                voice.resonance,
+                sample_rate,
+                &mut voice.filter,
+            );
+            let out_l = filtered * voice.gain * env * left_gain;
+            let out_r = filtered * voice.gain * env * right_gain;
+            let mix_base = i * channels;
+            if mix_base < temp.len() {
+                temp[mix_base] += out_l;
+                if channels > 1 && mix_base + 1 < temp.len() {
+                    temp[mix_base + 1] += out_r;
+                }
+            }
+            voice.sample_pos += voice.step;
+        }
+        processed = true;
+        voice.sample_pos < voice.sample_end
+    });
+
+    if panic_notes {
+        temp.fill(0.0);
+    }
+
+    (processed, events)
+}
+
 pub fn mix_track_hosts(
     output: &mut [f32],
     channels: usize,
@@ -559,6 +989,7 @@ pub fn mix_track_hosts(
     let processed_any_atomic = AtomicBool::new(false);
 
     let mix_guard = track_mix.lock();
+    let any_solo = mix_guard.iter().any(|mix| mix.solo);
     let routes_guard = node_routes.lock();
     runtime_buffers.routes_snapshot = (*routes_guard).clone();
     drop(routes_guard);
@@ -571,6 +1002,19 @@ pub fn mix_track_hosts(
                 Some(m) => m,
                 None => return,
             };
+            let is_silent = mix.muted || (any_solo && !mix.solo);
+            if is_silent {
+                if let Some(mut track_out_mutex) = state.track_buffer.try_lock() {
+                    if track_out_mutex.len() != output.len() {
+                        track_out_mutex.resize(output.len(), 0.0);
+                    }
+                    track_out_mutex.fill(0.0);
+                }
+                state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+                return;
+            }
             if !mix.active
                 && smart_suspend_tracks
                 && state.silent_blocks.load(Ordering::Relaxed) > 100
@@ -623,24 +1067,49 @@ pub fn mix_track_hosts(
                         let mut events = events_cell.borrow_mut();
                         events.clear();
 
-                        let (ts_processed, ts_events) = mix_treesynth_block(
-                            &mut temp,
-                            channels,
-                            sample_rate,
-                            block_start,
-                            block_end,
-                            samples_per_beat,
-                            panic_notes,
-                            loop_wrapped,
-                            &state.clip_notes.lock(),
-                            &[],
-                            state,
-                            audio_cache,
-                        );
-                        if ts_processed {
-                            track_processed = true;
+                        let wants_midi_events = state.treesynth_enabled.load(Ordering::Relaxed)
+                            || state.host.is_some();
+                        if wants_midi_events {
+                            let (ts_processed, ts_events) = mix_treesynth_block(
+                                &mut temp,
+                                channels,
+                                sample_rate,
+                                block_start,
+                                block_end,
+                                samples_per_beat,
+                                panic_notes,
+                                loop_wrapped,
+                                &state.clip_notes.lock(),
+                                &[],
+                                state,
+                                audio_cache,
+                            );
+                            if ts_processed {
+                                track_processed = true;
+                            }
+                            events.extend(ts_events);
                         }
-                        events.extend(ts_events);
+
+                        if state.drum_machine_enabled.load(Ordering::Relaxed) {
+                            let (drum_processed, drum_events) = mix_drum_machine_block(
+                                &mut temp,
+                                channels,
+                                sample_rate,
+                                block_start,
+                                block_end,
+                                samples_per_beat,
+                                panic_notes,
+                                loop_wrapped,
+                                &state.clip_notes.lock(),
+                                &[],
+                                state,
+                                audio_cache,
+                            );
+                            if drum_processed {
+                                track_processed = true;
+                            }
+                            events.extend(drum_events);
+                        }
 
                         if let Some(ref host) = state.host {
                             FILTERED_EVENTS_TMP.with(|filtered_cell| {
@@ -929,6 +1398,14 @@ pub fn mix_track_hosts(
             }
         }
     }
+
+    let mut next_transport = transport_pos.saturating_add(frames as u64);
+    if is_looping && playback_enabled && loop_end > loop_start {
+        if next_transport >= loop_end {
+            next_transport = loop_start.saturating_add(next_transport.saturating_sub(loop_end));
+        }
+    }
+    transport_samples.store(next_transport, Ordering::Relaxed);
 
     if let Some(mut activity) = node_activity.try_lock() {
         if activity.len() < track_count {

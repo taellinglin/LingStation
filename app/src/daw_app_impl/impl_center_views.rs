@@ -291,6 +291,8 @@ impl DawApp {
                             "CLAP"
                         } else if Self::is_treesynth_path(path) {
                             "TreeSynth"
+                        } else if Self::is_drummachine_path(path) {
+                            "Drum Machine"
                         } else {
                             "Inst"
                         }

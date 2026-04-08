@@ -56,6 +56,7 @@ pub(crate) struct DawApp {
     pub(crate) piano_snap: f32,
     pub(crate) piano_roll_hovered: bool,
     pub(crate) piano_key_down: Option<u8>,
+    pub(crate) drum_pad_note_down: Option<u8>,
     pub(crate) piano_lane_mode: PianoLaneMode,
     pub(crate) piano_cc: u8,
     pub(crate) import_path: String,

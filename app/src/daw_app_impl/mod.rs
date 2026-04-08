@@ -31,4 +31,5 @@ include!("impl_modals.rs");
 include!("impl_midi_io.rs");
 include!("impl_render_plan.rs");
 include!("impl_treesynth_presets.rs");
+include!("impl_drummachine.rs");
 include!("impl_project_tail.rs");

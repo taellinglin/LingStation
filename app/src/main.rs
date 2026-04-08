@@ -13,9 +13,8 @@ use rustfft::{num_complex::Complex, FftPlanner};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::{self, Receiver, Sender},
@@ -260,6 +259,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
             Track {
                 name: "CatSynth".to_string(),
@@ -286,6 +286,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
             Track {
                 name: "SannySynth".to_string(),
@@ -312,6 +313,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
             Track {
                 name: "DogSynth".to_string(),
@@ -338,6 +340,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
             Track {
                 name: "LingSynth".to_string(),
@@ -364,6 +367,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
             Track {
                 name: "MiceSynth".to_string(),
@@ -390,6 +394,7 @@ impl Default for DawApp {
                 midi_cc_lanes: Vec::new(),
                 midi_program: None,
                 treesynth: None,
+                drum_machine: None,
             },
         ];
 
@@ -476,6 +481,7 @@ impl Default for DawApp {
             piano_snap: 0.25,
             piano_roll_hovered: false,
             piano_key_down: None,
+            drum_pad_note_down: None,
             piano_lane_mode: PianoLaneMode::Velocity,
             piano_cc: 1,
             import_path: "project.mid".to_string(),
@@ -1012,6 +1018,7 @@ fn is_window_visible(_hwnd: isize) -> bool {
 mod tests {
     use super::*;
     use engine::hosts::clap::ParamInfo;
+    use std::path::Path;
 
     #[test]
     fn safe_join_rejects_traversal() {

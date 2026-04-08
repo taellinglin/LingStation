@@ -45,11 +45,16 @@ impl DawApp {
             if track.treesynth.is_some() {
                 track.instrument_path = Some("native:treesynth".to_string());
             }
+            if track.drum_machine.is_some() {
+                track.instrument_path = Some("native:drummachine".to_string());
+            }
         }
         for (i, track) in self.tracks.iter().enumerate() {
             if let Some(state) = self.engine.track_audio.get_mut(i) {
                 let enabled = track.treesynth.is_some();
                 state.sync_treesynth(track, enabled, &self.engine.audio_cache);
+                let drum_enabled = track.drum_machine.is_some();
+                state.sync_drum_machine(track, drum_enabled);
             }
         }
         let license_comment = self.render_license_comment();

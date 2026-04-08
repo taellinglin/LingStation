@@ -515,6 +515,7 @@ impl DawApp {
                                     if let Some(track) = self.tracks.get_mut(index) {
                                         track.instrument_path = None;
                                         track.treesynth = None;
+                                        track.drum_machine = None;
                                         track.params = default_midi_params();
                                         track.param_ids.clear();
                                         track.param_values.clear();
@@ -535,6 +536,11 @@ impl DawApp {
                                 .and_then(|i| self.tracks.get(i))
                                 .and_then(|track| track.instrument_path.as_deref())
                                 .map(Self::is_treesynth_path)
+                                .unwrap_or(false);
+                            let is_drummachine = selected_track_index
+                                .and_then(|i| self.tracks.get(i))
+                                .and_then(|track| track.instrument_path.as_deref())
+                                .map(Self::is_drummachine_path)
                                 .unwrap_or(false);
                             if is_treesynth {
                                 let audio_cache = self.engine.audio_cache.clone();
@@ -618,6 +624,67 @@ impl DawApp {
                                             let mut runtime = audio.treesynth_runtime.lock();
                                             runtime.voices.clear();
                                             runtime.sequence_index = 0;
+                                        }
+                                    }
+                                }
+                                if let Some(track_index) = selected_track_index {
+                                    self.draw_effect_params_panel(
+                                        ui,
+                                        track_index,
+                                        track_color,
+                                        &mut pending_automation_record,
+                                    );
+                                }
+                                return;
+                            }
+                            if is_drummachine {
+                                let audio_cache = self.engine.audio_cache.clone();
+                                let mut changed = false;
+                                if let Some(track_index) = selected_track_index {
+                                    let project_root = if self.project_path.trim().is_empty() {
+                                        None
+                                    } else {
+                                        Some(PathBuf::from(self.project_path.trim()))
+                                    };
+                                    let mut local_state = self
+                                        .tracks
+                                        .get(track_index)
+                                        .and_then(|track| track.drum_machine.clone());
+                                    if let Some(ref mut state) = local_state {
+                                        changed = self.draw_drummachine_panel(
+                                            ui,
+                                            state,
+                                            &audio_cache,
+                                            project_root.as_deref(),
+                                            track_index,
+                                        );
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::RED,
+                                            "[DrumMachine] Pads not initialized",
+                                        );
+                                    }
+                                    if changed {
+                                        if let Some(track) = self.tracks.get_mut(track_index) {
+                                            track.drum_machine = local_state;
+                                        }
+                                    }
+                                }
+                                if changed {
+                                    self.mark_dirty();
+                                    if let Some(track_index) = selected_track_index {
+                                        if let (Some(track), Some(audio)) = (
+                                            self.tracks.get(track_index),
+                                            self.engine.track_audio.get_mut(track_index),
+                                        ) {
+                                            let enabled = track
+                                                .instrument_path
+                                                .as_deref()
+                                                .map(Self::is_drummachine_path)
+                                                .unwrap_or(false);
+                                            audio.sync_drum_machine(track, enabled);
+                                            let mut runtime = audio.drum_machine_runtime.lock();
+                                            runtime.voices.clear();
                                         }
                                     }
                                 }

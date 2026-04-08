@@ -341,7 +341,8 @@ impl DawApp {
 
     pub(crate) fn sync_track_audio_states(&mut self) {
         self.rebuild_all_track_midi_notes();
-        for track in &mut self.tracks {
+        let mut pending_default_kits: Vec<usize> = Vec::new();
+        for (track_index, track) in self.tracks.iter_mut().enumerate() {
             if track
                 .instrument_path
                 .as_deref()
@@ -351,6 +352,33 @@ impl DawApp {
             {
                 track.treesynth = Some(TreeSynthState::default());
             }
+            if track.drum_machine.is_some()
+                && !track
+                    .instrument_path
+                    .as_deref()
+                    .map(Self::is_drummachine_path)
+                    .unwrap_or(false)
+            {
+                track.instrument_path = Some("native:drummachine".to_string());
+            }
+            if track
+                .instrument_path
+                .as_deref()
+                .map(Self::is_drummachine_path)
+                .unwrap_or(false)
+                && track.drum_machine.is_none()
+            {
+                track.drum_machine = Some(DrumMachineState::default());
+            }
+            if let Some(drums) = track.drum_machine.as_mut() {
+                Self::resolve_and_preload_drummachine_state(drums, &self.engine.audio_cache);
+                if drums.pads.iter().all(|pad| pad.path.is_none()) {
+                    pending_default_kits.push(track_index);
+                }
+            }
+        }
+        for track_index in pending_default_kits {
+            self.apply_default_drummachine_kit(track_index);
         }
         if self.engine.track_audio.len() != self.tracks.len() {
             self.engine.track_audio = self
@@ -370,6 +398,12 @@ impl DawApp {
                         .map(Self::is_treesynth_path)
                         .unwrap_or(false);
                     state.sync_treesynth(track, enabled, &self.engine.audio_cache);
+                    let drum_enabled = track
+                        .instrument_path
+                        .as_deref()
+                        .map(Self::is_drummachine_path)
+                        .unwrap_or(false);
+                    state.sync_drum_machine(track, drum_enabled);
                 }
             }
         }
@@ -411,7 +445,11 @@ impl DawApp {
             let missing_instrument = track
                 .instrument_path
                 .as_deref()
-                .map(|path| !Self::plugin_path_exists(path) && !Self::is_treesynth_path(path))
+                .map(|path| {
+                    !Self::plugin_path_exists(path)
+                        && !Self::is_treesynth_path(path)
+                        && !Self::is_drummachine_path(path)
+                })
                 .unwrap_or(false);
             if missing_instrument {
                 track.instrument_path = None;
@@ -608,7 +646,10 @@ impl DawApp {
 
     pub(crate) fn ensure_track_host(&mut self, index: usize, channels: usize) -> Option<PluginHostHandle> {
         let path = self.tracks.get(index).and_then(|t| t.instrument_path.clone())?;
-        if !Self::plugin_path_exists(&path) && !Self::is_treesynth_path(&path) {
+        if !Self::plugin_path_exists(&path)
+            && !Self::is_treesynth_path(&path)
+            && !Self::is_drummachine_path(&path)
+        {
             if let Some(track) = self.tracks.get_mut(index) {
                 track.instrument_path = None;
                 track.instrument_clap_id = None;

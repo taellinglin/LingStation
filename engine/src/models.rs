@@ -18,6 +18,11 @@ pub enum AudioStretchMode {
     Speed,
 }
 
+pub const DRUM_MACHINE_PAD_COUNT: usize = 32;
+pub const DRUM_MACHINE_BANK_SIZE: usize = 16;
+pub const DRUM_MACHINE_BASE_NOTE: u8 = 36;
+pub const DRUM_MACHINE_OUTPUT_PAIRS: usize = 16;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PianoRollNote {
     pub start_beats: f32,
@@ -106,6 +111,71 @@ pub struct Clip {
     pub audio_formant_scale: f32,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DrumMachinePad {
+    pub name: String,
+    pub path: Option<String>,
+    pub root_note: u8,
+    pub gain: f32,
+    pub pan: f32,
+    pub pitch_semitones: f32,
+    pub attack_ms: f32,
+    pub decay_ms: f32,
+    pub sustain: f32,
+    pub release_ms: f32,
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub output_pair: usize,
+    pub sensitivity: f32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DrumMachineState {
+    pub pads: Vec<DrumMachinePad>,
+    pub bank: usize,
+    pub selected_pad: usize,
+    pub gain: f32,
+    pub pan: f32,
+    pub cutoff: f32,
+    pub resonance: f32,
+}
+
+impl Default for DrumMachineState {
+    fn default() -> Self {
+        let mut pads = Vec::with_capacity(DRUM_MACHINE_PAD_COUNT);
+        for index in 0..DRUM_MACHINE_PAD_COUNT {
+            let bank = index / DRUM_MACHINE_BANK_SIZE;
+            let slot = index % DRUM_MACHINE_BANK_SIZE;
+            let label = if bank == 0 { "A" } else { "B" };
+            pads.push(DrumMachinePad {
+                name: format!("{}{}", label, slot + 1),
+                path: None,
+                root_note: DRUM_MACHINE_BASE_NOTE.saturating_add(index as u8),
+                gain: 1.0,
+                pan: 0.0,
+                pitch_semitones: 0.0,
+                attack_ms: 2.0,
+                decay_ms: 60.0,
+                sustain: 1.0,
+                release_ms: 80.0,
+                cutoff: 1.0,
+                resonance: 0.0,
+                output_pair: 0,
+                sensitivity: 1.0,
+            });
+        }
+        Self {
+            pads,
+            bank: 0,
+            selected_pad: 0,
+            gain: 1.0,
+            pan: 0.0,
+            cutoff: 1.0,
+            resonance: 0.0,
+        }
+    }
+}
+
 pub fn default_formant_scale() -> f32 {
     1.0
 }
@@ -150,6 +220,8 @@ pub struct Track {
     pub midi_program: Option<u8>,
     #[serde(default)]
     pub treesynth: Option<TreeSynthState>,
+    #[serde(default)]
+    pub drum_machine: Option<DrumMachineState>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
