@@ -524,7 +524,8 @@ impl TrackAudioState {
         } else {
             2
         };
-        self.native_output_channels.store(channels, Ordering::Relaxed);
+        self.native_output_channels
+            .store(channels, Ordering::Relaxed);
         if !enabled {
             self.drum_machine_state = None;
             self.drum_machine_runtime.lock().voices.clear();

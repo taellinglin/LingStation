@@ -675,16 +675,21 @@ pub(crate) fn mix_drum_machine_block(
             events.push(vst3::MidiEvent::control_change(channel, 123, 0));
         }
         for channel in 0u8..16 {
-            events.extend(
-                (0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)),
-            );
+            events
+                .extend((0u8..=127).map(|note| vst3::MidiEvent::note_off_at(channel, note, 0, 0)));
         }
     }
     if loop_wrapped {
         events.extend((0u8..=127).map(|note| vst3::MidiEvent::note_off(0, note, 0)));
     }
     let mut note_events = Vec::with_capacity(64);
-    collect_drum_machine_events(notes, block_start, block_end, samples_per_beat, &mut note_events);
+    collect_drum_machine_events(
+        notes,
+        block_start,
+        block_end,
+        samples_per_beat,
+        &mut note_events,
+    );
     for event in extra_events {
         match *event {
             vst3::MidiEvent::NoteOn {
@@ -765,15 +770,16 @@ pub(crate) fn mix_drum_machine_block(
     }
 
     let sample_count = drums_state.pads.len();
-    let sample_data: Vec<Option<Arc<AudioClipData>>> = if let Some(mut cache) = audio_cache.try_lock() {
-        drums_state
-            .pads
-            .iter()
-            .map(|pad| pad.path.as_ref().and_then(|path| cache.get(path)))
-            .collect()
-    } else {
-        vec![None; sample_count]
-    };
+    let sample_data: Vec<Option<Arc<AudioClipData>>> =
+        if let Some(mut cache) = audio_cache.try_lock() {
+            drums_state
+                .pads
+                .iter()
+                .map(|pad| pad.path.as_ref().and_then(|path| cache.get(path)))
+                .collect()
+        } else {
+            vec![None; sample_count]
+        };
 
     let mut runtime = match state.drum_machine_runtime.try_lock() {
         Some(guard) => guard,
@@ -850,7 +856,9 @@ pub(crate) fn mix_drum_machine_block(
             pan,
             cutoff,
             resonance,
-            output_pair: pad.output_pair.min(DRUM_MACHINE_OUTPUT_PAIRS.saturating_sub(1)),
+            output_pair: pad
+                .output_pair
+                .min(DRUM_MACHINE_OUTPUT_PAIRS.saturating_sub(1)),
             note: note_event.note,
             filter: DrumMachineFilterState { lp: 0.0, bp: 0.0 },
         });
@@ -1067,8 +1075,8 @@ pub fn mix_track_hosts(
                         let mut events = events_cell.borrow_mut();
                         events.clear();
 
-                        let wants_midi_events = state.treesynth_enabled.load(Ordering::Relaxed)
-                            || state.host.is_some();
+                        let wants_midi_events =
+                            state.treesynth_enabled.load(Ordering::Relaxed) || state.host.is_some();
                         if wants_midi_events {
                             let (ts_processed, ts_events) = mix_treesynth_block(
                                 &mut temp,
