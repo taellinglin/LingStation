@@ -11,6 +11,7 @@ impl eframe::App for DawApp {
             }
         }
         self.poll_license_job();
+        self.poll_render_job_completion();
         self.poll_audio_analysis_jobs();
         self.sync_last_param_changes();
         self.update_performance_auto_follow();
@@ -169,22 +170,6 @@ impl eframe::App for DawApp {
                 let total = job.total.load(Ordering::Relaxed);
                 if total > 0 {
                     self.render_progress = Some((done, total));
-                }
-                if job.finished.load(Ordering::Relaxed) {
-                    if let Ok(mut result) = job.result.lock() {
-                        if let Some(result) = result.take() {
-                            match result {
-                                Ok(msg) => {
-                                    self.status = msg;
-                                    close_requested = true;
-                                }
-                                Err(err) => {
-                                    self.status = format!("Render failed: {err}");
-                                }
-                            }
-                        }
-                    }
-                    self.render_job = None;
                 }
             }
             egui::Window::new("Render")

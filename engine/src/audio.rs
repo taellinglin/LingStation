@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 16;
+pub const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 32;
 pub static PLUGIN_PROCESS_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -437,10 +437,7 @@ impl PluginHostHandle {
 
 impl TrackAudioState {
     pub fn from_track(track: &Track) -> Self {
-        let drum_state = track
-            .drum_machine
-            .clone()
-            .unwrap_or_else(DrumMachineState::default);
+        let drum_state = track.drum_machine.clone().unwrap_or_default();
         let native_output_channels = if track.drum_machine.is_some() {
             (DRUM_MACHINE_OUTPUT_PAIRS * 2) as u32
         } else {
@@ -508,10 +505,7 @@ impl TrackAudioState {
 
     pub fn sync_drum_machine(&mut self, track: &Track, enabled: bool) {
         if enabled {
-            let next_state = track
-                .drum_machine
-                .clone()
-                .unwrap_or_else(DrumMachineState::default);
+            let next_state = track.drum_machine.clone().unwrap_or_default();
             if let Some(state) = self.drum_machine_state.as_ref() {
                 *state.lock() = next_state;
             } else {

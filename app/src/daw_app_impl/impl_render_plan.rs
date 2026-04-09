@@ -129,17 +129,37 @@ impl DawApp {
         let track_audio = self.engine.track_audio.clone();
         let audio_clip_cache = self.engine.audio_cache.clone();
         let format = self.render_format;
+        let ogg_quality = Self::vorbis_quality_for_ogg(self.render_bitrate);
         std::thread::spawn(move || {
             let mut final_status = Ok("Render complete".to_string());
             for (path, plan) in plan_paths {
                 done.store(0, Ordering::Relaxed);
                 total.store(1, Ordering::Relaxed);
                 let res = match format {
-                    RenderFormat::Wav => {
-                        Self::offline_render_plan_to_wav_thread(&plan, &path, &done, &total, track_audio.clone(), &audio_clip_cache)
-                    }
-                    RenderFormat::Ogg | RenderFormat::Flac => Err(
-                        "OGG and FLAC offline export are not wired after the render refactor; use WAV for now.".to_string(),
+                    RenderFormat::Wav => Self::offline_render_plan_to_wav_thread(
+                        &plan,
+                        &path,
+                        &done,
+                        &total,
+                        track_audio.clone(),
+                        &audio_clip_cache,
+                    ),
+                    RenderFormat::Flac => Self::offline_render_plan_to_flac_thread(
+                        &plan,
+                        &path,
+                        &done,
+                        &total,
+                        track_audio.clone(),
+                        &audio_clip_cache,
+                    ),
+                    RenderFormat::Ogg => Self::offline_render_plan_to_ogg_thread(
+                        &plan,
+                        &path,
+                        &done,
+                        &total,
+                        track_audio.clone(),
+                        &audio_clip_cache,
+                        ogg_quality,
                     ),
                 };
                 if let Err(err) = res {
@@ -154,6 +174,84 @@ impl DawApp {
         });
 
         Ok(())
+    }
+
+    fn vorbis_quality_for_ogg(bitrate_kbps: u32) -> f32 {
+        let br = bitrate_kbps.max(48) as f32;
+        (0.11 + (br / 320.0).min(1.0) * 0.74).clamp(0.1, 0.95)
+    }
+
+    pub(crate) fn poll_render_job_completion(&mut self) {
+        let finished = self
+            .render_job
+            .as_ref()
+            .is_some_and(|j| j.finished.load(Ordering::Relaxed));
+        if let Some(job) = self.render_job.as_ref() {
+            let done = job.done.load(Ordering::Relaxed);
+            let total = job.total.load(Ordering::Relaxed);
+            if total > 0 {
+                self.render_progress = Some((done, total));
+            }
+        }
+        if !finished {
+            return;
+        }
+        let job = match self.render_job.take() {
+            Some(j) => j,
+            None => return,
+        };
+        if let Ok(mut guard) = job.result.lock() {
+            if let Some(result) = guard.take() {
+                match result {
+                    Ok(msg) => {
+                        self.status = msg;
+                        self.show_render_dialog = false;
+                    }
+                    Err(err) => {
+                        self.status = format!("Render failed: {err}");
+                    }
+                }
+            }
+        }
+        self.render_progress = None;
+    }
+
+    fn offline_render_plan_to_flac_thread(
+        plan: &RenderPlan,
+        out_path: &Path,
+        progress_done: &AtomicU64,
+        progress_total: &AtomicU64,
+        track_audio: Vec<TrackAudioState>,
+        audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
+    ) -> Result<(), String> {
+        engine::render::offline_render_plan_to_flac(
+            plan,
+            out_path,
+            progress_done,
+            progress_total,
+            track_audio,
+            audio_clip_cache,
+        )
+    }
+
+    fn offline_render_plan_to_ogg_thread(
+        plan: &RenderPlan,
+        out_path: &Path,
+        progress_done: &AtomicU64,
+        progress_total: &AtomicU64,
+        track_audio: Vec<TrackAudioState>,
+        audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
+        quality: f32,
+    ) -> Result<(), String> {
+        engine::render::offline_render_plan_to_ogg_vorbis(
+            plan,
+            out_path,
+            progress_done,
+            progress_total,
+            track_audio,
+            audio_clip_cache,
+            quality,
+        )
     }
 
     fn offline_render_plan_to_wav_thread(

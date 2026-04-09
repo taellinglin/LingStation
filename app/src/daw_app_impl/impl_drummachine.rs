@@ -70,24 +70,20 @@ impl DawApp {
 
         let samples_roots = Self::drummachine_samples_roots(project_root);
         ui.horizontal(|ui| {
-            if ui.button("Randomize Kit").clicked() {
-                if !samples_roots.is_empty() {
-                    changed |=
-                        Self::randomize_drummachine_kit(state, &samples_roots, audio_clip_cache);
-                }
+            if ui.button("Randomize Kit").clicked() && !samples_roots.is_empty() {
+                changed |=
+                    Self::randomize_drummachine_kit(state, &samples_roots, audio_clip_cache);
             }
-            if ui.button("Randomize Pad").clicked() {
-                if !samples_roots.is_empty() {
-                    let selected = state.selected_pad.min(state.pads.len().saturating_sub(1));
-                    if let Some(pad) = state.pads.get_mut(selected) {
-                        if let Some(path) = Self::random_pad_sample_path(
-                            selected,
-                            pad.path.as_deref(),
-                            &samples_roots,
-                        ) {
-                            Self::apply_pad_sample(pad, path, audio_clip_cache);
-                            changed = true;
-                        }
+            if ui.button("Randomize Pad").clicked() && !samples_roots.is_empty() {
+                let selected = state.selected_pad.min(state.pads.len().saturating_sub(1));
+                if let Some(pad) = state.pads.get_mut(selected) {
+                    if let Some(path) = Self::random_pad_sample_path(
+                        selected,
+                        pad.path.as_deref(),
+                        &samples_roots,
+                    ) {
+                        Self::apply_pad_sample(pad, path, audio_clip_cache);
+                        changed = true;
                     }
                 }
             }
@@ -528,7 +524,7 @@ impl DawApp {
                 if Self::paths_equal(candidate, exclude_path) {
                     return true;
                 }
-                if let (Some(candidate_name), Some(ref exclude_name)) = (
+                if let (Some(candidate_name), Some(exclude_name)) = (
                     candidate.file_name().map(|s| s.to_string_lossy().to_string()),
                     exclude_name.as_ref(),
                 ) {
@@ -647,46 +643,7 @@ impl DawApp {
         let mut paths = Vec::new();
         Self::scan_dir_for_exts_static(&dir, &mut paths, exts);
         paths.sort();
-        paths.first().map(|p| PathBuf::from(p))
-    }
-
-    pub(crate) fn resolve_drum_sample_path(path: &str) -> Option<PathBuf> {
-        let candidate = PathBuf::from(path);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if candidate.is_absolute() {
-            let file_name = candidate.file_name().map(|s| s.to_string_lossy().to_string());
-            if let Some(file_name) = file_name {
-                for root in Self::drummachine_samples_roots(None) {
-                    if let Some(found) = Self::find_sample_by_name(&root, &file_name) {
-                        return Some(found);
-                    }
-                }
-            }
-            return None;
-        }
-        for root in Self::drummachine_samples_roots(None) {
-            let from_root = root.join(path);
-            if from_root.exists() {
-                return Some(from_root);
-            }
-            let file_name = Path::new(path)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string());
-            if let Some(file_name) = file_name {
-                if let Some(found) = Self::find_sample_by_name(&root, &file_name) {
-                    return Some(found);
-                }
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            let from_cwd = cwd.join(path);
-            if from_cwd.exists() {
-                return Some(from_cwd);
-            }
-        }
-        None
+        paths.first().map(PathBuf::from)
     }
 
     pub(crate) fn resolve_drum_sample_path_with_project_root(
