@@ -529,6 +529,7 @@ impl DawApp {
                 ui.selectable_value(&mut self.main_tab, MainTab::PianoRoll, "Piano Roll");
                 ui.selectable_value(&mut self.main_tab, MainTab::NodeEditor, "Node Editor");
                 ui.selectable_value(&mut self.main_tab, MainTab::Performance, "Performance");
+                ui.selectable_value(&mut self.main_tab, MainTab::AiScores, "AI Scores");
             });
         });
     }
@@ -611,6 +612,8 @@ impl DawApp {
                 ui.label("Tempo");
                 let mut tempo = f32::from_bits(self.engine.tempo_bpm.load(Ordering::Relaxed));
                 if ui.add(egui::DragValue::new(&mut tempo).speed(1.0)).changed() {
+                    let tempo = tempo.max(1.0);
+                    self.tempo_bpm = tempo;
                     self.engine.tempo_bpm.store(tempo.to_bits(), Ordering::Relaxed);
                 }
                 ui.separator();
@@ -691,6 +694,7 @@ impl DawApp {
             });
 
             let raw_peak = f32::from_bits(self.engine.master_peak_bits.load(Ordering::Relaxed));
+            self.engine.master_peak_bits.store(0, Ordering::Relaxed);
             self.master_peak_display = (self.master_peak_display * 0.92).max(raw_peak);
             let meter_value = self.master_peak_display.clamp(0.0, 1.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

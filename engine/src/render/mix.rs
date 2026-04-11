@@ -1,6 +1,6 @@
 use crate::audio::{
     AudioClipCache, AudioClipData, DrumMachineFilterState, TrackAudioState, TreeSynthRuntime,
-    TreeSynthVoice,
+    TreeSynthVoice, MAX_PLUGIN_OUTPUT_CHANNELS,
 };
 use crate::hosts::vst3;
 use crate::models::PluginHostHandle;
@@ -1021,6 +1021,11 @@ pub fn mix_track_hosts(
                     }
                     track_out_mutex.fill(0.0);
                 }
+                if let Some(mut pair_buffers) = state.output_pair_buffers.try_lock() {
+                    for buf in pair_buffers.iter_mut() {
+                        buf.fill(0.0);
+                    }
+                }
                 state.peak_l_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.peak_r_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
                 state.peak_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
@@ -1133,8 +1138,14 @@ pub fn mix_track_hosts(
 
                             HOST_OUTPUT_TEMP.with(|host_out_cell| {
                                 let mut host_out = host_out_cell.borrow_mut();
-                                if host_out.len() != output.len() {
-                                    host_out.resize(output.len(), 0.0);
+                                let host_output_channels = host
+                                    .io_channels()
+                                    .1
+                                    .clamp(1, MAX_PLUGIN_OUTPUT_CHANNELS);
+                                let host_frames = frames;
+                                let host_samples = host_frames * host_output_channels;
+                                if host_out.len() != host_samples {
+                                    host_out.resize(host_samples, 0.0);
                                 }
                                 host_out.fill(0.0);
 
@@ -1186,16 +1197,110 @@ pub fn mix_track_hosts(
                                 FILTERED_EVENTS_TMP.with(|filtered_cell| {
                                     let filtered = filtered_cell.borrow();
                                     let result = match host {
-                                        PluginHostHandle::Vst3(h) => {
-                                            h.lock().process_f32(&mut host_out, channels, &filtered)
-                                        }
-                                        PluginHostHandle::Clap(h) => {
-                                            h.lock().process_f32(&mut host_out, channels, &filtered)
-                                        }
+                                        PluginHostHandle::Vst3(h) => h
+                                            .lock()
+                                            .process_f32(&mut host_out, host_output_channels, &filtered),
+                                        PluginHostHandle::Clap(h) => h
+                                            .lock()
+                                            .process_f32(&mut host_out, host_output_channels, &filtered),
                                     };
                                     if result.is_ok() {
-                                        for (t, h) in temp.iter_mut().zip(host_out.iter()) {
-                                            *t += *h;
+                                        state
+                                            .native_output_channels
+                                            .store(host_output_channels as u32, Ordering::Relaxed);
+                                        if host_output_channels > channels {
+                                            let pair_count = (host_output_channels + 1) / 2;
+                                            let pair_count = pair_count.min(8);
+                                            let mut pair_buffers =
+                                                state.output_pair_buffers.lock();
+                                            if pair_buffers.len() != pair_count {
+                                                pair_buffers.resize(pair_count, Vec::new());
+                                            }
+                                            for buf in pair_buffers.iter_mut() {
+                                                if buf.len() != frames * 2 {
+                                                    buf.resize(frames * 2, 0.0);
+                                                }
+                                                buf.fill(0.0);
+                                            }
+                                            let mut pair_mix = state.output_pair_mix.lock();
+                                            if pair_mix.len() < pair_count {
+                                                pair_mix.resize(pair_count, TrackMixState::default());
+                                            }
+                                            let any_solo = pair_mix.iter().take(pair_count).any(|m| m.solo);
+                                            let override_pair =
+                                                state.output_pair_override.load(Ordering::Relaxed);
+                                            for pair in 0..pair_count {
+                                                let mix_state = &pair_mix[pair];
+                                                let forced_mute =
+                                                    override_pair >= 0 && pair != override_pair as usize;
+                                                let muted =
+                                                    forced_mute || mix_state.muted || (any_solo && !mix_state.solo);
+                                                let level = mix_state.level;
+                                                let left_idx = pair * 2;
+                                                let right_idx = left_idx + 1;
+                                                let buf = &mut pair_buffers[pair];
+                                                for frame in 0..frames {
+                                                    let base = frame * host_output_channels;
+                                                    let left = host_out
+                                                        .get(base + left_idx)
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    let right = host_out
+                                                        .get(base + right_idx)
+                                                        .copied()
+                                                        .unwrap_or(left);
+                                                    let mix_l = if muted { 0.0 } else { left * level };
+                                                    let mix_r = if muted { 0.0 } else { right * level };
+                                                    let pair_base = frame * 2;
+                                                    buf[pair_base] = mix_l;
+                                                    buf[pair_base + 1] = mix_r;
+                                                    if channels >= 1 {
+                                                        let out_base = frame * channels;
+                                                        if out_base < temp.len() {
+                                                            temp[out_base] += mix_l;
+                                                            if channels > 1 && out_base + 1 < temp.len() {
+                                                                temp[out_base + 1] += mix_r;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            if let Some(mut pair_buffers) =
+                                                state.output_pair_buffers.try_lock()
+                                            {
+                                                for buf in pair_buffers.iter_mut() {
+                                                    buf.fill(0.0);
+                                                }
+                                            }
+                                            for frame in 0..frames {
+                                                let base = frame * channels;
+                                                let sample = host_out
+                                                    .get(frame * host_output_channels)
+                                                    .copied()
+                                                    .unwrap_or(0.0);
+                                                if host_output_channels == 1 {
+                                                    if base < temp.len() {
+                                                        temp[base] += sample;
+                                                        if channels > 1 && base + 1 < temp.len() {
+                                                            temp[base + 1] += sample;
+                                                        }
+                                                    }
+                                                } else {
+                                                    if base < temp.len() {
+                                                        temp[base] += sample;
+                                                    }
+                                                    if channels > 1 {
+                                                        let right = host_out
+                                                            .get(frame * host_output_channels + 1)
+                                                            .copied()
+                                                            .unwrap_or(sample);
+                                                        if base + 1 < temp.len() {
+                                                            temp[base + 1] += right;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         track_processed = true;
                                     }
@@ -1441,6 +1546,21 @@ pub fn mix_track_hosts(
                     }
                 }
                 slot.output_pair_peaks[0] = (slot.output_pair_peaks[0] * 0.82).max(peak);
+                if let Some(pair_buffers) = state.output_pair_buffers.try_lock() {
+                    for (pair_index, buf) in pair_buffers.iter().enumerate().take(8) {
+                        let mut pair_peak = 0.0f32;
+                        for frame in buf.chunks(2) {
+                            if !frame.is_empty() {
+                                pair_peak = pair_peak.max(frame[0].abs());
+                                if frame.len() > 1 {
+                                    pair_peak = pair_peak.max(frame[1].abs());
+                                }
+                            }
+                        }
+                        slot.output_pair_peaks[pair_index] =
+                            (slot.output_pair_peaks[pair_index] * 0.82).max(pair_peak);
+                    }
+                }
 
                 slot.midi_in = (slot.midi_in * 0.78)
                     .max(f32::from_bits(state.midi_in_peak.load(Ordering::Relaxed)));

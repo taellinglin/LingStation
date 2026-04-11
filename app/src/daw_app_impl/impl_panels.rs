@@ -630,6 +630,204 @@ impl DawApp {
                             selected_track = Some(index);
                             action = Some(MixerAction::Select(index));
                         }
+
+                        let output_pairs = self
+                            .engine
+                            .track_audio
+                            .get(index)
+                            .map(|state| state.native_output_channels.load(Ordering::Relaxed))
+                            .unwrap_or(2)
+                            .max(2);
+                        let pair_count = (output_pairs as usize / 2).max(1).min(8);
+                        if pair_count > 1 {
+                            if track.output_pair_mix.len() < pair_count {
+                                track
+                                    .output_pair_mix
+                                    .resize(pair_count, TrackMixState::default());
+                                mix_dirty = true;
+                            }
+                            let pair_peaks = self
+                                .engine
+                                .node_activity
+                                .lock()
+                                .get(index)
+                                .map(|a| a.output_pair_peaks)
+                                .unwrap_or([0.0; 8]);
+                            ui.add_space(6.0);
+                            for pair in 0..pair_count {
+                                let pair_label = format!("Out {}/{}", pair * 2 + 1, pair * 2 + 2);
+                                let mut pair_muted = track
+                                    .output_pair_mix
+                                    .get(pair)
+                                    .map(|m| m.muted)
+                                    .unwrap_or(false);
+                                let pair_solo = track
+                                    .output_pair_mix
+                                    .get(pair)
+                                    .map(|m| m.solo)
+                                    .unwrap_or(false);
+                                let mut pair_level = track
+                                    .output_pair_mix
+                                    .get(pair)
+                                    .map(|m| m.level)
+                                    .unwrap_or(1.0);
+                                let mut solo_action: Option<(bool, bool)> = None;
+                                let child_fill = egui::Color32::from_rgba_premultiplied(
+                                    track_color.r(),
+                                    track_color.g(),
+                                    track_color.b(),
+                                    40,
+                                );
+                                egui::Frame::none()
+                                    .fill(child_fill)
+                                    .rounding(egui::Rounding::same(6.0))
+                                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                                    .show(ui, |ui| {
+                                        let (label_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), 16.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            label_rect,
+                                            4.0,
+                                            egui::Color32::from_rgba_premultiplied(
+                                                track_color.r(),
+                                                track_color.g(),
+                                                track_color.b(),
+                                                90,
+                                            ),
+                                        );
+                                        Self::outlined_text(
+                                            ui.painter(),
+                                            egui::pos2(label_rect.left() + 6.0, label_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &pair_label,
+                                            egui::FontId::proportional(BASE_UI_FONT_SIZE - 1.0),
+                                            egui::Color32::from_gray(220),
+                                        );
+
+                                        let (ms_row_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let mute_rect = egui::Rect::from_min_size(
+                                            egui::pos2(ms_row_rect.left(), ms_row_rect.top()),
+                                            egui::vec2(22.0, 16.0),
+                                        );
+                                        let solo_rect = egui::Rect::from_min_size(
+                                            egui::pos2(mute_rect.right() + row_spacing, ms_row_rect.top()),
+                                            egui::vec2(22.0, 16.0),
+                                        );
+                                        let mute_id = egui::Id::new(format!("mixer_pair_mute_{}_{}", index, pair));
+                                        let solo_id = egui::Id::new(format!("mixer_pair_solo_{}_{}", index, pair));
+                                        let mute_resp = ui.interact(mute_rect, mute_id, egui::Sense::click());
+                                        let solo_resp = ui.interact(solo_rect, solo_id, egui::Sense::click());
+                                        let mute_bg = if pair_muted {
+                                            Self::tint(track_color, 0.6)
+                                        } else {
+                                            egui::Color32::from_rgba_premultiplied(
+                                                track_color.r(),
+                                                track_color.g(),
+                                                track_color.b(),
+                                                40,
+                                            )
+                                        };
+                                        let solo_bg = if pair_solo {
+                                            Self::tint(track_color, 0.85)
+                                        } else {
+                                            egui::Color32::from_rgba_premultiplied(
+                                                track_color.r(),
+                                                track_color.g(),
+                                                track_color.b(),
+                                                60,
+                                            )
+                                        };
+                                        ui.painter().rect_filled(mute_rect, 3.0, mute_bg);
+                                        ui.painter().rect_filled(solo_rect, 3.0, solo_bg);
+                                        Self::outlined_text(
+                                            ui.painter(),
+                                            mute_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "M",
+                                            egui::FontId::proportional(BASE_UI_FONT_SIZE - 1.0),
+                                            egui::Color32::from_gray(220),
+                                        );
+                                        Self::outlined_text(
+                                            ui.painter(),
+                                            solo_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "S",
+                                            egui::FontId::proportional(BASE_UI_FONT_SIZE - 1.0),
+                                            egui::Color32::from_gray(220),
+                                        );
+                                        if mute_resp.clicked() {
+                                            pair_muted = !pair_muted;
+                                            mix_dirty = true;
+                                        }
+                                        if solo_resp.clicked() {
+                                            let multi_solo =
+                                                ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                                            if pair_solo {
+                                                solo_action = Some((false, multi_solo));
+                                            } else {
+                                                solo_action = Some((true, multi_solo));
+                                            }
+                                            mix_dirty = true;
+                                        }
+
+                                        let level_response = ui.add_sized(
+                                            [ui.available_width(), 10.0],
+                                            egui::Slider::new(&mut pair_level, 0.0..=1.0)
+                                                .text("Level"),
+                                        );
+                                        if level_response.changed() || level_response.dragged() {
+                                            mix_dirty = true;
+                                        }
+
+                                        let meter_height = 8.0;
+                                        let (meter_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), meter_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            meter_rect,
+                                            2.0,
+                                            egui::Color32::from_rgb(16, 20, 24),
+                                        );
+                                        let peak = pair_peaks.get(pair).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                        let fill_w = meter_rect.width() * peak;
+                                        if fill_w > 0.0 {
+                                            let color = if peak > 0.9 {
+                                                egui::Color32::from_rgb(255, 90, 64)
+                                            } else if peak > 0.7 {
+                                                egui::Color32::from_rgb(250, 200, 80)
+                                            } else {
+                                                egui::Color32::from_rgb(90, 210, 120)
+                                            };
+                                            let fill_rect = egui::Rect::from_min_size(
+                                                meter_rect.min,
+                                                egui::vec2(fill_w, meter_rect.height()),
+                                            );
+                                            ui.painter().rect_filled(fill_rect, 2.0, color);
+                                        }
+                                    });
+                                if let Some(target) = track.output_pair_mix.get_mut(pair) {
+                                    target.muted = pair_muted;
+                                    target.level = pair_level;
+                                }
+                                if let Some((enable, multi)) = solo_action {
+                                    if enable && !multi {
+                                        for other in track.output_pair_mix.iter_mut() {
+                                            other.solo = false;
+                                        }
+                                    }
+                                    if let Some(target) = track.output_pair_mix.get_mut(pair) {
+                                        target.solo = enable;
+                                    }
+                                }
+                                ui.add_space(4.0);
+                            }
+                        }
                     });
                     if show_hitboxes {
                         ui.painter().rect_stroke(
@@ -861,6 +1059,11 @@ impl DawApp {
             }
             if mix_dirty {
                 self.sync_track_mix();
+                for (index, track) in self.tracks.iter().enumerate() {
+                    if let Some(state) = self.engine.track_audio.get(index) {
+                        state.sync_output_pair_mix(track);
+                    }
+                }
             }
         });
     }

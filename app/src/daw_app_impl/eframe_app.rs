@@ -132,6 +132,10 @@ impl eframe::App for DawApp {
                 self.ui_arranger_last_ms = 0.0;
                 self.center_performance(ctx);
             }
+            MainTab::AiScores => {
+                self.ui_arranger_last_ms = 0.0;
+                self.center_ai_scores(ctx);
+            }
         }
         self.plugin_ui_window(ctx, frame);
         self.modals(ctx);
@@ -232,18 +236,41 @@ impl eframe::App for DawApp {
                                 });
                         });
                     }
-                    ui.horizontal(|ui| {
-                        ui.label("Bitrate");
-                        egui::ComboBox::from_id_source("render_bitrate")
-                            .selected_text(format!("{} kbps", self.render_bitrate))
-                            .show_ui(ui, |ui| {
-                                for rate in [96u32, 128, 192, 256, 320] {
-                                    if ui.selectable_label(self.render_bitrate == rate, format!("{} kbps", rate)).clicked() {
-                                        self.render_bitrate = rate;
+                    if self.render_format == RenderFormat::Ogg {
+                        ui.horizontal(|ui| {
+                            ui.label("Quality");
+                            let quality = self.render_ogg_quality.clamp(0.0, 1.0);
+                            self.render_ogg_quality = quality;
+                            ui.add(egui::Slider::new(&mut self.render_ogg_quality, 0.0..=1.0)
+                                .show_value(true)
+                                .clamp_to_range(true));
+                        });
+                    }
+                    if self.render_format == RenderFormat::Flac {
+                        ui.horizontal(|ui| {
+                            ui.label("Bit Depth");
+                            let label = match self.render_flac_bit_depth {
+                                RenderWavBitDepth::Int16 => "16-bit",
+                                _ => "24-bit",
+                            };
+                            egui::ComboBox::from_id_source("render_flac_bit_depth")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.render_flac_bit_depth == RenderWavBitDepth::Int16, "16-bit")
+                                        .clicked()
+                                    {
+                                        self.render_flac_bit_depth = RenderWavBitDepth::Int16;
                                     }
-                                }
-                            });
-                    });
+                                    if ui
+                                        .selectable_label(self.render_flac_bit_depth == RenderWavBitDepth::Int24, "24-bit")
+                                        .clicked()
+                                    {
+                                        self.render_flac_bit_depth = RenderWavBitDepth::Int24;
+                                    }
+                                });
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Tail Mode");
                         let label = match self.render_tail_mode {

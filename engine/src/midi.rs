@@ -162,6 +162,119 @@ pub fn export_midi(path: &str, notes: &[PianoRollNote], ticks_per_beat: u16) -> 
 }
 
 #[derive(Clone, Debug)]
+pub struct MidiExportTrack {
+    pub name: String,
+    pub instrument_name: Option<String>,
+    pub is_drum: bool,
+    pub channel: u8,
+    pub program: Option<u8>,
+    pub notes: Vec<PianoRollNote>,
+}
+
+pub fn export_midi_multitrack(
+    path: &str,
+    tracks: &[MidiExportTrack],
+    ticks_per_beat: u16,
+) -> Result<(), String> {
+    let tpq = ticks_per_beat as u32;
+    let mut out_tracks = Vec::with_capacity(tracks.len().max(1));
+
+    for track in tracks {
+        let mut events: Vec<(u64, TrackEventKind)> = Vec::new();
+        let channel = midly::num::u4::from((track.channel.min(15)) as u8);
+        if !track.name.trim().is_empty() {
+            events.push((
+                0,
+                TrackEventKind::Meta(MetaMessage::TrackName(track.name.as_bytes())),
+            ));
+        }
+        if let Some(instrument) = track.instrument_name.as_ref() {
+            if !instrument.trim().is_empty() {
+                events.push((
+                    0,
+                    TrackEventKind::Meta(MetaMessage::InstrumentName(
+                        instrument.as_bytes(),
+                    )),
+                ));
+            }
+        }
+        if let Some(program) = track.program {
+            events.push((
+                0,
+                TrackEventKind::Midi {
+                    channel,
+                    message: MidlyMessage::ProgramChange {
+                        program: midly::num::u7::from(program.min(127)),
+                    },
+                },
+            ));
+        }
+        for note in &track.notes {
+            let start = (note.start_beats * tpq as f32).round().max(0.0) as u64;
+            let end = ((note.start_beats + note.length_beats) * tpq as f32)
+                .round()
+                .max(0.0) as u64;
+            let key = midly::num::u7::from(note.midi_note.min(127));
+            let vel = midly::num::u7::from(note.velocity.min(127));
+            events.push((
+                start,
+                TrackEventKind::Midi {
+                    channel,
+                    message: MidlyMessage::NoteOn { key, vel },
+                },
+            ));
+            events.push((
+                end,
+                TrackEventKind::Midi {
+                    channel,
+                    message: MidlyMessage::NoteOff {
+                        key,
+                        vel: midly::num::u7::from(0),
+                    },
+                },
+            ));
+        }
+
+        events.sort_by_key(|(t, _)| *t);
+        let mut midi_track = Vec::new();
+        let mut last_tick = 0u64;
+        for (tick, kind) in events {
+            let delta = tick.saturating_sub(last_tick) as u32;
+            last_tick = tick;
+            midi_track.push(midly::TrackEvent {
+                delta: delta.into(),
+                kind,
+            });
+        }
+        midi_track.push(midly::TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+        out_tracks.push(midi_track);
+    }
+
+    if out_tracks.is_empty() {
+        out_tracks.push(vec![midly::TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        }]);
+    }
+
+    let smf = Smf {
+        header: midly::Header::new(
+            midly::Format::Parallel,
+            Timing::Metrical(ticks_per_beat.into()),
+        ),
+        tracks: out_tracks,
+    };
+
+    let mut out = Vec::new();
+    smf.write_std(&mut out).map_err(|e| e.to_string())?;
+    fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
 pub struct MidiChannelNotes {
     pub channel: u8,
     pub notes: Vec<PianoRollNote>,

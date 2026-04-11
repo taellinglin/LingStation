@@ -187,6 +187,8 @@ pub struct Track {
     pub level: f32,
     pub muted: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub output_pair_mix: Vec<TrackMixState>,
     pub midi_notes: Vec<PianoRollNote>,
     pub instrument_path: Option<String>,
     #[serde(default)]
@@ -308,6 +310,14 @@ pub struct Vst3PresetFile {
     pub treesynth: Option<TreeSynthState>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct AiScorePromptEntry {
+    pub prompt: String,
+    pub at_beats: f32,
+    #[serde(default)]
+    pub response: Option<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct ProjectState {
     pub name: String,
@@ -329,6 +339,8 @@ pub struct ProjectState {
     pub project_key_minor: bool,
     pub tempo_bpm: f32,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub ai_score_journal: Vec<AiScorePromptEntry>,
     #[serde(default)]
     pub node_routes: Vec<NodeRouteLink>,
     #[serde(default)]
@@ -1161,6 +1173,7 @@ pub enum MainTab {
     PianoRoll,
     NodeEditor,
     Performance,
+    AiScores,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

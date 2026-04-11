@@ -1,6 +1,13 @@
 use super::*;
 use engine::audio::AudioEngine;
 use engine::models::*;
+use std::sync::mpsc::Receiver;
+
+pub(crate) struct AiScoreJobResult {
+    pub(crate) prompt: String,
+    pub(crate) at_beats: f32,
+    pub(crate) response: Result<String, String>,
+}
 
 pub(crate) struct DawApp {
     pub(crate) project_name: String,
@@ -88,6 +95,8 @@ pub(crate) struct DawApp {
     pub(crate) render_sample_rate: u32,
     pub(crate) render_wav_bit_depth: RenderWavBitDepth,
     pub(crate) render_bitrate: u32,
+    pub(crate) render_ogg_quality: f32,
+    pub(crate) render_flac_bit_depth: RenderWavBitDepth,
     pub(crate) render_split_tracks: bool,
     pub(crate) render_target_dir: Option<PathBuf>,
     pub(crate) render_progress: Option<(u64, u64)>,
@@ -158,6 +167,18 @@ pub(crate) struct DawApp {
     pub(crate) plugin_ui_resume_at: Option<std::time::Instant>,
     pub(crate) last_params_track: Option<usize>,
     pub(crate) last_viewport_maximized: Option<bool>,
+    pub(crate) ai_score_prompt: String,
+    pub(crate) ai_score_status: String,
+    pub(crate) ai_score_journal: Vec<AiScorePromptEntry>,
+    pub(crate) ai_score_response: String,
+    pub(crate) ai_score_job: Option<Receiver<AiScoreJobResult>>,
+    pub(crate) ai_score_busy: bool,
+    pub(crate) ai_score_bars: u32,
+    pub(crate) ai_score_auto_apply: bool,
+    pub(crate) ai_vllm_url: String,
+    pub(crate) ai_vllm_model: String,
+    pub(crate) ai_vllm_temperature: f32,
+    pub(crate) ai_vllm_max_tokens: u32,
     pub(crate) last_viewport_rect: Option<egui::Rect>,
     pub(crate) pending_startup_maximize: bool,
     pub(crate) seen_nonzero_viewport: bool,

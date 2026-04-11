@@ -17,6 +17,7 @@ impl DawApp {
             level: 0.8,
             muted: false,
             solo: false,
+            output_pair_mix: Vec::new(),
             midi_notes: Vec::new(),
             instrument_path: None,
             instrument_clap_id: None,
@@ -116,6 +117,7 @@ impl DawApp {
             level: 0.8,
             muted: false,
             solo: false,
+            output_pair_mix: Vec::new(),
             midi_notes: Vec::new(),
             instrument_path: None,
             instrument_clap_id: None,
@@ -345,6 +347,7 @@ impl DawApp {
             project_key_minor: self.project_key_minor,
             tempo_bpm: self.tempo_bpm,
             tracks,
+            ai_score_journal: self.ai_score_journal.clone(),
             node_routes: self.node_routes.clone(),
             performance_clip_settings: self.performance_clip_settings.clone(),
             performance_launch_quantize_beats: self.performance_launch_quantize_beats.max(0.0),
@@ -499,6 +502,7 @@ impl DawApp {
         self.project_key_minor = state.project_key_minor;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
+        self.ai_score_journal = state.ai_score_journal;
         self.node_routes = Self::sanitize_node_routes(state.node_routes, &self.tracks);
         self.performance_clip_settings =
             Self::sanitize_performance_clip_settings(state.performance_clip_settings, &self.tracks);
@@ -766,6 +770,7 @@ impl DawApp {
         self.project_key_minor = state.project_key_minor;
         self.tempo_bpm = state.tempo_bpm;
         self.tracks = state.tracks;
+        self.ai_score_journal = state.ai_score_journal;
         self.node_routes = Self::sanitize_node_routes(state.node_routes, &self.tracks);
         self.performance_clip_settings =
             Self::sanitize_performance_clip_settings(state.performance_clip_settings, &self.tracks);
@@ -2492,7 +2497,7 @@ impl DawApp {
                                     actual_rate as f64,
                                     buffer_size_usize as u32,
                                     channels,
-                                    channels.min(MAX_CLAP_OUTPUT_CHANNELS),
+                                    MAX_CLAP_OUTPUT_CHANNELS,
                                 )
                                 .ok()
                                 .map(|host| PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
@@ -2516,6 +2521,12 @@ impl DawApp {
                             }
                         }
                         state.host = Some(host.clone());
+                        let (_, out_channels) = host.io_channels();
+                        if out_channels > 0 {
+                            state
+                                .native_output_channels
+                                .store(out_channels as u32, Ordering::Relaxed);
+                        }
                         if sync_micesynth_program {
                             micesynth_program_sync.push(index);
                         }

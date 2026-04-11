@@ -26,10 +26,12 @@ impl DawApp {
             host_state: track.plugin_state_component.clone(),
             clips: track.clips.clone(),
             automation: track.automation_lanes.clone(),
+            output_pair: None,
         }
     }
 
     pub(crate) fn render_with_options(&mut self, folder: &Path) -> Result<(), String> {
+        self.rebuild_all_track_midi_notes();
         self.sync_track_audio_states();
         if self.audio_running {
             self.stop_audio_and_midi_internal(false);
@@ -92,25 +94,65 @@ impl DawApp {
 
         if self.render_split_tracks {
             for (index, track) in self.tracks.iter().enumerate() {
+                if !self.track_has_audio_in_range(track, range_start, range_end) {
+                    continue;
+                }
                 let safe_name = Self::sanitize_folder_name(&track.name);
                 let ext = match format {
                     RenderFormat::Wav => "wav",
                     RenderFormat::Ogg => "ogg",
                     RenderFormat::Flac => "flac",
                 };
-                let file_name = format!("{} - {:02}_{}.{}", base_name, index + 1, safe_name, ext);
-                let path = Self::safe_join_within_base(&folder, &file_name)?;
-                plan_paths.push((
-                    path,
-                    self.build_stem_render_plan(
-                        index,
-                        sample_rate,
-                        range_start,
-                        range_end,
-                        has_solo,
-                        license_comment.clone(),
-                    ),
-                ));
+                let runtime_pairs = self
+                    .engine
+                    .track_audio
+                    .get(index)
+                    .map(|state| state.native_output_channels.load(Ordering::Relaxed))
+                    .unwrap_or(2)
+                    .max(2) as usize
+                    / 2;
+                let pair_count = track.output_pair_mix.len().max(runtime_pairs).max(1).min(8);
+                if pair_count > 1 {
+                    for pair in 0..pair_count {
+                        let file_name = format!(
+                            "{} - {:02}_{}_Out{}-{}.{}",
+                            base_name,
+                            index + 1,
+                            safe_name,
+                            pair * 2 + 1,
+                            pair * 2 + 2,
+                            ext
+                        );
+                        let path = Self::safe_join_within_base(&folder, &file_name)?;
+                        let mut plan = self.build_stem_render_plan(
+                            index,
+                            sample_rate,
+                            range_start,
+                            range_end,
+                            has_solo,
+                            license_comment.clone(),
+                        );
+                        if let Some(track_plan) = plan.tracks.get_mut(index) {
+                            track_plan.output_pair = Some(pair);
+                        }
+                        plan_paths.push((path, plan));
+                    }
+                } else {
+                    let file_name =
+                        format!("{} - {:02}_{}.{}", base_name, index + 1, safe_name, ext);
+                    let path = Self::safe_join_within_base(&folder, &file_name)?;
+                    plan_paths.push((
+                        path,
+                        self.build_stem_render_plan(
+                            index,
+                            sample_rate,
+                            range_start,
+                            range_end,
+                            has_solo,
+                            license_comment.clone(),
+                        ),
+                    ));
+                }
             }
         }
 
@@ -129,6 +171,8 @@ impl DawApp {
         let track_audio = self.engine.track_audio.clone();
         let audio_clip_cache = self.engine.audio_cache.clone();
         let format = self.render_format;
+        let ogg_quality = self.render_ogg_quality.clamp(0.0, 1.0);
+        let flac_bit_depth = self.render_flac_bit_depth;
         std::thread::spawn(move || {
             let mut final_status = Ok("Render complete".to_string());
             for (path, plan) in plan_paths {
@@ -138,9 +182,28 @@ impl DawApp {
                     RenderFormat::Wav => {
                         Self::offline_render_plan_to_wav_thread(&plan, &path, &done, &total, track_audio.clone(), &audio_clip_cache)
                     }
-                    RenderFormat::Ogg | RenderFormat::Flac => Err(
-                        "OGG and FLAC offline export are not wired after the render refactor; use WAV for now.".to_string(),
-                    ),
+                    RenderFormat::Ogg => {
+                        Self::offline_render_plan_to_ogg_thread(
+                            &plan,
+                            &path,
+                            &done,
+                            &total,
+                            track_audio.clone(),
+                            &audio_clip_cache,
+                            ogg_quality,
+                        )
+                    }
+                    RenderFormat::Flac => {
+                        Self::offline_render_plan_to_flac_thread(
+                            &plan,
+                            &path,
+                            &done,
+                            &total,
+                            track_audio.clone(),
+                            &audio_clip_cache,
+                            flac_bit_depth,
+                        )
+                    }
                 };
                 if let Err(err) = res {
                     final_status = Err(err);
@@ -154,6 +217,31 @@ impl DawApp {
         });
 
         Ok(())
+    }
+
+    fn track_has_audio_in_range(&self, track: &Track, range_start: f32, range_end: f32) -> bool {
+        let end = range_end.max(range_start + 0.001);
+        if !track.automation_lanes.is_empty()
+            || track.instrument_path.is_some()
+            || !track.effect_paths.is_empty()
+            || track.treesynth.is_some()
+            || track.drum_machine.is_some()
+        {
+            return true;
+        }
+        if track.midi_notes.iter().any(|note| {
+            let note_end = note.start_beats + note.length_beats;
+            note.start_beats < end && note_end > range_start
+        }) {
+            return true;
+        }
+        track.clips.iter().any(|clip| {
+            if clip.is_midi {
+                return false;
+            }
+            let clip_end = clip.start_beats + clip.length_beats;
+            clip.start_beats < end && clip_end > range_start
+        })
     }
 
     fn offline_render_plan_to_wav_thread(
@@ -204,6 +292,142 @@ impl DawApp {
                 let _ = append_wav_comment(&out_path.to_string_lossy(), comment);
             }
         }
+        Ok(())
+    }
+
+    fn offline_render_plan_to_ogg_thread(
+        plan: &RenderPlan,
+        out_path: &Path,
+        progress_done: &AtomicU64,
+        progress_total: &AtomicU64,
+        track_audio: Vec<TrackAudioState>,
+        audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
+        quality: f32,
+    ) -> Result<(), String> {
+        use engine::render::render_plan_for_each_block;
+        use std::io::Write;
+        let cancel = AtomicBool::new(false);
+        let sample_rate = plan.sample_rate as u64;
+        let channels = plan.channels.max(1) as usize;
+        let mut encoder = vorbis_encoder::Encoder::new(
+            channels as u32,
+            sample_rate,
+            quality.clamp(0.0, 1.0),
+        )
+            .map_err(|e| format!("Vorbis encoder init failed: {e}"))?;
+        let mut file = std::fs::File::create(out_path).map_err(|e| e.to_string())?;
+
+        let bpm = plan.bpm;
+        let samples_per_beat = (plan.sample_rate as f64 * 60.0) / bpm as f64;
+        let start_samples = (plan.start_beats as f64 * samples_per_beat).round() as u64;
+        let end_samples = (plan.end_beats as f64 * samples_per_beat).round() as u64;
+        let expected_total = end_samples.saturating_sub(start_samples);
+        progress_total.store(expected_total.max(1), Ordering::Relaxed);
+        progress_done.store(0, Ordering::Relaxed);
+
+        let mut rendered_block_samples = 0u64;
+        render_plan_for_each_block(
+            plan,
+            &cancel,
+            expected_total,
+            track_audio,
+            audio_clip_cache,
+            |block, frames| {
+                let mut pcm = Vec::with_capacity(frames * channels);
+                for sample in block.iter().take(frames * channels) {
+                    let clamped = sample.clamp(-1.0, 1.0);
+                    let value = (clamped * i16::MAX as f32).round() as i16;
+                    pcm.push(value);
+                }
+                let encoded = encoder
+                    .encode(&pcm)
+                    .map_err(|e| format!("Vorbis encode failed: {e}"))?;
+                if !encoded.is_empty() {
+                    file.write_all(&encoded).map_err(|e| e.to_string())?;
+                }
+                rendered_block_samples = rendered_block_samples.saturating_add(frames as u64);
+                progress_done.store(
+                    rendered_block_samples.min(expected_total),
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            },
+        )?;
+        let encoded = encoder
+            .flush()
+            .map_err(|e| format!("Vorbis flush failed: {e}"))?;
+        if !encoded.is_empty() {
+            file.write_all(&encoded).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn offline_render_plan_to_flac_thread(
+        plan: &RenderPlan,
+        out_path: &Path,
+        progress_done: &AtomicU64,
+        progress_total: &AtomicU64,
+        track_audio: Vec<TrackAudioState>,
+        audio_clip_cache: &Arc<ParkingMutex<AudioClipCache>>,
+        bit_depth: RenderWavBitDepth,
+    ) -> Result<(), String> {
+        use engine::render::{render_plan_for_each_block, sample_to_int};
+        use flacenc::component::BitRepr;
+        use flacenc::error::Verify;
+
+        let cancel = AtomicBool::new(false);
+        let channels = plan.channels.max(1) as usize;
+        let bits_per_sample = match bit_depth {
+            RenderWavBitDepth::Int16 => 16,
+            _ => 24,
+        };
+
+        let bpm = plan.bpm;
+        let samples_per_beat = (plan.sample_rate as f64 * 60.0) / bpm as f64;
+        let start_samples = (plan.start_beats as f64 * samples_per_beat).round() as u64;
+        let end_samples = (plan.end_beats as f64 * samples_per_beat).round() as u64;
+        let expected_total = end_samples.saturating_sub(start_samples);
+        progress_total.store(expected_total.max(1), Ordering::Relaxed);
+        progress_done.store(0, Ordering::Relaxed);
+
+        let mut samples: Vec<i32> = Vec::new();
+        let mut rendered_block_samples = 0u64;
+        render_plan_for_each_block(
+            plan,
+            &cancel,
+            expected_total,
+            track_audio,
+            audio_clip_cache,
+            |block, frames| {
+                let total = frames * channels;
+                samples.reserve(total);
+                for sample in block.iter().take(total) {
+                    let value = sample_to_int(*sample, bits_per_sample) as i32;
+                    samples.push(value);
+                }
+                rendered_block_samples = rendered_block_samples.saturating_add(frames as u64);
+                progress_done.store(
+                    rendered_block_samples.min(expected_total),
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            },
+        )?;
+
+        let config = flacenc::config::Encoder::default()
+            .into_verified()
+            .map_err(|e| format!("FLAC config error: {e:?}"))?;
+        let source = flacenc::source::MemSource::from_samples(
+            &samples,
+            channels,
+            bits_per_sample as usize,
+            plan.sample_rate as usize,
+        );
+        let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+            .map_err(|e| format!("FLAC encode failed: {e}"))?;
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        stream.write(&mut sink);
+        std::fs::write(out_path, sink.as_slice()).map_err(|e| e.to_string())?;
         Ok(())
     }
 

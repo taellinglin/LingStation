@@ -5,7 +5,7 @@ use crate::node_editor::TrackNodeActivity;
 use crate::performance::PerformanceRuntimeClip;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const MAX_PLUGIN_OUTPUT_CHANNELS: usize = 16;
@@ -303,6 +303,9 @@ pub struct TrackAudioState {
     pub fx_in_peaks: Arc<Mutex<Vec<f32>>>,
     pub fx_out_peaks: Arc<Mutex<Vec<f32>>>,
     pub track_buffer: Arc<Mutex<Vec<f32>>>,
+    pub output_pair_mix: Arc<Mutex<Vec<TrackMixState>>>,
+    pub output_pair_buffers: Arc<Mutex<Vec<Vec<f32>>>>,
+    pub output_pair_override: Arc<AtomicI32>,
     pub native_output_channels: Arc<AtomicU32>,
     pub silent_blocks: Arc<AtomicU64>,
 }
@@ -472,6 +475,9 @@ impl TrackAudioState {
             fx_in_peaks: Arc::new(Mutex::new(Vec::new())),
             fx_out_peaks: Arc::new(Mutex::new(Vec::new())),
             track_buffer: Arc::new(Mutex::new(Vec::new())),
+            output_pair_mix: Arc::new(Mutex::new(track.output_pair_mix.clone())),
+            output_pair_buffers: Arc::new(Mutex::new(Vec::new())),
+            output_pair_override: Arc::new(AtomicI32::new(-1)),
             native_output_channels: Arc::new(AtomicU32::new(native_output_channels)),
             silent_blocks: Arc::new(AtomicU64::new(0)),
         }
@@ -487,6 +493,10 @@ impl TrackAudioState {
 
     pub fn sync_effect_bypass(&self, track: &Track) {
         *self.effect_bypass.lock() = track.effect_bypass.clone();
+    }
+
+    pub fn sync_output_pair_mix(&self, track: &Track) {
+        *self.output_pair_mix.lock() = track.output_pair_mix.clone();
     }
 
     pub fn sync_treesynth(

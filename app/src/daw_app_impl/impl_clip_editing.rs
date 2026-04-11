@@ -436,49 +436,15 @@ impl DawApp {
                     sample_rate as f32,
                 );
             } else {
-                #[cfg(all(windows, has_rubberband))]
-                {
-                    let formant_preserve = matches!(
-                        render.stretch_mode,
-                        AudioStretchMode::StretchFormant
-                            | AudioStretchMode::StretchNeutral
-                            | AudioStretchMode::StretchVocal
-                    );
-                    let time_mul = render.time_mul.max(0.01) as f64;
-                    let pitch_scale = time_mul
-                        * 2.0f64.powf(render.pitch_semitones as f64 / 12.0);
-                    let formant_scale = render.formant_scale.max(0.25) as f64;
-                    let stretcher = local_cache.get_or_create_stretcher(
-                        render.clip_id,
-                        sample_rate,
-                        channels,
-                        pitch_scale,
-                        formant_preserve,
-                        formant_scale,
-                    );
-                    mix_clip_stretch(
-                        &mut samples,
-                        channels,
-                        render,
-                        data,
-                        0,
-                        total_frames,
-                        sample_rate as f32,
-                        &stretcher,
-                    );
-                }
-                #[cfg(any(not(windows), not(has_rubberband)))]
-                {
-                    mix_clip_resample(
-                        &mut samples,
-                        channels,
-                        render,
-                        data,
-                        0,
-                        total_frames,
-                        sample_rate as f32,
-                    );
-                }
+                mix_clip_resample(
+                    &mut samples,
+                    channels,
+                    render,
+                    data,
+                    0,
+                    total_frames,
+                    sample_rate as f32,
+                );
             }
         }
 

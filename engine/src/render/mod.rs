@@ -99,6 +99,7 @@ pub struct RenderTrack {
     pub host_state: Option<Vec<u8>>,
     pub clips: Vec<Clip>,
     pub automation: Vec<AutomationLane>,
+    pub output_pair: Option<usize>,
 }
 
 pub fn render_plan_for_each_block<F>(
@@ -112,6 +113,17 @@ pub fn render_plan_for_each_block<F>(
 where
     F: FnMut(&[f32], usize) -> Result<(), String>,
 {
+    for (index, state) in track_audio.iter().enumerate() {
+        let override_pair = plan
+            .tracks
+            .get(index)
+            .and_then(|track| track.output_pair)
+            .map(|pair| pair as i32)
+            .unwrap_or(-1);
+        state
+            .output_pair_override
+            .store(override_pair, Ordering::Relaxed);
+    }
     let sample_rate = plan.sample_rate;
     let channels = plan.channels as usize;
     let bpm = plan.bpm;

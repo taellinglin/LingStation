@@ -442,6 +442,7 @@ impl DawApp {
                 level: 0.8,
                 muted: false,
                 solo: false,
+                output_pair_mix: Vec::new(),
                 midi_notes: Vec::new(),
                 instrument_path,
                 instrument_clap_id: None,
@@ -526,21 +527,220 @@ impl DawApp {
     }
 
     pub(crate) fn export_midi_dialog(&mut self) -> Result<(), String> {
+        self.rebuild_all_track_midi_notes();
         let path = rfd::FileDialog::new()
             .add_filter("MIDI", &["mid", "midi"])
             .set_file_name("export.mid")
             .save_file();
         if let Some(path) = path {
             let path_str = path.to_string_lossy().to_string();
-            let notes = self
-                .selected_track
-                .and_then(|index| self.tracks.get(index))
-                .map(|track| track.midi_notes.as_slice())
-                .unwrap_or(&[]);
-            export_midi(&path_str, notes, 480)?;
+            let mut tracks = self.build_midi_export_tracks();
+            if tracks.is_empty() {
+                self.status = "No MIDI notes to export".to_string();
+                return Ok(());
+            }
+            Self::assign_midi_export_channels(&mut tracks);
+            export_midi_multitrack(&path_str, &tracks, 480)?;
             self.export_path = path_str;
             self.status = "MIDI exported".to_string();
         }
         Ok(())
+    }
+
+    fn build_midi_export_tracks(&self) -> Vec<engine::midi::MidiExportTrack> {
+        let mut tracks = Vec::new();
+        for (index, track) in self.tracks.iter().enumerate() {
+            if track.midi_notes.is_empty() {
+                continue;
+            }
+            let tokens = Self::track_instrument_tokens(track);
+            let is_drum = track.drum_machine.is_some()
+                || tokens.contains("drum")
+                || tokens.contains("kit")
+                || tokens.contains("perc");
+            let program = if is_drum {
+                track
+                    .midi_program
+                    .or_else(|| Self::infer_drum_program(&tokens))
+            } else {
+                track
+                    .midi_program
+                    .or_else(|| Self::infer_program_from_tokens(&tokens))
+            };
+            let instrument_name = Self::infer_instrument_name(program, is_drum, &tokens);
+            let mut name = track.name.trim().to_string();
+            if name.is_empty() {
+                name = instrument_name
+                    .clone()
+                    .unwrap_or_else(|| format!("Track {}", index + 1));
+            } else if let Some(label) = instrument_name.as_ref() {
+                let lower_name = name.to_ascii_lowercase();
+                let lower_label = label.to_ascii_lowercase();
+                if !lower_name.contains(&lower_label) {
+                    name = format!("{} ({})", name, label);
+                }
+            }
+
+            tracks.push(engine::midi::MidiExportTrack {
+                name,
+                instrument_name,
+                is_drum,
+                channel: 0,
+                program,
+                notes: track.midi_notes.clone(),
+            });
+        }
+        tracks
+    }
+
+    fn assign_midi_export_channels(tracks: &mut [engine::midi::MidiExportTrack]) {
+        let mut next_channel: u8 = 0;
+        for track in tracks {
+            if track.is_drum {
+                track.channel = 9;
+                continue;
+            }
+            let mut candidate = next_channel % 16;
+            while candidate == 9 {
+                next_channel = next_channel.saturating_add(1);
+                candidate = next_channel % 16;
+            }
+            track.channel = candidate;
+            next_channel = next_channel.saturating_add(1);
+        }
+    }
+
+    fn track_instrument_tokens(track: &Track) -> String {
+        let mut parts = Vec::new();
+        if !track.name.trim().is_empty() {
+            parts.push(track.name.clone());
+        }
+        if let Some(path) = track.instrument_path.as_ref() {
+            parts.push(path.clone());
+        }
+        for param in &track.params {
+            parts.push(param.clone());
+        }
+        parts.join(" ").to_ascii_lowercase()
+    }
+
+    fn infer_drum_program(tokens: &str) -> Option<u8> {
+        if tokens.contains("808") {
+            return Some(25);
+        }
+        if tokens.contains("room") {
+            return Some(8);
+        }
+        if tokens.contains("power") {
+            return Some(16);
+        }
+        if tokens.contains("electronic") || tokens.contains("edm") {
+            return Some(24);
+        }
+        if tokens.contains("jazz") {
+            return Some(32);
+        }
+        if tokens.contains("brush") {
+            return Some(40);
+        }
+        if tokens.contains("orchestra") {
+            return Some(48);
+        }
+        if tokens.contains("sfx") {
+            return Some(56);
+        }
+        None
+    }
+
+    fn infer_program_from_tokens(tokens: &str) -> Option<u8> {
+        if tokens.contains("piano") || tokens.contains("keys") {
+            return Some(0);
+        }
+        if tokens.contains("epiano") || tokens.contains("rhodes") {
+            return Some(4);
+        }
+        if tokens.contains("organ") {
+            return Some(16);
+        }
+        if tokens.contains("harpsi") {
+            return Some(6);
+        }
+        if tokens.contains("clav") {
+            return Some(7);
+        }
+        if tokens.contains("violin") {
+            return Some(40);
+        }
+        if tokens.contains("viola") {
+            return Some(41);
+        }
+        if tokens.contains("cello") {
+            return Some(42);
+        }
+        if tokens.contains("bass") {
+            if tokens.contains("synth") {
+                return Some(38);
+            }
+            return Some(32);
+        }
+        if tokens.contains("guitar") {
+            if tokens.contains("electric") {
+                return Some(27);
+            }
+            return Some(24);
+        }
+        if tokens.contains("strings") {
+            if tokens.contains("pizz") {
+                return Some(45);
+            }
+            return Some(48);
+        }
+        if tokens.contains("pad") {
+            return Some(88);
+        }
+        if tokens.contains("lead") {
+            return Some(80);
+        }
+        if tokens.contains("synth") {
+            return Some(81);
+        }
+        if tokens.contains("choir") || tokens.contains("vocal") {
+            return Some(52);
+        }
+        if tokens.contains("flute") {
+            return Some(73);
+        }
+        if tokens.contains("clarinet") {
+            return Some(71);
+        }
+        if tokens.contains("oboe") {
+            return Some(68);
+        }
+        if tokens.contains("trumpet") {
+            return Some(56);
+        }
+        if tokens.contains("trombone") {
+            return Some(57);
+        }
+        if tokens.contains("horn") {
+            return Some(60);
+        }
+        None
+    }
+
+    fn infer_instrument_name(program: Option<u8>, is_drum: bool, tokens: &str) -> Option<String> {
+        if is_drum {
+            let kit_program = program.unwrap_or(0);
+            return engine::render::util::gm_drum_kit_name(kit_program)
+                .map(|name| name.to_string())
+                .or_else(|| Some("Drum Kit".to_string()));
+        }
+        if let Some(program) = program {
+            return Some(engine::render::util::gm_program_name(program).to_string());
+        }
+        if tokens.contains("pizz") {
+            return Some("Pizzicato Strings".to_string());
+        }
+        None
     }
 }

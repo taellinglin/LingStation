@@ -348,6 +348,21 @@ impl DawApp {
         };
         let mut pending_default_kits: Vec<usize> = Vec::new();
         for (track_index, track) in self.tracks.iter_mut().enumerate() {
+            let pairs = self
+                .engine
+                .track_audio
+                .get(track_index)
+                .map(|state| state.native_output_channels.load(Ordering::Relaxed))
+                .unwrap_or(2)
+                .max(2);
+            let pair_count = (pairs as usize / 2).max(1).min(8);
+            if track.output_pair_mix.len() < pair_count {
+                track
+                    .output_pair_mix
+                    .resize(pair_count, TrackMixState::default());
+            } else if track.output_pair_mix.len() > pair_count {
+                track.output_pair_mix.truncate(pair_count);
+            }
             if track
                 .instrument_path
                 .as_deref()
@@ -401,6 +416,7 @@ impl DawApp {
                     state.sync_notes(track);
                     state.sync_automation(track);
                     state.sync_effect_bypass(track);
+                    state.sync_output_pair_mix(track);
                     let enabled = track
                         .instrument_path
                         .as_deref()
@@ -706,7 +722,7 @@ impl DawApp {
                     self.settings.sample_rate as f64,
                     self.settings.buffer_size,
                     0,
-                    channels.clamp(1, MAX_CLAP_OUTPUT_CHANNELS),
+                    MAX_CLAP_OUTPUT_CHANNELS,
                 )
                 .ok()?;
                 Some(PluginHostHandle::Clap(Arc::new(ParkingMutex::new(host))))
@@ -714,6 +730,12 @@ impl DawApp {
         };
         let host = host?;
         state.host = Some(host.clone());
+        let (_, out_channels) = host.io_channels();
+        if out_channels > 0 {
+            state
+                .native_output_channels
+                .store(out_channels as u32, Ordering::Relaxed);
+        }
         Some(host)
     }
 

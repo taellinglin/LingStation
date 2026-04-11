@@ -1,0 +1,8 @@
+is_global = true
+build_property.RootNamespace = rubberband_sharp
+build_property.ProjectDir = c:\Users\User\Programs\[LingStation]\third_party\rubberband\dotnet\rubberband-sharp\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 
+build_property.CsWinRTUseWindowsUIXamlProjections = false
+build_property.EffectiveAnalysisLevelStyle = 
+build_property.EnableCodeStyleSeverity = 

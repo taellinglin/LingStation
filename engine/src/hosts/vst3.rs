@@ -1,3 +1,4 @@
+use crate::audio::MAX_PLUGIN_OUTPUT_CHANNELS;
 use crate::error::{LingError, Result as LingResult};
 use com_scrape_types::{Class, ComPtr, ComWrapper};
 use libloading::Library;
@@ -1175,6 +1176,19 @@ impl Vst3Host {
                     "VST3 has no audio output buses".to_string(),
                 ));
             }
+            if audio_out_count > 1 {
+                log::warn!(
+                    "VST3 multi-out not supported; deactivating extra output buses (count={audio_out_count})"
+                );
+                for bus_index in 1..audio_out_count {
+                    let _ = component.activateBus(
+                        MediaTypes_::kAudio as i32,
+                        BusDirections_::kOutput as i32,
+                        bus_index,
+                        0,
+                    );
+                }
+            }
             if audio_in_count > 1 {
                 return Err(LingError::Plugin(
                     "VST3 multiple input buses not supported".to_string(),
@@ -1272,8 +1286,8 @@ impl Vst3Host {
             );
             if bus_info_result == kResultOk {
                 let count = bus_info.channelCount as usize;
-                if (1..=2).contains(&count) {
-                    output_channels = count;
+                if count >= 1 {
+                    output_channels = count.min(MAX_PLUGIN_OUTPUT_CHANNELS);
                 }
             }
             let in_bus_info_result = component.getBusInfo(
