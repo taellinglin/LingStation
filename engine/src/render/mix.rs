@@ -605,7 +605,7 @@ fn drum_machine_lowpass(
     let v3 = sample - state.lp - k * state.bp;
     let v2 = state.bp + a2 * v3;
     state.bp = v2;
-    state.lp = state.lp + a3 * v3;
+    state.lp += a3 * v3;
     state.lp
 }
 
@@ -882,13 +882,21 @@ pub(crate) fn mix_drum_machine_block(
         if src_frames == 0 {
             return false;
         }
+        let out_pairs = DRUM_MACHINE_OUTPUT_PAIRS.max(1);
+        let pair_idx = voice.output_pair.min(out_pairs.saturating_sub(1));
+        let pair_spread = if out_pairs > 1 {
+            (pair_idx as f32 / (out_pairs - 1) as f32) * 2.0 - 1.0
+        } else {
+            0.0
+        };
+        let effective_pan = (voice.pan + pair_spread * 0.35).clamp(-1.0, 1.0);
         let left_gain = if channels >= 2 {
-            (1.0 - voice.pan) * 0.5
+            (1.0 - effective_pan) * 0.5
         } else {
             1.0
         };
         let right_gain = if channels >= 2 {
-            (1.0 + voice.pan) * 0.5
+            (1.0 + effective_pan) * 0.5
         } else {
             1.0
         };
@@ -1516,10 +1524,8 @@ pub fn mix_track_hosts(
     }
 
     let mut next_transport = transport_pos.saturating_add(frames as u64);
-    if is_looping && playback_enabled && loop_end > loop_start {
-        if next_transport >= loop_end {
-            next_transport = loop_start.saturating_add(next_transport.saturating_sub(loop_end));
-        }
+    if is_looping && playback_enabled && loop_end > loop_start && next_transport >= loop_end {
+        next_transport = loop_start.saturating_add(next_transport.saturating_sub(loop_end));
     }
     transport_samples.store(next_transport, Ordering::Relaxed);
 
@@ -1643,4 +1649,23 @@ pub fn apply_fade_in_if_needed(data: &mut [f32], channels: usize, fade_gate: &At
         }
     }
     fade_gate.store(false, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod mix_tests {
+    use super::drum_machine_pad_index;
+    use crate::models::DRUM_MACHINE_BASE_NOTE;
+
+    #[test]
+    fn drum_machine_pad_index_respects_base_note() {
+        assert_eq!(drum_machine_pad_index(DRUM_MACHINE_BASE_NOTE), Some(0));
+        assert_eq!(
+            drum_machine_pad_index(DRUM_MACHINE_BASE_NOTE.saturating_add(1)),
+            Some(1)
+        );
+        assert_eq!(
+            drum_machine_pad_index(DRUM_MACHINE_BASE_NOTE.saturating_sub(1)),
+            None
+        );
+    }
 }

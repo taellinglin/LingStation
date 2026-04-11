@@ -7,9 +7,11 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub mod encode;
 pub mod mix;
 pub mod util;
 
+pub use encode::{offline_render_plan_to_flac, offline_render_plan_to_ogg_vorbis};
 pub use mix::*;
 pub use util::*;
 
@@ -272,4 +274,65 @@ pub fn build_flac_comment_block(comment: &str) -> Vec<u8> {
     block.push((len & 0xff) as u8);
     block.extend_from_slice(&payload);
     block
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::audio::AudioClipCache;
+    use crate::models::MasterCompSettings;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+
+    fn silent_plan(sample_rate: u32) -> RenderPlan {
+        RenderPlan {
+            start_beats: 0.0,
+            end_beats: 0.25,
+            sample_rate,
+            channels: 2,
+            bit_depth: RenderWavBitDepth::Float32,
+            bpm: 120.0,
+            tracks: vec![],
+            master_comp: MasterCompSettings::default(),
+            license_comment: None,
+        }
+    }
+
+    #[test]
+    fn render_plan_silence_with_no_tracks() {
+        let plan = silent_plan(48_000);
+        let cancel = AtomicBool::new(false);
+        let cache = Arc::new(Mutex::new(AudioClipCache::new()));
+        let mut max_abs = 0.0f32;
+        render_plan_for_each_block(&plan, &cancel, 1, vec![], &cache, |block, _| {
+            for &s in block {
+                max_abs = max_abs.max(s.abs());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(max_abs < 1e-5, "expected silence, peak was {max_abs}");
+    }
+
+    #[test]
+    fn offline_flac_encodes_short_plan() {
+        let plan = silent_plan(48_000);
+        let cache = Arc::new(Mutex::new(AudioClipCache::new()));
+        let path = std::env::temp_dir().join(format!(
+            "ling_station_flac_test_{}.flac",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let done = AtomicU64::new(0);
+        let total = AtomicU64::new(1);
+        offline_render_plan_to_flac(&plan, &path, &done, &total, vec![], &cache).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() >= 4 && bytes.starts_with(b"fLaC"),
+            "missing fLaC magic, len {}",
+            bytes.len()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

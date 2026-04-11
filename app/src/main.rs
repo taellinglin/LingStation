@@ -43,7 +43,7 @@ pub(crate) const LICENSE_PRODUCT_CODE: &str = "LingStation";
 pub(crate) const WAVEFORM_CACHE_MAX_ENTRIES: usize = 256;
 pub(crate) const WAVEFORM_COLOR_CACHE_MAX_ENTRIES: usize = 256;
 pub(crate) const WAVEFORM_LEN_CACHE_MAX_ENTRIES: usize = 512;
-pub(crate) const MAX_CLAP_OUTPUT_CHANNELS: usize = 16;
+pub(crate) const MAX_CLAP_OUTPUT_CHANNELS: usize = 32;
 
 fn main() -> eframe::Result<()> {
     entry::main()

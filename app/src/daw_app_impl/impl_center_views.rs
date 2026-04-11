@@ -241,18 +241,14 @@ impl DawApp {
                 }
                 let mut y_out = header.bottom() + row_top_pad;
                 for (name, color, level) in outputs {
-                    painter.circle_filled(egui::pos2(r.right() - port_inset, y_out), port_radius, *color);
-                    painter.text(
-                        egui::pos2(r.right() - label_inset, y_out),
-                        egui::Align2::RIGHT_CENTER,
-                        name,
-                        egui::TextStyle::Small.resolve(ui.style()),
-                        egui::Color32::from_gray(220),
-                    );
+                    let port_x = r.right() - port_inset;
+                    painter.circle_filled(egui::pos2(port_x, y_out), port_radius, *color);
                     if show_meters {
-                        let meter_x = r.left() + meter_inset;
+                        let gap = (4.0 * zoom).clamp(3.0, 6.0);
+                        let meter_right = port_x - port_radius - gap;
+                        let meter_left = meter_right - meter_w;
                         let meter_rect = egui::Rect::from_min_size(
-                            egui::pos2(meter_x, y_out - meter_h * 0.5),
+                            egui::pos2(meter_left, y_out - meter_h * 0.5),
                             egui::vec2(meter_w, meter_h),
                         );
                         painter.rect_filled(meter_rect, 2.0, egui::Color32::from_gray(46));
@@ -264,6 +260,21 @@ impl DawApp {
                                 *color,
                             );
                         }
+                        painter.text(
+                            egui::pos2(meter_left - gap, y_out),
+                            egui::Align2::RIGHT_CENTER,
+                            name,
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            egui::Color32::from_gray(220),
+                        );
+                    } else {
+                        painter.text(
+                            egui::pos2(r.right() - label_inset, y_out),
+                            egui::Align2::RIGHT_CENTER,
+                            name,
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            egui::Color32::from_gray(220),
+                        );
                     }
                     y_out += row_step;
                 }

@@ -244,6 +244,41 @@ impl DawApp {
         })
     }
 
+    pub(crate) fn poll_render_job_completion(&mut self) {
+        let finished = self
+            .render_job
+            .as_ref()
+            .is_some_and(|j| j.finished.load(Ordering::Relaxed));
+        if let Some(job) = self.render_job.as_ref() {
+            let done = job.done.load(Ordering::Relaxed);
+            let total = job.total.load(Ordering::Relaxed);
+            if total > 0 {
+                self.render_progress = Some((done, total));
+            }
+        }
+        if !finished {
+            return;
+        }
+        let job = match self.render_job.take() {
+            Some(j) => j,
+            None => return,
+        };
+        if let Ok(mut guard) = job.result.lock() {
+            if let Some(result) = guard.take() {
+                match result {
+                    Ok(msg) => {
+                        self.status = msg;
+                        self.show_render_dialog = false;
+                    }
+                    Err(err) => {
+                        self.status = format!("Render failed: {err}");
+                    }
+                }
+            }
+        }
+        self.render_progress = None;
+    }
+
     fn offline_render_plan_to_wav_thread(
         plan: &RenderPlan,
         out_path: &Path,
