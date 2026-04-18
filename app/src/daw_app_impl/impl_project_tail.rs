@@ -1,3 +1,4 @@
+
 #[allow(dead_code)]
 impl DawApp {
     pub(crate) fn new_project(&mut self) {
@@ -307,7 +308,7 @@ impl DawApp {
                     }
                 }
             }
-            Self::log_fm_ratio_param_from(index, "capture", &track.params, &track.param_ids, &track.param_values);
+
         }
     }
 
@@ -554,7 +555,7 @@ impl DawApp {
         self.migrate_track_notes_to_clips();
         let (missing_instruments, missing_effects) = self.clear_missing_plugin_references();
         self.sync_track_audio_states();
-        self.log_all_fm_ratio_params("after_load");
+
         self.selected_track = if self.tracks.is_empty() { None } else { Some(0) };
         if self.project_name.trim().is_empty() {
             if let Some(name) = self.project_name_from_path() {
@@ -941,11 +942,9 @@ impl DawApp {
             match c {
                 std::path::Component::Normal(s) => base_stack.push(s.to_os_string()),
                 std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
+                std::path::Component::ParentDir if base_stack.pop().is_none() => {
                     // Normalizing the base path; if we would pop past root, it's unsafe.
-                    if base_stack.pop().is_none() {
-                        return Err("Output path escapes render base directory".to_string());
-                    }
+                    return Err("Output path escapes render base directory".to_string());
                 }
                 _ => {}
             }
@@ -964,10 +963,8 @@ impl DawApp {
             match c {
                 std::path::Component::Normal(s) => cand_stack.push(s.to_os_string()),
                 std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    if cand_stack.pop().is_none() {
-                        return Err("Output path escapes render base directory".to_string());
-                    }
+                std::path::Component::ParentDir if cand_stack.pop().is_none() => {
+                    return Err("Output path escapes render base directory".to_string());
                 }
                 _ => {}
             }
@@ -1857,7 +1854,7 @@ impl DawApp {
                         .points
                         .iter().filter(|&p| p.beat < range_start - 0.02 || p.beat > range_end + 0.02).cloned()
                         .collect();
-                    merged.extend(new_points.into_iter());
+                    merged.extend(new_points);
                     Self::coalesce_automation_points(&mut merged, 0.02);
                     lane.points = merged;
                 }
@@ -4608,7 +4605,7 @@ impl DawApp {
                 track.param_ids = params.iter().map(|p| p.id).collect();
                 track.param_values = next_values;
                 Self::apply_program_param(track);
-                Self::log_fm_ratio_param_from(index, "refresh_track", &track.params, &track.param_ids, &track.param_values);
+
                 if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
                     let mut lanes = Vec::new();
                     for name in &track.automation_channels {

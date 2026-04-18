@@ -465,16 +465,14 @@ impl DawApp {
                     };
                     let offset = index as f32 * 0.5;
                     match Self::fs_drag_kind_for_path(path) {
-                        Some(FsDragKind::Midi) => {
-                            if !midi_started {
-                                let _ = self.begin_midi_import_with_mode(
-                                    path.to_string_lossy().to_string(),
-                                    MidiImportMode::AppendTracks {
-                                        start_beats: start_beats + offset,
-                                    },
-                                );
-                                midi_started = true;
-                            }
+                        Some(FsDragKind::Midi) if !midi_started => {
+                            let _ = self.begin_midi_import_with_mode(
+                                path.to_string_lossy().to_string(),
+                                MidiImportMode::AppendTracks {
+                                    start_beats: start_beats + offset,
+                                },
+                            );
+                            midi_started = true;
                         }
                         Some(FsDragKind::Audio) => match self.add_audio_clip_from_path(
                             target_track,
@@ -488,7 +486,7 @@ impl DawApp {
                                 self.status = format!("Drop import failed: {err}");
                             }
                         },
-                        None => {}
+                        _ => {}
                     }
                 }
             }

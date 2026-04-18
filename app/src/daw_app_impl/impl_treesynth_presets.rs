@@ -399,66 +399,13 @@ impl DawApp {
             .replace([' ', '_', '-'], "")
     }
 
-    pub(crate) fn debug_param_enabled() -> bool {
-        std::env::var("LING_DEBUG_PARAMS")
-            .map(|value| {
-                let value = value.to_ascii_lowercase();
-                value == "1" || value == "true" || value == "yes"
-            })
-            .unwrap_or(false)
-    }
 
-    pub(crate) fn log_fm_ratio_param(&self, track_index: usize, stage: &str) {
-        if !Self::debug_param_enabled() {
-            return;
-        }
-        let Some(track) = self.tracks.get(track_index) else {
-            return;
-        };
-        Self::log_fm_ratio_param_from(
-            track_index,
-            stage,
-            &track.params,
-            &track.param_ids,
-            &track.param_values,
-        );
-    }
 
-    pub(crate) fn log_fm_ratio_param_from(
-        track_index: usize,
-        stage: &str,
-        params: &[String],
-        param_ids: &[u32],
-        param_values: &[f32],
-    ) {
-        if !Self::debug_param_enabled() {
-            return;
-        }
-        let mut found = false;
-        for (index, name) in params.iter().enumerate() {
-            let key = Self::normalize_param_name(name);
-            if key.contains("fmratio") || (key.contains("fm") && key.contains("ratio")) {
-                let id = param_ids.get(index).copied().unwrap_or(0);
-                let value = param_values.get(index).copied().unwrap_or(0.0);
-                log::debug!(
-                    "[param-debug] {stage} track={track_index} name={name} id={id} value={value}"
-                );
-                found = true;
-            }
-        }
-        if !found {
-            log::debug!("[param-debug] {stage} track={track_index} fm_ratio not found");
-        }
-    }
 
-    pub(crate) fn log_all_fm_ratio_params(&self, stage: &str) {
-        if !Self::debug_param_enabled() {
-            return;
-        }
-        for index in 0..self.tracks.len() {
-            self.log_fm_ratio_param(index, stage);
-        }
-    }
+
+
+
+
 
     pub(crate) fn remap_param_values_by_id_or_name(
         old_ids: &[u32],

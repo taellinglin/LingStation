@@ -722,28 +722,22 @@ impl DawApp {
     pub(crate) fn plugin_ui_window(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(ui_host) = self.plugin_ui.as_ref() {
             if ui_host.close_requested.swap(false, Ordering::Relaxed) {
-                eprintln!(
-                    "UI close_requested: target={:?} hwnd={} child={} floating={}",
-                    ui_host.target,
-                    ui_host.hwnd,
-                    ui_host.child_hwnd,
-                    ui_host.floating
-                );
+
                 if let Some(ui_host) = self.plugin_ui.as_ref() {
                     if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                         editor.set_focus(false);
-                        eprintln!("UI close_requested: VST3 focus false");
+
                     }
                     if let PluginUiEditor::Clap(_) = &ui_host.editor {
                         if let PluginHostHandle::Clap(host) = &ui_host.host {
                             if let Some(mut host) = host.try_lock() {
                                 host.hide_gui();
-                                eprintln!("UI close_requested: CLAP hide_gui");
+
                             }
                         }
                     }
                     hide_plugin_window(ui_host.hwnd);
-                    eprintln!("UI close_requested: host window hidden");
+
                 }
                 self.show_plugin_ui = false;
                 if self.plugin_ui.is_some() {
@@ -751,7 +745,7 @@ impl DawApp {
                 }
                 self.pending_viewport_focus = true;
                 self.pending_repaint_frames = self.pending_repaint_frames.max(12);
-                eprintln!("UI close_requested: completed (non-destructive)");
+
                 ctx.request_repaint();
                 return;
             }
@@ -764,17 +758,17 @@ impl DawApp {
             && self.show_plugin_ui
             && !self.plugin_ui_hidden;
         if should_close_hidden {
-            eprintln!("UI should_close_hidden triggered");
+
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                     editor.set_focus(false);
-                    eprintln!("UI should_close_hidden: VST3 focus false");
+
                 }
                 if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Some(mut host) = host.try_lock() {
                             host.hide_gui();
-                            eprintln!("UI should_close_hidden: CLAP hide_gui");
+
                         }
                     }
                 }
@@ -943,22 +937,22 @@ impl DawApp {
                 }
             });
         if close_editor {
-            eprintln!("UI close_editor clicked");
+
             if let Some(ui_host) = self.plugin_ui.as_ref() {
                 if let PluginUiEditor::Vst3(editor) = &ui_host.editor {
                     editor.set_focus(false);
-                    eprintln!("UI close_editor: VST3 focus false");
+
                 }
                 if let PluginUiEditor::Clap(_) = &ui_host.editor {
                     if let PluginHostHandle::Clap(host) = &ui_host.host {
                         if let Some(mut host) = host.try_lock() {
                             host.hide_gui();
-                            eprintln!("UI close_editor: CLAP hide_gui");
+
                         }
                     }
                 }
                 hide_plugin_window(ui_host.hwnd);
-                eprintln!("UI close_editor: host window hidden");
+
                 release_mouse_capture();
             }
             open = false;
@@ -1048,7 +1042,7 @@ impl DawApp {
                     }
                 };
                 let (w, h) = editor.get_size().unwrap_or((520, 360));
-                eprintln!("Plugin UI size hint: {w}x{h}");
+
                 let hwnd = match create_plugin_top_window(w, h) {
                     Some(hwnd) => hwnd,
                     None => {
@@ -1057,7 +1051,7 @@ impl DawApp {
                     }
                 };
                 resize_plugin_top_window(hwnd, w.max(200), h.max(120));
-                eprintln!("Plugin UI window hwnd={hwnd}");
+
                 let mut child_hwnd = match create_plugin_child_window(hwnd) {
                     Some(child_hwnd) => child_hwnd,
                     None => {
@@ -1078,7 +1072,7 @@ impl DawApp {
                     destroy_plugin_child_window(hwnd);
                     return;
                 }
-                eprintln!("Plugin UI attached");
+
                 let (cw, ch) = client_window_size(child_hwnd).unwrap_or((w, h));
                 editor.set_size(cw, ch);
                 editor.set_focus(true);
@@ -1099,7 +1093,7 @@ impl DawApp {
             }
             PluginHostHandle::Clap(clap_host) => {
                 let (w, h) = clap_host.lock().gui_size().unwrap_or((520, 360));
-                eprintln!("CLAP UI size hint: {w}x{h}");
+
                 let hwnd = match create_plugin_top_window(w, h) {
                     Some(hwnd) => hwnd,
                     None => {
