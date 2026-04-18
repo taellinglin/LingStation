@@ -1,4 +1,5 @@
 
+#[allow(dead_code)]
 impl DawApp {
     pub(crate) fn new_project(&mut self) {
         self.prepare_for_project_change();
@@ -936,11 +937,9 @@ impl DawApp {
             match c {
                 std::path::Component::Normal(s) => base_stack.push(s.to_os_string()),
                 std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
+                std::path::Component::ParentDir if base_stack.pop().is_none() => {
                     // Normalizing the base path; if we would pop past root, it's unsafe.
-                    if base_stack.pop().is_none() {
-                        return Err("Output path escapes render base directory".to_string());
-                    }
+                    return Err("Output path escapes render base directory".to_string());
                 }
                 _ => {}
             }
@@ -959,10 +958,8 @@ impl DawApp {
             match c {
                 std::path::Component::Normal(s) => cand_stack.push(s.to_os_string()),
                 std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    if cand_stack.pop().is_none() {
-                        return Err("Output path escapes render base directory".to_string());
-                    }
+                std::path::Component::ParentDir if cand_stack.pop().is_none() => {
+                    return Err("Output path escapes render base directory".to_string());
                 }
                 _ => {}
             }
@@ -1852,7 +1849,7 @@ impl DawApp {
                         .points
                         .iter().filter(|&p| p.beat < range_start - 0.02 || p.beat > range_end + 0.02).cloned()
                         .collect();
-                    merged.extend(new_points.into_iter());
+                    merged.extend(new_points);
                     Self::coalesce_automation_points(&mut merged, 0.02);
                     lane.points = merged;
                 }
