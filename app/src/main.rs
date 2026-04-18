@@ -28,10 +28,11 @@ mod entry;
 use daw_app::DawApp;
 use engine::audio::*;
 use engine::models::{
-    default_performance_launch_quantize_beats, ArrangerTool, MainTab, PianoLaneMode, PianoTool, RenderFormat,
-    RenderTailMode, RenderWavBitDepth, SettingsTab,
+    default_performance_launch_quantize_beats, ArrangerTool, MainTab, NodeRouteKind, PianoLaneMode,
+    PianoTool, RenderFormat, RenderTailMode, RenderWavBitDepth, SettingsState, SettingsTab,
+    SidebarTab, Track, TrackMixState,
 };
-use engine::models::{Track, TrackAudioState, TrackMixState, TrackNodeActivity};
+use engine::node_editor::TrackNodeActivity;
 
 pub(crate) const BASE_UI_FONT_SIZE: f32 = 12.0;
 pub(crate) const LICENSE_API_BASE: &str = "https://linglin.art";
