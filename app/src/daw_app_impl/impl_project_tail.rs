@@ -1,4 +1,4 @@
-#[allow(dead_code)]
+
 impl DawApp {
     pub(crate) fn new_project(&mut self) {
         self.prepare_for_project_change();
@@ -305,7 +305,7 @@ impl DawApp {
                     }
                 }
             }
-            Self::log_fm_ratio_param_from(index, "capture", &track.params, &track.param_ids, &track.param_values);
+
         }
     }
 
@@ -550,7 +550,7 @@ impl DawApp {
         self.migrate_track_notes_to_clips();
         let (missing_instruments, missing_effects) = self.clear_missing_plugin_references();
         self.sync_track_audio_states();
-        self.log_all_fm_ratio_params("after_load");
+
         self.selected_track = if self.tracks.is_empty() { None } else { Some(0) };
         if self.project_name.trim().is_empty() {
             if let Some(name) = self.project_name_from_path() {
@@ -4597,7 +4597,7 @@ impl DawApp {
                 track.param_ids = params.iter().map(|p| p.id).collect();
                 track.param_values = next_values;
                 Self::apply_program_param(track);
-                Self::log_fm_ratio_param_from(index, "refresh_track", &track.params, &track.param_ids, &track.param_values);
+
                 if track.automation_lanes.is_empty() && !track.automation_channels.is_empty() {
                     let mut lanes = Vec::new();
                     for name in &track.automation_channels {

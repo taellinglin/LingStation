@@ -66,7 +66,7 @@ impl DawApp {
         );
         track.params = params.iter().map(|p| p.name.clone()).collect();
         track.param_ids = params.iter().map(|p| p.id).collect();
-        Self::log_fm_ratio_param_from(index, "ensure_live", &track.params, &track.param_ids, &track.param_values);
+
     }
 
     pub(crate) fn refresh_clap_params_if_needed(&mut self) {
@@ -97,7 +97,7 @@ impl DawApp {
             );
             track.params = params.iter().map(|p| p.name.clone()).collect();
             track.param_ids = params.iter().map(|p| p.id).collect();
-            Self::log_fm_ratio_param_from(index, "refresh_clap", &track.params, &track.param_ids, &track.param_values);
+
         }
     }
 
