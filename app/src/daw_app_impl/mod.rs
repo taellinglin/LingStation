@@ -9,7 +9,7 @@ use engine::models::*;
 use engine::performance::performance_length_samples;
 use engine::performance::{PerformanceRuntimeClip, PerformanceTriggerMode};
 use engine::render::*;
-use crate::daw_app::AiScoreJobResult;
+use crate::daw_app::{AiScoreJobResult, ModelDownloadEvent, AiBackend, TorchDevice};
 use parking_lot::Mutex as ParkingMutex;
 
 use super::*;

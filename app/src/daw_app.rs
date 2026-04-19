@@ -9,6 +9,23 @@ pub(crate) struct AiScoreJobResult {
     pub(crate) response: Result<String, String>,
 }
 
+pub(crate) enum ModelDownloadEvent {
+    Progress { downloaded: u64, total: Option<u64> },
+    Finished(Result<String, String>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiBackend {
+    VLLm,
+    Transformers,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TorchDevice {
+    Cuda,
+    Cpu,
+}
+
 pub(crate) struct DawApp {
     pub(crate) project_name: String,
     pub(crate) project_path: String,
@@ -179,6 +196,18 @@ pub(crate) struct DawApp {
     pub(crate) ai_vllm_model: String,
     pub(crate) ai_vllm_temperature: f32,
     pub(crate) ai_vllm_max_tokens: u32,
+    pub(crate) ai_model_download_url: String,
+    pub(crate) ai_model_download_job: Option<Receiver<ModelDownloadEvent>>,
+    pub(crate) ai_model_download_busy: bool,
+    pub(crate) ai_model_download_progress: Option<(u64, Option<u64>)>,
+    pub(crate) ai_model_download_status: String,
+    pub(crate) ai_model_candidates: Vec<String>,
+    pub(crate) ai_vllm_process: Option<std::process::Child>,
+    pub(crate) ai_vllm_online: bool,
+    pub(crate) ai_vllm_status: String,
+    pub(crate) ai_vllm_last_probe: Option<std::time::Instant>,
+    pub(crate) ai_backend: AiBackend,
+    pub(crate) ai_torch_device: TorchDevice,
     pub(crate) last_viewport_rect: Option<egui::Rect>,
     pub(crate) pending_startup_maximize: bool,
     pub(crate) seen_nonzero_viewport: bool,

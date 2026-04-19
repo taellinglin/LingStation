@@ -25,7 +25,7 @@ use std::thread;
 mod daw_app;
 mod daw_app_impl;
 mod entry;
-use daw_app::DawApp;
+use daw_app::{DawApp, AiBackend, TorchDevice};
 use engine::audio::*;
 use engine::models::{
     default_performance_launch_quantize_beats, ArrangerTool, AudioStretchMode, Clip, MainTab,
@@ -606,10 +606,22 @@ impl Default for DawApp {
             ai_score_busy: false,
             ai_score_bars: 16,
             ai_score_auto_apply: true,
-            ai_vllm_url: "http://127.0.0.1:8000".to_string(),
-            ai_vllm_model: "Qwen/Qwen3.5-9B".to_string(),
+            ai_vllm_url: "http://127.0.0.1:8001".to_string(),
+            ai_vllm_model: "Qwen/Qwen2.5-3B-Instruct".to_string(),
             ai_vllm_temperature: 0.7,
             ai_vllm_max_tokens: 512,
+            ai_model_download_url: String::new(),
+            ai_model_download_job: None,
+            ai_model_download_busy: false,
+            ai_model_download_progress: None,
+            ai_model_download_status: String::new(),
+            ai_model_candidates: Vec::new(),
+            ai_vllm_process: None,
+            ai_vllm_online: false,
+            ai_vllm_status: "Offline".to_string(),
+            ai_vllm_last_probe: None,
+            ai_backend: AiBackend::VLLm,
+            ai_torch_device: TorchDevice::Cuda,
             pending_startup_maximize: true,
             seen_nonzero_viewport: false,
             pending_viewport_focus: false,

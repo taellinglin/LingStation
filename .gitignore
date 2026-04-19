@@ -23,3 +23,25 @@ settings.ling.json
 # Synths
 synths/PlantSynth/PlantSynth.vst3/samples/
 synths/PlantSynth/PlantSynth.vst3/sample_kits/
+
+# AI / ML — large files not suitable for git
+Qwen*/
+lora_adapters/
+midi_train_structured/
+*.safetensors
+*.bin
+*.gguf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
+vllm_server.log
+transformers_server.log
+
+# Build artifacts
+third_party/rubberband/dotnet/**/obj/
+third_party/rubberband/dotnet/**/bin/
